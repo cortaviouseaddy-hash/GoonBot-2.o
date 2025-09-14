@@ -1,0 +1,33 @@
+{
+  "raids": [
+    "\ud83c\udfdc\ufe0f Desert Perpetual \ud83c\udfdc\ufe0f",
+    "\ud83d\udc0d Last Wish \ud83d\udc0d",
+    "\ud83c\udf31 Garden of Salvation \ud83c\udf31",
+    "\u2744\ufe0f Deep Stone Crypt \u2744\ufe0f",
+    "\u23f3 Vault of Glass \u23f3",
+    "\ud83d\udcdc Vow of the Disciple \ud83d\udcdc",
+    "\ud83d\udc51 King's Fall \ud83d\udc51",
+    "\ud83c\udf19 Root of Nightmares \ud83c\udf19",
+    "\u2694\ufe0f Crota's End \u2694\ufe0f",
+    "\ud83d\ude4f Salvation's Edge \ud83d\ude4f"
+  ],
+  "dungeons": [
+    "\ud83d\udc51 The Shattered Throne \ud83d\udc51",
+    "\ud83d\udd25 Pit of Heresy \ud83d\udd25",
+    "\ud83c\udf0c Prophecy \ud83c\udf0c",
+    "\ud83d\udcb0 Grasp of Avarice \ud83d\udcb0",
+    "\ud83c\udfad Duality \ud83c\udfad",
+    "\ud83d\udd75\ufe0f Spire of the Watcher \ud83d\udd75\ufe0f",
+    "\ud83d\udc7b Ghosts of the Deep \ud83d\udc7b",
+    "\u2694\ufe0f Warlord's Ruin \u2694\ufe0f",
+    "\u2600\ufe0f Sunder Doctrine \u2600\ufe0f"
+  ],
+  "exotic_activities": [
+    "\ud83c\udf0c The Whisper \ud83c\udf0c",
+    "\u23f3 Zero Hour \u23f3",
+    "\ud83d\udcd6 Presage \ud83d\udcd6",
+    "\ud83d\udef0\ufe0f Operation: Seraph's Shield \ud83d\udef0\ufe0f",
+    "\u2b50 Starcrossed \u2b50",
+    "\u2696\ufe0f Dual Destiny \u2696\ufe0f"
+  ]
+}
