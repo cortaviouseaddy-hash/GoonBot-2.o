@@ -168,6 +168,34 @@ async def queue_cmd(interaction: discord.Interaction):
     await _post_queue_board()
     await interaction.followup.send("Queue board updated.", ephemeral=True)
 
+def _activity_choices_user(prefix: str, user_id: int) -> list[app_commands.Choice[str]]:
+    # Return activities the user is currently in, filtered by prefix
+    in_acts = _user_current_activities(user_id)
+    pref = (prefix or "").lower()
+    filtered = [a for a in in_acts if pref in a.lower()][:25]
+    return [app_commands.Choice(name=a, value=a) for a in filtered]
+
+@bot.tree.command(name="leave", description="Leave an activity queue")
+@app_commands.describe(activity="Choose an activity queue to leave")
+@app_commands.autocomplete(activity=lambda interaction, current: _activity_choices_user(current, interaction.user.id))
+async def leave_cmd(interaction: discord.Interaction, activity: str):
+    # Validate user is in that activity
+    if activity not in ALL_ACTIVITIES:
+        await interaction.response.send_message("Unknown activity.", ephemeral=True)
+        return
+    uid = interaction.user.id
+    q = QUEUES.get(activity)
+    if not q or uid not in q:
+        await interaction.response.send_message("You are not in that queue.", ephemeral=True)
+        return
+    # Remove and refresh board
+    q[:] = [x for x in q if x != uid]
+    if not q:
+        # Clean up empty queues
+        QUEUES.pop(activity, None)
+    await interaction.response.send_message(f"Left queue for: {activity}", ephemeral=True)
+    await _post_queue_board()
+
 # Helper to send a message to a channel by ID, fetching if needed
 async def _send_to_channel_id(channel_id: str | None, content: str | None = None, *, embed: discord.Embed | None = None) -> bool:
     if not channel_id:
