@@ -184,25 +184,49 @@ def _activity_choices_user(prefix: str, user_id: int) -> list[app_commands.Choic
     filtered = [a for a in in_acts if pref in a.lower()][:25]
     return [app_commands.Choice(name=a, value=a) for a in filtered]
 
-@bot.tree.command(name="leave", description="Leave an activity queue")
-@app_commands.describe(activity="Choose an activity queue to leave")
-@app_commands.autocomplete(activity=lambda interaction, current: _activity_choices_user(current, interaction.user.id))
-async def leave_cmd(interaction: discord.Interaction, activity: str):
-    # Validate user is in that activity
+def _user_choices(prefix: str) -> list[app_commands.Choice[str]]:
+    # Fetch guild members and filter by display name or username
+    if not bot.guilds:
+        return []
+    guild = bot.guilds[0]  # Assuming single guild; adjust if multi-guild
+    pref = (prefix or "").lower()
+    members = [m for m in guild.members if pref in m.display_name.lower() or pref in m.name.lower()][:25]
+    return [app_commands.Choice(name=f"{m.display_name} ({m.name})", value=str(m.id)) for m in members]
+
+@bot.tree.command(name="kick", description="Remove a user from an activity queue (founder only)")
+@promoter_only()
+@app_commands.describe(user="User to remove from queue", activity="Activity queue to remove them from")
+@app_commands.autocomplete(user=lambda interaction, current: _user_choices(current))
+async def kick_cmd(interaction: discord.Interaction, user: str, activity: str):
+    # Validate activity
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True)
         return
-    uid = interaction.user.id
+    # Get user ID
+    try:
+        target_user_id = int(user)
+    except ValueError:
+        await interaction.response.send_message("Invalid user.", ephemeral=True)
+        return
+    # Find user in guild
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    target_member = guild.get_member(target_user_id)
+    if not target_member:
+        await interaction.response.send_message("User not found in this server.", ephemeral=True)
+        return
+    # Check if user is in the queue
     q = QUEUES.get(activity)
-    if not q or uid not in q:
-        await interaction.response.send_message("You are not in that queue.", ephemeral=True)
+    if not q or target_user_id not in q:
+        await interaction.response.send_message(f"{target_member.display_name} is not in the {activity} queue.", ephemeral=True)
         return
     # Remove and refresh board
-    q[:] = [x for x in q if x != uid]
+    q[:] = [x for x in q if x != target_user_id]
     if not q:
-        # Clean up empty queues
         QUEUES.pop(activity, None)
-    await interaction.response.send_message(f"Left queue for: {activity}", ephemeral=True)
+    await interaction.response.send_message(f"Removed {target_member.display_name} from {activity} queue.", ephemeral=True)
     await _post_queue_board()
 
 # Helper to send a message to a channel by ID, fetching if needed
