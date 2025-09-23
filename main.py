@@ -21,6 +21,7 @@ def _get_first_env(*keys: str) -> str | None:
 GENERAL_CHANNEL_ID = _get_first_env("GENERAL_CHANNEL_ID", "GENERAL")
 # Sherpa Assistant -> general-sherpa
 GENERAL_SHERPA_CHANNEL_ID = _get_first_env("GENERAL_SHERPA_CHANNEL_ID", "GENERAL_SHERPA")
+RAID_QUEUE_CHANNEL_ID = _get_first_env("RAID_QUEUE_CHANNEL_ID", "RAID_QUEUE")
 
 # Founder/user restriction: allow locking certain commands to a single user or role
 FOUNDER_USER_ID = os.getenv("FOUNDER_USER_ID")  # optional: numeric user ID of the founder
@@ -73,6 +74,99 @@ async def on_ready():
 @bot.tree.command(name="ping", description="Check bot latency")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! Latency: {round(bot.latency * 1000)} ms")
+
+# -----------------------------
+# Queues: /join and /queue
+# -----------------------------
+
+# Build a flat list of activities and caps by category
+ALL_ACTIVITIES: list[str] = []
+CAP_BY_CATEGORY: dict[str, int] = {
+    "raids": 6,
+    "dungeons": 3,
+    "exotic_activities": 3,
+}
+for cat, items in ACTIVITIES.items():
+    if isinstance(items, list):
+        ALL_ACTIVITIES.extend(items)
+
+# In-memory queues: activity -> ordered list of user IDs
+QUEUES: dict[str, list[int]] = {}
+
+def _category_of_activity(name: str) -> str | None:
+    for cat, items in ACTIVITIES.items():
+        if name in items:
+            return cat
+    return None
+
+def _cap_for_activity(name: str) -> int:
+    cat = _category_of_activity(name)
+    return CAP_BY_CATEGORY.get(cat or "", 6)
+
+def _user_current_activities(user_id: int) -> list[str]:
+    res: list[str] = []
+    for act, lst in QUEUES.items():
+        if user_id in lst:
+            res.append(act)
+    return res
+
+def _ensure_queue(name: str) -> list[int]:
+    return QUEUES.setdefault(name, [])
+
+def _activity_choices(prefix: str) -> list[app_commands.Choice[str]]:
+    # Filter by case-insensitive substring for autocomplete
+    pref = (prefix or "").lower()
+    filtered = [a for a in ALL_ACTIVITIES if pref in a.lower()][:25]
+    return [app_commands.Choice(name=a, value=a) for a in filtered]
+
+async def _post_queue_board() -> None:
+    # Build an embed showing main queues only (up to cap) in join order
+    if not RAID_QUEUE_CHANNEL_ID:
+        return
+    cap_cache: dict[str, int] = {}
+    embed = discord.Embed(title="Activity Queues", color=discord.Color.blurple())
+    if not QUEUES:
+        embed.description = "No sign-ups yet. Use /join to get started!"
+    else:
+        for act in ALL_ACTIVITIES:
+            if act not in QUEUES:
+                continue
+            cap = cap_cache.setdefault(act, _cap_for_activity(act))
+            main_ids = QUEUES[act][:cap]
+            if not main_ids:
+                continue
+            mentions = [f"<@{uid}>" for uid in main_ids]
+            embed.add_field(name=act, value="\n".join(mentions), inline=False)
+    await _send_to_channel_id(RAID_QUEUE_CHANNEL_ID, None, embed=embed)
+
+@bot.tree.command(name="join", description="Join an activity queue (raids, dungeons, exotic missions)")
+@app_commands.describe(activity="Choose an activity to join")
+@app_commands.autocomplete(activity=lambda interaction, current: _activity_choices(current))
+async def join_cmd(interaction: discord.Interaction, activity: str):
+    # Validate activity
+    if activity not in ALL_ACTIVITIES:
+        await interaction.response.send_message("Unknown activity. Please choose from suggestions.", ephemeral=True)
+        return
+    # Enforce unique per activity and max 2 activities per user
+    uid = interaction.user.id
+    joined = _user_current_activities(uid)
+    if activity in joined:
+        await interaction.response.send_message("You are already signed up for this activity.", ephemeral=True)
+        return
+    # At most 2 different activities per user
+    if len(joined) >= 2:
+        await interaction.response.send_message("You can only be in 2 different activity queues at once.", ephemeral=True)
+        return
+    q = _ensure_queue(activity)
+    q.append(uid)
+    await interaction.response.send_message(f"Joined queue for: {activity}", ephemeral=True)
+    await _post_queue_board()
+
+@bot.tree.command(name="queue", description="Show the current queues for all activities")
+async def queue_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await _post_queue_board()
+    await interaction.followup.send("Queue board updated.", ephemeral=True)
 
 # Helper to send a message to a channel by ID, fetching if needed
 async def _send_to_channel_id(channel_id: str | None, content: str | None = None, *, embed: discord.Embed | None = None) -> bool:
