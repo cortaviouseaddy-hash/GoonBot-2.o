@@ -52,13 +52,15 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     # Sync app commands (slash commands)
     try:
+        # Always update global commands to ensure old signatures like 'message' are replaced
+        gsynced = await bot.tree.sync()
+        print(f"Globally synced {len(gsynced)} commands")
+
+        # Then, if a target guild is configured, also sync to that guild for instant availability
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
-        else:
-            synced = await bot.tree.sync()
-            print(f"Globally synced {len(synced)} commands")
+            gsynced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(gsynced)} commands to guild {GUILD_ID}")
     except Exception as e:
         print(f"Slash command sync failed: {e}")
 
