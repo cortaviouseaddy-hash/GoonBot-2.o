@@ -8,8 +8,19 @@ import os
 ACTIVITIES = load_presets()
 TOKEN = get_token("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")  # optional: set for fast guild-specific sync
-GENERAL_CHANNEL_ID = os.getenv("GENERAL_CHANNEL_ID")  # Destiny Community -> general
-GENERAL_SHERPA_CHANNEL_ID = os.getenv("GENERAL_SHERPA_CHANNEL_ID")  # Sherpa Assistant -> general-sherpa
+
+# Accept multiple possible env var names so you don't have to rename your existing keys on Render
+def _get_first_env(*keys: str) -> str | None:
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return None
+
+# Destiny Community -> general
+GENERAL_CHANNEL_ID = _get_first_env("GENERAL_CHANNEL_ID", "GENERAL")
+# Sherpa Assistant -> general-sherpa
+GENERAL_SHERPA_CHANNEL_ID = _get_first_env("GENERAL_SHERPA_CHANNEL_ID", "GENERAL_SHERPA")
 
 intents = discord.Intents.default()
 intents.message_content = True  # enable if you plan to parse messages elsewhere
