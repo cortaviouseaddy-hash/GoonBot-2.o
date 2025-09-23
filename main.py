@@ -17,6 +17,11 @@ def _get_first_env(*keys: str) -> str | None:
             return v
     return None
 
+# Helper: is member a Sherpa Assistant?
+def _is_sherpa(member: discord.Member) -> bool:
+    role = _get_sherpa_role(member.guild)
+    return role is not None and role in member.roles
+
 # Destiny Community -> general
 GENERAL_CHANNEL_ID = _get_first_env("GENERAL_CHANNEL_ID", "GENERAL")
 # Sherpa Assistant -> general-sherpa
@@ -143,6 +148,10 @@ async def _post_queue_board() -> None:
 @app_commands.describe(activity="Choose an activity to join")
 @app_commands.autocomplete(activity=lambda interaction, current: _activity_choices(current))
 async def join_cmd(interaction: discord.Interaction, activity: str):
+    # Block Sherpa Assistants from joining queues
+    if isinstance(interaction.user, discord.Member) and _is_sherpa(interaction.user):
+        await interaction.response.send_message("Sherpa Assistants cannot join queues.", ephemeral=True)
+        return
     # Validate activity
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity. Please choose from suggestions.", ephemeral=True)
