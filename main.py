@@ -177,7 +177,8 @@ async def _send_to_channel_id(
         return None
 
 
-def _activity_autocomplete(_: discord.Interaction, current: str):
+async def _activity_autocomplete(_: discord.Interaction, current: str):
+    """MUST be a coroutine for discord.py app_commands.autocomplete."""
     return [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if current.lower() in a.lower()][:25]
 
 
