@@ -142,6 +142,7 @@ for cat, items in ACTIVITIES.items():
     if isinstance(items, list):
         ALL_ACTIVITIES.extend(items)
 QUEUES: Dict[str, List[int]] = {}
+CHECKED: Dict[str, Set[int]] = {}
 
 def _category_of_activity(name: str) -> Optional[str]:
     for cat, items in ACTIVITIES.items():
@@ -157,6 +158,9 @@ def _user_current_activities(uid: int) -> List[str]:
 
 def _ensure_queue(name: str) -> List[int]:
     return QUEUES.setdefault(name, [])
+
+def _ensure_checked(name: str) -> Set[int]:
+    return CHECKED.setdefault(name, set())
 
 def _category_label(cat: Optional[str]) -> str:
     return {"raids": "Raid", "dungeons": "Dungeon", "exotic_activities": "Exotic"}.get(cat or "", "Activity")
@@ -251,11 +255,75 @@ async def remove_from_queue_cmd(interaction: discord.Interaction, users: str, ac
             member = guild.get_member(uid)
             removed.append(member.display_name if member else str(uid))
             q[:] = [x for x in q if x != uid]
+            _ensure_checked(activity).discard(uid)
     if not q: QUEUES.pop(activity, None)
     if not removed:
         await interaction.response.send_message(f"No selected users were in the **{activity}** queue.", ephemeral=True); return
     await interaction.response.send_message(f"Removed from **{activity}**: {', '.join(removed)}", ephemeral=True)
+    
+@bot.tree.command(name="check_in", description="Add a ✅ next to one or more users in an activity queue (founder only)")
+@promoter_only()
+@app_commands.describe(users="Mentions/IDs/names separated by spaces/commas",
+                       activity="Activity whose queue to mark")
+@app_commands.autocomplete(activity=activity_autocomplete)
+async def check_in_cmd(interaction: discord.Interaction, users: str, activity: str):
+    if activity not in ALL_ACTIVITIES:
+        await interaction.response.send_message("Unknown activity.", ephemeral=True); return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True); return
+    targets = _parse_user_ids(users, guild)
+    if not targets:
+        await interaction.response.send_message("No valid users found.", ephemeral=True); return
+    q = QUEUES.get(activity, [])
+    if not q:
+        await interaction.response.send_message(f"No queue exists yet for **{activity}**.", ephemeral=True); return
+
+    checked = _ensure_checked(activity)
+    added = []
+    for uid in targets:
+        if uid in q:
+            checked.add(uid)
+            m = guild.get_member(uid)
+            added.append(m.display_name if m else str(uid))
+
+    if not added:
+        await interaction.response.send_message("No selected users are in that queue.", ephemeral=True); return
+
     await _post_activity_board(activity)
+    await interaction.response.send_message(f"Checked ✅ in **{activity}**: {', '.join(added)}", ephemeral=True)
+
+@bot.tree.command(name="uncheck_in", description="Remove the ✅ for one or more users in an activity queue (founder only)")
+@promoter_only()
+@app_commands.describe(users="Mentions/IDs/names separated by spaces/commas",
+                       activity="Activity whose queue to unmark")
+@app_commands.autocomplete(activity=activity_autocomplete)
+async def uncheck_in_cmd(interaction: discord.Interaction, users: str, activity: str):
+    if activity not in ALL_ACTIVITIES:
+        await interaction.response.send_message("Unknown activity.", ephemeral=True); return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True); return
+    targets = _parse_user_ids(users, guild)
+    if not targets:
+        await interaction.response.send_message("No valid users found.", ephemeral=True); return
+    q = QUEUES.get(activity, [])
+    if not q:
+        await interaction.response.send_message(f"No queue exists yet for **{activity}**.", ephemeral=True); return
+
+    checked = _ensure_checked(activity)
+    removed = []
+    for uid in targets:
+        if uid in checked:
+            checked.discard(uid)
+            m = guild.get_member(uid)
+            removed.append(m.display_name if m else str(uid))
+
+    if not removed:
+        await interaction.response.send_message("None of the selected users were checked.", ephemeral=True); return
+
+    await _post_activity_board(activity)
+    await interaction.response.send_message(f"Unchecked in **{activity}**: {', '.join(removed)}", ephemeral=True)
 
 @bot.tree.command(name="promote", description="Promote a member to Sherpa Assistant and announce it")
 @promoter_only()
@@ -303,12 +371,15 @@ async def _post_activity_board(activity: str) -> None:
     if not RAID_QUEUE_CHANNEL_ID or activity not in QUEUES:
         return
     q = QUEUES.get(activity, [])
-    cap = _cap_for_activity(activity)
+    checked = _ensure_checked(activity)
     embed = discord.Embed(title=f"Queue — {activity}", color=_activity_color(activity))
-    embed.add_field(name="Capacity", value=str(cap), inline=True)
     embed.add_field(name="Signed Up", value=str(len(q)), inline=True)
     if q:
-        embed.add_field(name="Players (in order)", value="\n".join(f"<@{u}>" for u in q), inline=False)
+        lines = []
+        for uid in q:
+            mark = " ✅" if uid in checked else ""
+            lines.append(f"<@{uid}>{mark}")
+        embed.add_field(name="Players (in order)", value="\n".join(lines), inline=False)
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
     embed, attachment = _apply_activity_image(embed, activity)
