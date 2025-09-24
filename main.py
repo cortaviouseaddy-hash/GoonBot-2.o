@@ -35,13 +35,16 @@ FOUNDER_USER_ID = os.getenv("FOUNDER_USER_ID")  # optional: numeric user ID of t
 
 def promoter_only():
     async def predicate(interaction: discord.Interaction) -> bool:
+        # Must be used in a guild
         if interaction.guild is None:
             raise app_commands.CheckFailure("This command can only be used in a server.")
+        # If founder ID configured, allow only that user
         try:
             if FOUNDER_USER_ID and interaction.user.id == int(FOUNDER_USER_ID):
                 return True
         except ValueError:
             pass
+        # Otherwise fall back to role name check 'Founder'
         if isinstance(interaction.user, discord.Member):
             if any(r.name.lower() == "founder" for r in interaction.user.roles):
                 return True
@@ -49,14 +52,19 @@ def promoter_only():
     return app_commands.check(predicate)
 
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # enable if you plan to parse messages elsewhere
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    # Sync app commands (slash commands)
     try:
+        # Always update global commands to ensure old signatures like 'message' are replaced
         gsynced = await bot.tree.sync()
         print(f"Globally synced {len(gsynced)} commands")
+
+        # Then, if a target guild is configured, also sync to that guild for instant availability
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             gsynced = await bot.tree.sync(guild=guild)
@@ -69,14 +77,16 @@ async def on_ready():
           f"dungeons={len(ACTIVITIES['dungeons'])}, "
           f"exotics={len(ACTIVITIES['exotic_activities'])}")
 
+# Example slash command
 @bot.tree.command(name="ping", description="Check bot latency")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! Latency: {round(bot.latency * 1000)} ms")
 
 # -----------------------------
-# Queues: /join, /queue, /remove_from_queue
+# Queues: /join and /queue
 # -----------------------------
 
+# Build a flat list of activities and caps by category
 ALL_ACTIVITIES: list[str] = []
 CAP_BY_CATEGORY: dict[str, int] = {
     "raids": 6,
@@ -87,6 +97,7 @@ for cat, items in ACTIVITIES.items():
     if isinstance(items, list):
         ALL_ACTIVITIES.extend(items)
 
+# In-memory queues: activity -> ordered list of user IDs
 QUEUES: dict[str, list[int]] = {}
 
 def _category_of_activity(name: str) -> str | None:
@@ -110,11 +121,17 @@ def _ensure_queue(name: str) -> list[int]:
     return QUEUES.setdefault(name, [])
 
 def _activity_choices(prefix: str) -> list[app_commands.Choice[str]]:
+    # Filter by case-insensitive substring for autocomplete
     pref = (prefix or "").lower()
     filtered = [a for a in ALL_ACTIVITIES if pref in a.lower()][:25]
     return [app_commands.Choice(name=a, value=a) for a in filtered]
 
+# MUST be coroutine for Discord autocomplete
+async def activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return _activity_choices(current)
+
 async def _post_queue_board() -> None:
+    # Build an embed showing main queues only (up to cap) in join order
     if not RAID_QUEUE_CHANNEL_ID:
         return
     cap_cache: dict[str, int] = {}
@@ -135,19 +152,23 @@ async def _post_queue_board() -> None:
 
 @bot.tree.command(name="join", description="Join an activity queue (raids, dungeons, exotic missions)")
 @app_commands.describe(activity="Choose an activity to join")
-@app_commands.autocomplete(activity=lambda interaction, current: _activity_choices(current))
+@app_commands.autocomplete(activity=activity_autocomplete)
 async def join_cmd(interaction: discord.Interaction, activity: str):
+    # Block Sherpa Assistants from joining queues
     if isinstance(interaction.user, discord.Member) and _is_sherpa(interaction.user):
         await interaction.response.send_message("Sherpa Assistants cannot join queues.", ephemeral=True)
         return
+    # Validate activity
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity. Please choose from suggestions.", ephemeral=True)
         return
+    # Enforce unique per activity and max 2 activities per user
     uid = interaction.user.id
     joined = _user_current_activities(uid)
     if activity in joined:
         await interaction.response.send_message("You are already signed up for this activity.", ephemeral=True)
         return
+    # At most 2 different activities per user
     if len(joined) >= 2:
         await interaction.response.send_message("You can only be in 2 different activity queues at once.", ephemeral=True)
         return
@@ -162,14 +183,34 @@ async def queue_cmd(interaction: discord.Interaction):
     await _post_queue_board()
     await interaction.followup.send("Queue board updated.", ephemeral=True)
 
-# -------- remove_from_queue (renamed /kick) --------
+def _activity_choices_user(prefix: str, user_id: int) -> list[app_commands.Choice[str]]:
+    # Return activities the user is currently in, filtered by prefix
+    in_acts = _user_current_activities(user_id)
+    pref = (prefix or "").lower()
+    filtered = [a for a in in_acts if pref in a.lower()][:25]
+    return [app_commands.Choice(name=a, value=a) for a in filtered]
+
+def _user_choices(prefix: str) -> list[app_commands.Choice[str]]:
+    # Fetch guild members and filter by display name or username
+    if not bot.guilds:
+        return []
+    guild = bot.guilds[0]  # Assuming single guild; adjust if multi-guild
+    pref = (prefix or "").lower()
+    members = [m for m in guild.members if pref in m.display_name.lower() or pref in m.name.lower()][:25]
+    return [app_commands.Choice(name=f"{m.display_name} ({m.name})", value=str(m.id)) for m in members]
+
+# -----------------------------
+# /remove_from_queue (replaces /kick), supports multiple users
+# -----------------------------
 
 def _parse_user_ids(text: str, guild: discord.Guild) -> List[int]:
+    """Accepts mentions, raw IDs, or names separated by spaces/commas; returns valid member IDs."""
     if not text:
         return []
     parts = [p.strip() for p in text.replace(",", " ").split() if p.strip()]
     ids: List[int] = []
     for p in parts:
+        # mention formats <@123>, <@!123>
         if p.startswith("<@") and p.endswith(">"):
             p = p.strip("<@!>")
         try:
@@ -179,10 +220,12 @@ def _parse_user_ids(text: str, guild: discord.Guild) -> List[int]:
             continue
         except ValueError:
             pass
+        # fallback: match by display name or username (first hit)
         lower = p.lower()
         m = discord.utils.find(lambda u: lower in u.display_name.lower() or lower in u.name.lower(), guild.members)
         if m:
             ids.append(m.id)
+    # de-dupe, keep order
     seen = set()
     out: List[int] = []
     for i in ids:
@@ -197,7 +240,9 @@ def _parse_user_ids(text: str, guild: discord.Guild) -> List[int]:
     users="Mentions, IDs, or names separated by spaces/commas (e.g., @A @B 1234567890)",
     activity="Activity queue to remove them from"
 )
+@app_commands.autocomplete(activity=activity_autocomplete)
 async def remove_from_queue_cmd(interaction: discord.Interaction, users: str, activity: str):
+    # Validate activity
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True)
         return
@@ -230,93 +275,7 @@ async def remove_from_queue_cmd(interaction: discord.Interaction, users: str, ac
     )
     await _post_queue_board()
 
-# -------- promote command --------
-
-def _get_sherpa_role(guild: discord.Guild) -> discord.Role | None:
-    role_id_env = os.getenv("SHERPA_ROLE_ID")
-    if role_id_env:
-        try:
-            r = guild.get_role(int(role_id_env))
-            if r:
-                return r
-        except ValueError:
-            pass
-    for r in guild.roles:
-        if r.name.lower() == "sherpa assistant":
-            return r
-    return None
-
-@bot.tree.command(name="promote", description="Promote a member to Sherpa Assistant and announce it with flair")
-@promoter_only()
-@app_commands.describe(user="Member to promote")
-async def promote(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.guild is None:
-        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
-        return
-
-    guild = interaction.guild
-    sherpa_role = _get_sherpa_role(guild)
-    if not sherpa_role:
-        await interaction.followup.send("Could not find the 'Sherpa Assistant' role.", ephemeral=True)
-        return
-
-    assigned = False
-    if sherpa_role not in user.roles:
-        try:
-            await user.add_roles(sherpa_role, reason=f"Promoted by {interaction.user} via /promote")
-            assigned = True
-        except discord.Forbidden:
-            await interaction.followup.send("I don't have permission to manage roles or my role is below 'Sherpa Assistant'.", ephemeral=True)
-            return
-        except Exception as e:
-            await interaction.followup.send(f"Failed to assign role: {e}", ephemeral=True)
-            return
-
-    description_lines = [
-        f"🎉 **Congratulations, {user.mention}!** 🏆",
-        "",
-        "You’ve risen above and become a **Sherpa Assistant**. This isn’t just a new role — it’s a mark of trust and respect.",
-        "",
-        "✨ **What it Means to be a Sherpa**",
-        "Sherpas bring **patience, clarity, and positive vibes** to every fireteam.",
-        "They’re the **torchbearers of the fireteam**, guiding others through chaos and turning doubt into understanding.",
-        "They help newer and returning players **learn mechanics and win together**.",
-        "A Sherpa doesn’t just guide — they inspire Guardians to rise higher.",
-        "",
-        "⚔️ **Expectations**",
-        "• Be the calm voice when the fireteam feels the pressure.",
-        "• Explain mechanics clearly so **anyone** can master them.",
-        "• Turn every wipe into a lesson and every lesson into victory.",
-        "• Keep every run welcoming, fun, and unforgettable.",
-        "",
-        "🌌 **Carry the Light**",
-        "Every Guardian you guide becomes part of your story.",
-        "Lead with patience, lift others up, and show the community what it truly means to **Carry the Light**.",
-    ]
-
-    palette = [discord.Color.blurple(), discord.Color.green(), discord.Color.gold(), discord.Color.purple(), discord.Color.orange()]
-    embed = discord.Embed(
-        title="Sherpa Promotion 🌟",
-        description="\n".join(description_lines),
-        color=random.choice(palette),
-    )
-    embed.set_author(name=user.display_name, icon_url=user.display_avatar.url if user.display_avatar else discord.Embed.Empty)
-    embed.set_thumbnail(url=user.display_avatar.url if user.display_avatar else discord.Embed.Empty)
-    embed.set_footer(text=f"Promoted by {interaction.user.display_name} • GG!")
-
-    targets = [GENERAL_CHANNEL_ID, GENERAL_SHERPA_CHANNEL_ID]
-    success_count = 0
-    for tid in targets:
-        ok = await _send_to_channel_id(tid, None, embed=embed)
-        if ok:
-            success_count += 1
-
-    ack = f"Role {'assigned' if assigned else 'already present'}; announcement sent in {success_count}/{len(targets)} channels."
-    await interaction.followup.send(ack, ephemeral=True)
-
-# -------- helpers --------
-
+# Helper to send a message to a channel by ID, fetching if needed
 async def _send_to_channel_id(channel_id: str | None, content: str | None = None, *, embed: discord.Embed | None = None) -> bool:
     if not channel_id:
         return False
@@ -335,5 +294,113 @@ async def _send_to_channel_id(channel_id: str | None, content: str | None = None
     except Exception as e:
         print(f"Failed to post to channel {channel_id}: {e}")
         return False
+
+def _get_sherpa_role(guild: discord.Guild) -> discord.Role | None:
+    role_id_env = os.getenv("SHERPA_ROLE_ID")
+    if role_id_env:
+        try:
+            r = guild.get_role(int(role_id_env))
+            if r:
+                return r
+        except ValueError:
+            pass
+    # Fallback by common name
+    for r in guild.roles:
+        if r.name.lower() == "sherpa assistant":
+            return r
+    return None
+
+# -----------------------------
+# /promote — colorful embed + avatar + epic copy
+# -----------------------------
+@bot.tree.command(name="promote", description="Promote a member to Sherpa Assistant and announce it with style")
+@promoter_only()
+@app_commands.describe(user="Member to promote")
+async def promote(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    # Safety: only in guilds
+    if interaction.guild is None:
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    sherpa_role = _get_sherpa_role(guild)
+    if not sherpa_role:
+        await interaction.followup.send("Could not find the 'Sherpa Assistant' role. Set SHERPA_ROLE_ID in environment or ensure a role named 'Sherpa Assistant' exists.", ephemeral=True)
+        return
+
+    # Assign role if not already
+    assigned = False
+    if sherpa_role not in user.roles:
+        try:
+            await user.add_roles(sherpa_role, reason=f"Promoted by {interaction.user} via /promote")
+            assigned = True
+        except discord.Forbidden:
+            await interaction.followup.send("I don't have permission to manage roles or my role is below 'Sherpa Assistant'. Move my role above and grant 'Manage Roles'.", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"Failed to assign role: {e}", ephemeral=True)
+            return
+
+    # Build announcement embed (epic, community-driven vibe)
+    description_lines = [
+        f"🎉 **Congratulations, {user.mention}!** 🏆",
+        "",
+        "You’ve risen above and become a **Sherpa Assistant**. This isn’t just a new role — it’s a mark of trust and respect.",
+        "",
+        "✨ **What it Means to be a Sherpa**",
+        "Sherpas bring **patience, clarity, and positive vibes** to every fireteam.",
+        "They’re the torchbearers of the fireteam, guiding others through chaos and turning doubt into understanding.",
+        "They help newer and returning players **learn mechanics and win together**.",
+        "A Sherpa doesn’t just guide — they inspire Guardians to rise higher.",
+        "",
+        "⚔️ **Expectations**",
+        "• Be the calm voice when the fireteam feels the pressure.",
+        "• Explain mechanics clearly so **anyone** can master them.",
+        "• Turn every wipe into a lesson and every lesson into victory.",
+        "• Keep every run welcoming, fun, and unforgettable.",
+        "",
+        "🌌 **Carry the Light**",
+        "Every Guardian you guide becomes part of your story.",
+        "Lead with patience, lift others up, and show the community what it truly means to **Carry the Light**.",
+    ]
+
+    # fun color palette
+    palette = [
+        discord.Color.blurple(),
+        discord.Color.green(),
+        discord.Color.gold(),
+        discord.Color.purple(),
+        discord.Color.orange(),
+    ]
+    embed = discord.Embed(
+        title="Sherpa Promotion 🌟",
+        description="\n".join(description_lines),
+        color=random.choice(palette),
+    )
+    # Avatar as author icon + thumbnail
+    try:
+        icon_url = user.display_avatar.url
+    except Exception:
+        icon_url = None
+    embed.set_author(name=user.display_name, icon_url=icon_url if icon_url else discord.Embed.Empty)
+    if icon_url:
+        embed.set_thumbnail(url=icon_url)
+    embed.set_footer(text=f"Promoted by {interaction.user.display_name}")
+
+    # Post to target channels
+    targets = [GENERAL_CHANNEL_ID, GENERAL_SHERPA_CHANNEL_ID]
+    success_count = 0
+    for tid in targets:
+        ok = await _send_to_channel_id(tid, None, embed=embed)
+        if ok:
+            success_count += 1
+
+    # Acknowledge to invoker
+    ack = f"Role {'assigned' if assigned else 'already present'}; announcement sent in {success_count}/{len(targets)} channels."
+    await interaction.followup.send(ack, ephemeral=True)
+
+# No commands or handlers here. Add cogs/AI elsewhere to use ACTIVITIES.
 
 bot.run(TOKEN)
