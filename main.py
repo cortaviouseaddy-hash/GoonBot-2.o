@@ -1,7 +1,6 @@
-# GoonBot main file (robust) — queues, promotions, events + image support with safe fallbacks
+# GoonBot main file — unlimited queues, founder check-in, schedule with DM confirmations & reminders
 import os
-import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
 import discord
@@ -19,7 +18,7 @@ except Exception:
 # ---------------
 # Config & presets
 # ---------------
-ACTIVITIES = load_presets()
+ACTIVITIES = load_presets()  # {'raids': [...], 'dungeons': [...], 'exotic_activities': [...]}
 
 # env helper with fallback to name
 def _get_first_env(key: str, fallback_name: str) -> Optional[str]:
@@ -39,7 +38,6 @@ SHERPA_ROLE_ID = os.getenv("SHERPA_ROLE_ID")
 
 # Map activity to local image path. If files are missing, the bot will just skip images.
 ACTIVITY_IMAGES: Dict[str, str] = {
-    # Raids
     "Crota's End": "assets/raids/crotas_end.jpg",
     "Deep Stone Crypt": "assets/raids/deep_stone_crypt.jpg",
     "Garden of Salvation": "assets/raids/garden_of_salvation.jpg",
@@ -74,6 +72,18 @@ def promoter_only():
                 return True
         raise app_commands.CheckFailure("You are not authorized to use this command.")
     return app_commands.check(predicate)
+
+
+def founder_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.CheckFailure("Use this in a server.")
+        try:
+            return FOUNDER_USER_ID and interaction.user.id == int(FOUNDER_USER_ID)
+        except Exception:
+            return False
+    return app_commands.check(predicate)
+
 
 @bot.event
 async def on_ready():
@@ -150,7 +160,7 @@ def _apply_activity_image(embed: discord.Embed, activity: str) -> Tuple[discord.
         return embed, None
 
 # --------------
-# Queues
+# Queues & boards
 # --------------
 ALL_ACTIVITIES: List[str] = []
 CAP_BY_CATEGORY: Dict[str, int] = {"raids": 6, "dungeons": 3, "exotic_activities": 3}
@@ -172,10 +182,6 @@ def _cap_for_activity(name: str) -> int:
     return CAP_BY_CATEGORY.get(_category_of_activity(name) or "", 6)
 
 
-def _user_current_activities(uid: int) -> List[str]:
-    return [a for a, lst in QUEUES.items() if uid in lst]
-
-
 def _ensure_queue(name: str) -> List[int]:
     return QUEUES.setdefault(name, [])
 
@@ -184,20 +190,15 @@ def _ensure_checked(name: str) -> Set[int]:
     return CHECKED.setdefault(name, set())
 
 
-def _category_label(cat: Optional[str]) -> str:
-    return {
-        "raids": "Raid",
-        "dungeons": "Dungeon",
-        "exotic_activities": "Exotic Mission",
-        None: "Unknown",
-    }.get(cat, "Unknown")
-
-
 async def _post_all_activity_boards():
     if not RAID_QUEUE_CHANNEL_ID:
         return
     for act in list(QUEUES.keys()):
         await _post_activity_board(act)
+
+
+def _activity_autocomplete(_: discord.Interaction, current: str):
+    return [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if current.lower() in a.lower()][:25]
 
 
 async def _post_activity_board(activity: str) -> None:
@@ -215,7 +216,8 @@ async def _post_activity_board(activity: str) -> None:
         for uid in q:
             mark = " ✅" if uid in checked else ""
             lines.append(f"<@{uid}>{mark}")
-        embed.add_field(name="Players (in order)", value="\n".join(lines), inline=False)
+        embed.add_field(name="Players (in order)", value="
+".join(lines), inline=False)
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
 
@@ -223,7 +225,7 @@ async def _post_activity_board(activity: str) -> None:
     await _send_to_channel_id(RAID_QUEUE_CHANNEL_ID, None, embed=embed, file=attachment)
 
 # --------------
-# Slash commands: core
+# Slash: ping / join / queue / add / remove / check-in
 # --------------
 
 @bot.tree.command(name="ping", description="Check bot latency")
@@ -233,17 +235,21 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="join", description="Join an activity queue")
 @app_commands.describe(activity="Choose an activity to join")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def join_cmd(interaction: discord.Interaction, activity: str):
-    if isinstance(interaction.user, discord.Member) and _is_sherpa(interaction.user):
+    # Sherpa Assistants cannot join queues
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if member and _is_sherpa(member):
         await interaction.response.send_message("Sherpa Assistants cannot join queues.", ephemeral=True); return
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True); return
     uid = interaction.user.id
-    if activity in _user_current_activities(uid):
-        await interaction.response.send_message("You are already signed up for this activity.", ephemeral=True); return
-    if len(_user_current_activities(uid)) >= 2:
-        await interaction.response.send_message("You can only be in 2 different activity queues at once.", ephemeral=True); return
+    # Allow up to two different activities
+    in_any = [a for a, lst in QUEUES.items() if uid in lst]
+    if activity in in_any:
+        await interaction.response.send_message("You're already in that queue.", ephemeral=True); return
+    if len(in_any) >= 2:
+        await interaction.response.send_message("You can be in at most 2 different activity queues.", ephemeral=True); return
     _ensure_queue(activity).append(uid)
     await interaction.response.send_message(f"Joined queue for: {activity}", ephemeral=True)
     await _post_activity_board(activity)
@@ -272,8 +278,7 @@ def _parse_user_ids(text: str, guild: discord.Guild) -> List[int]:
         m = discord.utils.find(lambda m: m.display_name.lower() == p.lower() or m.name.lower() == p.lower(), guild.members)
         if m: out.append(m.id)
     # dedupe, preserve order
-    seen = set()
-    uniq: List[int] = []
+    seen = set(); uniq: List[int] = []
     for uid in out:
         if uid not in seen:
             uniq.append(uid); seen.add(uid)
@@ -283,7 +288,7 @@ def _parse_user_ids(text: str, guild: discord.Guild) -> List[int]:
 @bot.tree.command(name="add_to_queue", description="(Founder) Add users to an activity queue")
 @promoter_only()
 @app_commands.describe(users="Mentions/IDs/names separated by spaces/commas", activity="Activity name")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def add_to_queue_cmd(interaction: discord.Interaction, users: str, activity: str):
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True); return
@@ -309,7 +314,7 @@ async def add_to_queue_cmd(interaction: discord.Interaction, users: str, activit
 @bot.tree.command(name="remove_from_queue", description="(Founder) Remove users from an activity queue")
 @promoter_only()
 @app_commands.describe(users="Mentions/IDs/names separated by spaces/commas", activity="Activity name")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def remove_from_queue_cmd(interaction: discord.Interaction, users: str, activity: str):
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True); return
@@ -336,18 +341,19 @@ async def remove_from_queue_cmd(interaction: discord.Interaction, users: str, ac
     await _post_activity_board(activity)
 
 
-# NEW: Founder-only green-check toggles
+# Founder-only green-check toggles
 @bot.tree.command(name="check_in", description="Add a ✅ next to one or more users in an activity queue (founder only)")
 @promoter_only()
 @app_commands.describe(users="Mentions/IDs/names separated by spaces/commas",
                        activity="Activity whose queue to mark")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def check_in_cmd(interaction: discord.Interaction, users: str, activity: str):
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True); return
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True); return
+
     targets = _parse_user_ids(users, guild)
     if not targets:
         await interaction.response.send_message("No valid users found.", ephemeral=True); return
@@ -374,13 +380,14 @@ async def check_in_cmd(interaction: discord.Interaction, users: str, activity: s
 @promoter_only()
 @app_commands.describe(users="Mentions/IDs/names separated by spaces/commas",
                        activity="Activity whose queue to unmark")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def uncheck_in_cmd(interaction: discord.Interaction, users: str, activity: str):
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True); return
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True); return
+
     targets = _parse_user_ids(users, guild)
     if not targets:
         await interaction.response.send_message("No valid users found.", ephemeral=True); return
@@ -402,7 +409,6 @@ async def uncheck_in_cmd(interaction: discord.Interaction, users: str, activity:
     await _post_activity_board(activity)
     await interaction.response.send_message(f"Unchecked in **{activity}**: {', '.join(removed)}", ephemeral=True)
 
-
 # --------------
 # Promote (Torchbearer style embed)
 # --------------
@@ -417,10 +423,9 @@ async def promote(interaction: discord.Interaction, user: discord.Member):
     role = _get_sherpa_role(interaction.guild)
     if not role:
         await interaction.followup.send("Could not find the 'Sherpa Assistant' role. Set SHERPA_ROLE_ID or create one.", ephemeral=True); return
-    assigned = False
     if role not in user.roles:
         try:
-            await user.add_roles(role, reason=f"Promoted by {interaction.user} via /promote"); assigned = True
+            await user.add_roles(role, reason=f"Promoted by {interaction.user} via /promote")
         except discord.Forbidden:
             await interaction.followup.send("I need 'Manage Roles' and my role must be above 'Sherpa Assistant'.", ephemeral=True); return
 
@@ -438,7 +443,8 @@ async def promote(interaction: discord.Interaction, user: discord.Member):
         "",
         "🌌 **Carry the Light**",
     ]
-    embed = discord.Embed(title="Sherpa Promotion 🌟", description="\n".join(lines), color=discord.Color.purple())
+    embed = discord.Embed(title="Sherpa Promotion 🌟", description="
+".join(lines), color=discord.Color.purple())
     embed.set_footer(text="Carry the torch. Lead the way.")
 
     # Post in General + General Sherpa if configured
@@ -449,16 +455,17 @@ async def promote(interaction: discord.Interaction, user: discord.Member):
                 sent += 1
     await interaction.followup.send(f"Promoted {'and announced' if sent else ''}.", ephemeral=True)
 
-
 # --------------
-# Event creation (trimmed for brevity but functional)
+# Event embed helper
 # --------------
 
-def _resolve_tz() -> Tuple[int, str]:
-    tz_name = os.getenv("SERVER_TZ", "UTC")
-    tz = ZoneInfo(tz_name) if ZoneInfo else None
-    dt = datetime.now(tz)
-    return int(dt.timestamp()), (tz.key if tz else tz_name)
+def _category_label(cat: Optional[str]) -> str:
+    return {
+        "raids": "Raid",
+        "dungeons": "Dungeon",
+        "exotic_activities": "Exotic Mission",
+        None: "Unknown",
+    }.get(cat, "Unknown")
 
 
 def _names_from_ids(guild: discord.Guild, ids: Set[int]) -> str:
@@ -472,7 +479,6 @@ def _names_from_ids(guild: discord.Guild, ids: Set[int]) -> str:
 
 
 async def _render_event_embed(guild: discord.Guild, activity: str, data: Dict[str, object]) -> Tuple[discord.Embed, Optional[discord.File]]:
-    # Uses provided human-readable when_text rather than strict timestamp scheduling (keeps things simple)
     when_text = data.get("when_text", "TBD")
     embed = discord.Embed(title=f"📣 Event: {activity}", description=data.get("desc", "Be ready and bring good vibes!"), color=_activity_color(activity))
     embed.add_field(name="When", value=str(when_text), inline=False)
@@ -481,7 +487,7 @@ async def _render_event_embed(guild: discord.Guild, activity: str, data: Dict[st
     cap = data.get("capacity", _cap_for_activity(activity)) or _cap_for_activity(activity)
     embed.add_field(name="Capacity", value=str(cap), inline=True)
 
-    # Sherpa section
+    # Sherpas
     reserved = int(data.get("reserved_sherpas", 0))
     sherpas = data.get("sherpas", set()) or set()
     sherpa_backup = data.get("sherpa_backup", set()) or set()
@@ -489,64 +495,26 @@ async def _render_event_embed(guild: discord.Guild, activity: str, data: Dict[st
     if sherpa_backup:
         embed.add_field(name=f"Sherpa Backup ({len(sherpa_backup)})", value=_names_from_ids(guild, sherpa_backup), inline=False)
 
-    # Players section
-    selected = data.get("players", []) or []
-    confirmed = data.get("confirmed", set()) or set()
-    if selected:
-        lines = []
-        for uid in selected:
-            mark = " ✅" if uid in confirmed else ""
-            lines.append(f"<@{uid}>{mark}")
-        embed.add_field(name=f"Players ({len(selected)}/{cap})", value="
+    # Participants
+    participants: List[int] = data.get("players", []) or []  # confirmed players
+    if participants:
+        lines = [f"<@{uid}>" for uid in participants]
+        embed.add_field(name=f"Participants ({len(participants)}/{cap})", value="
 ".join(lines), inline=False)
 
-    backups = data.get("backups", []) or []
+    backups: List[int] = data.get("backups", []) or []
     if backups:
-        embed.add_field(name=f"Backups ({len(backups)})", value=_names_from_ids(guild, set(backups)), inline=False)
+        embed.add_field(name=f"Backups ({len(backups)})", value="
+".join(f"<@{u}>" for u in backups), inline=False)
 
-    # Image
     embed, f = _apply_activity_image(embed, activity)
-
-    # Footer state
-    state_bits = []
-    if data.get("signups_open"):
-        state_bits.append("Open to everyone ✅")
-    else:
-        state_bits.append("Closed signups — scheduled squad")
-    embed.set_footer(text=" | ".join(state_bits))
+    embed.set_footer(text="Use 📝 on this post to join Backups. LFG reactions do not count.")
     return embed, f
 
-
-@bot.tree.command(name="event", description="(Founder) Create a lightweight event announcement")
-@promoter_only()
-@app_commands.describe(activity="Activity name", description="Optional description")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
-async def event_cmd(interaction: discord.Interaction, activity: str, description: Optional[str] = None):
-    if activity not in ALL_ACTIVITIES:
-        await interaction.response.send_message("Unknown activity.", ephemeral=True); return
-    data = {"desc": description or "Be ready and bring good vibes!", "sherpa": set(), "confirmed": set(), "when_text": "TBD"}
-    embed, f = await _render_event_embed(interaction.guild, activity, data)
-    await interaction.response.send_message("Event posted.", ephemeral=True)
-    await _send_to_channel_id(GENERAL_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID, embed=embed, file=f)
-
-
 # --------------
-# Schedule system (Founder-only, DM **everyone** in queue; no backups until full; self-backup allowed; auto-fill on open)
+# Schedule system (Founder-only, DM everyone in queue; self-backup; auto-open; reminders; survey)
 # --------------
 SCHEDULES: Dict[int, Dict[str, object]] = {}  # event_message_id -> schedule data
-
-# Founder-only check
-
-def founder_only():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            raise app_commands.CheckFailure("Use this in a server.")
-        try:
-            return FOUNDER_USER_ID and interaction.user.id == int(FOUNDER_USER_ID)
-        except Exception:
-            return False
-    return app_commands.check(predicate)
-
 
 class ConfirmView(discord.ui.View):
     def __init__(self, mid: int, uid: int):
@@ -575,10 +543,9 @@ class ConfirmView(discord.ui.View):
             participants.append(self.uid)
             await interaction.response.send_message("Locked in. See you there! ✅", ephemeral=True)
         else:
-            # Full — per spec, now we create/use backups and place confirmers there
             if self.uid not in backups:
                 backups.append(self.uid)
-            await interaction.response.send_message("Roster is currently full — you've been added as **Backup**.", ephemeral=True)
+            await interaction.response.send_message("Roster is full — you've been added as **Backup**.", ephemeral=True)
         guild = interaction.client.get_guild(data.get("guild_id"))  # type: ignore
         if guild:
             await _update_schedule_message(guild, self.mid)
@@ -598,10 +565,6 @@ class ConfirmView(discord.ui.View):
             if guild:
                 await _update_schedule_message(guild, self.mid)
         await interaction.response.send_message("All good. Thanks for letting us know.", ephemeral=True)
-
-
-def _first_n(iterable: List[int], n: int) -> List[int]:
-    return iterable[:max(0, n)] if iterable else []
 
 
 def _autofill_from_backups(data: Dict[str, object]):
@@ -624,7 +587,7 @@ async def _update_schedule_message(guild: discord.Guild, message_id: int):
     try:
         ch = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
         msg = await ch.fetch_message(int(message_id))
-        embed, f = await _render_event_embed(guild, data["activity"], data)
+        embed, _ = await _render_event_embed(guild, data["activity"], data)
         await msg.edit(embed=embed)
     except Exception as e:
         print("Failed to update schedule msg:", e)
@@ -660,9 +623,7 @@ async def _scheduler_loop():
                 # 2h auto-open (to everyone) if short on participants; announcement in LFG
                 if not data.get("signups_open") and now >= start_ts - 2*60*60 and len(participants) < player_slots:
                     data["signups_open"] = True
-                    # Promote any existing backups into participants until full
                     _autofill_from_backups(data)
-                    # LFG announcement — NO reactions; direct them to event signup
                     await _send_to_channel_id(
                         LFG_CHAT_CHANNEL_ID or GENERAL_CHANNEL_ID,
                         content=(
@@ -671,8 +632,45 @@ async def _scheduler_loop():
                             f"👉 Go to the **event signup post** and react there to join. (Reactions **here** won't count.)"
                         ),
                     )
-                
+
                 # Reminders to participants and sherpas
+                for label, delta, key in (("2h", 2*60*60, "r_2h"), ("30m", 30*60, "r_30m"), ("start", 0, "r_0m")):
+                    if not data.get(key) and now >= start_ts - delta:
+                        await _send_reminders(data, label)
+                        data[key] = True
+        except Exception as e:
+            print("scheduler error:", e)
+        finally:
+            # tick roughly once per minute
+            await discord.utils.sleep_until(datetime.utcnow().replace(second=0, microsecond=0) + timedelta(minutes=1))
+
+
+async def _send_reminders(data: Dict[str, object], label: str):
+    guild = bot.get_guild(data.get("guild_id"))  # type: ignore
+    if not guild:
+        return
+    activity = data.get("activity", "Event")
+    when_text = data.get("when_text", "soon")
+
+    participants: List[int] = data.get("players", [])  # type: ignore
+    sherpas: Set[int] = data.get("sherpas", set())  # type: ignore
+
+    msg = {
+        "2h": f"Reminder: **{activity}** in ~2 hours ({when_text}).",
+        "30m": f"Reminder: **{activity}** in ~30 minutes ({when_text}).",
+        "start": f"It's time: **{activity}** ({when_text}).",
+    }.get(label, f"Reminder: **{activity}** ({when_text}).")
+
+    async def dm(uid: int):
+        try:
+            member = guild.get_member(uid)
+            if not member:
+                return
+            d = await member.create_dm()
+            await d.send(msg)
+        except Exception:
+            pass
+
     for uid in participants:
         await dm(uid)
     for uid in sherpas:
@@ -681,32 +679,37 @@ async def _scheduler_loop():
     # Post-event survey DM (3h after start)
     if label == "start":
         async def survey_task():
-            await discord.utils.sleep_until(datetime.utcnow() + timedelta(hours=3))
-            guild = bot.get_guild(data.get("guild_id")) if data else None
-            if not guild:
-                return
-            survey_msg = (f"Thanks for running **{activity}**! We'd love your feedback.
+            try:
+                await discord.utils.sleep_until(datetime.utcnow() + timedelta(hours=3))
+                g = bot.get_guild(data.get("guild_id"))  # type: ignore
+                if not g:
+                    return
+                survey_msg = (
+                    f"Thanks for running **{activity}**! We'd love your feedback.
 "
-                          f"Please fill out the survey in **#survey-and-suggestions**.")
-            for uid in participants:
-                try:
-                    member = guild.get_member(uid)
-                    if member:
-                        d = await member.create_dm()
-                        await d.send(survey_msg)
-                except Exception:
-                    pass
+                    f"Please fill out the survey in **#survey-and-suggestions**."
+                )
+                for uid in participants:
+                    try:
+                        member = g.get_member(uid)
+                        if member:
+                            d = await member.create_dm()
+                            await d.send(survey_msg)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         bot.loop.create_task(survey_task())
 
 
-@bot.tree.command(name="schedule", description="(Founder) Schedule a run: DM **everyone** in queue; backups only once full; reminders; LFG announce")
+@bot.tree.command(name="schedule", description="(Founder) Schedule a run: DM everyone in queue; backups once full; reminders; LFG announce")
 @founder_only()
 @app_commands.describe(activity="Activity name",
                        when_text="Shown in the embed (e.g., 'Today 5pm ET')",
                        date="YYYY-MM-DD (for reminders/auto-open)",
                        time="HH:MM 24h in America/New_York (for reminders/auto-open)",
                        reserved_sherpas="Number of Sherpa slots to reserve (default 2)")
-@app_commands.autocomplete(activity=lambda i, c: [app_commands.Choice(name=a, value=a) for a in ALL_ACTIVITIES if c.lower() in a.lower()][:25])
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def schedule_cmd(interaction: discord.Interaction, activity: str, when_text: str,
                        date: Optional[str] = None, time: Optional[str] = None, reserved_sherpas: Optional[int] = 2):
     if activity not in ALL_ACTIVITIES:
@@ -756,21 +759,26 @@ async def schedule_cmd(interaction: discord.Interaction, activity: str, when_tex
             if not m: continue
             dm = await m.create_dm()
             await dm.send(
-                content=(f"You've been selected for **{activity}** at **{when_text}** in {interaction.guild.name}.
+                content=(
+                    f"You've been selected for **{activity}** at **{when_text}** in {interaction.guild.name}.
 "
-                         f"Tap **Confirm** to lock your spot."),
+                    f"Tap **Confirm** to lock your spot."
+                ),
                 view=ConfirmView(mid=mid, uid=uid)
             )
             sent += 1
         except Exception:
             pass
 
-    # Sherpa alert (unchanged)
+    # Sherpa alert (first R get slots; extras go to backup)
     if GENERAL_SHERPA_CHANNEL_ID and reserved > 0:
         alert = await _send_to_channel_id(
             GENERAL_SHERPA_CHANNEL_ID,
-            content=(f"🧭 **Sherpa Alert:** {activity} at **{when_text}**. "
-                     f"{reserved} reserved Sherpa slot(s). React ✅ to claim."))
+            content=(
+                f"🧭 **Sherpa Alert:** {activity} at **{when_text}**. "
+                f"{reserved} reserved Sherpa slot(s). React ✅ to claim."
+            )
+        )
         if alert:
             SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
             SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
@@ -887,9 +895,6 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 # --------------
 # Boot
-# --------------
-# --------------
-# --------------
 # --------------
 if __name__ == "__main__":
     token = get_token("DISCORD_TOKEN")
