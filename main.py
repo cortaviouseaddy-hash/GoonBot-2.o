@@ -49,6 +49,14 @@ for v in PRESETS.values():
     if isinstance(v, list):
         ALL_ACTIVITIES.extend(v)
 
+# Explicit activity -> image map (lowercase keys). Add more mappings as needed.
+# Example: map "desert perpetual" to assets/raids/desert_perpetual.jpg
+ACTIVITY_IMAGE_MAP: Dict[str, str] = {
+    # If you have a real desert_perpetual.jpg, replace the path below.
+    # Temporarily map to an available raid image so the embed shows something.
+    "desert perpetual": os.path.join(os.path.dirname(__file__), "assets", "raids", "salvations_edge.jpg"),
+}
+
 def _cap_for_activity(activity: str) -> int:
     # Basic heuristic: raids 6, dungeons 3, default 6
     a = activity.lower()
@@ -187,6 +195,13 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
     promoter_id = data.get("promoter_id")
     if promoter_id:
         embed.add_field(name="Scheduled by", value=f"<@{promoter_id}>", inline=True)
+        # Set promoter avatar as thumbnail if possible
+        try:
+            member = guild.get_member(int(promoter_id)) if guild and promoter_id else None
+            if member and member.avatar:
+                embed.set_thumbnail(url=member.avatar.url)
+        except Exception:
+            pass
 
     # Sherpas
     sherpas = data.get("sherpas") or set()
@@ -207,9 +222,10 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
         b_lines = [f"<@{b}>" for b in backups]
         embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(b_lines), inline=False)
 
-    # Attempt to attach an image from assets matching the activity name
+    # If there's an explicit map, prefer that image; otherwise attempt fuzzy search
+    mapped = ACTIVITY_IMAGE_MAP.get(activity.lower()) if activity else None
+    img = mapped or _find_activity_image(activity)
     file = None
-    img = _find_activity_image(activity)
     if img:
         try:
             filename = os.path.basename(img)
@@ -222,13 +238,23 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
 
 
 def _find_activity_image(activity: str) -> Optional[str]:
-    # Search the assets directory for a filename containing words from the activity name.
+    # Explicit mapping for Desert Perpetual and fallback to fuzzy search
+    ACTIVITY_IMAGE_MAP = {
+        "Desert Perpetual": "assets/raids/desert_perpetual.jpg",
+        # Add more mappings as needed
+    }
     aset = os.path.join(os.path.dirname(__file__), "assets")
+    # Direct mapping first
+    img_path = ACTIVITY_IMAGE_MAP.get(activity)
+    if img_path:
+        abs_path = os.path.join(os.path.dirname(__file__), img_path) if not os.path.isabs(img_path) else img_path
+        if os.path.isfile(abs_path):
+            return abs_path
+    # Fallback: fuzzy search
     if not os.path.isdir(aset):
         return None
     activity_key = ''.join(ch.lower() for ch in activity if ch.isalnum() or ch.isspace()).strip()
     tokens = [t for t in activity_key.split() if t]
-    # Walk assets/ and try to find a file that matches tokens
     best = None
     best_score = 0
     for root, _, files in os.walk(aset):
@@ -391,10 +417,13 @@ def _autofill_from_backups(data: Dict[str, object]):
     player_slots = max(0, cap - reserved)
     participants: List[int] = data.get("players", [])  # type: ignore
     backups: List[int] = data.get("backups", [])  # type: ignore
+    moved: List[int] = []
     while len(participants) < player_slots and backups:
         nxt = backups.pop(0)
         if nxt not in participants:
             participants.append(nxt)
+            moved.append(nxt)
+    return moved
 
 
 async def _update_schedule_message(guild: discord.Guild, message_id: int):
@@ -430,7 +459,7 @@ async def _scheduler_loop():
                 # 2h auto-open (to everyone) if short on participants; announcement in LFG
                 if not data.get("signups_open") and now >= start_ts - 2*60*60 and len(participants) < player_slots:
                     data["signups_open"] = True
-                    _autofill_from_backups(data)
+                    moved = _autofill_from_backups(data)
                     await _send_to_channel_id(
                         LFG_CHAT_CHANNEL_ID or GENERAL_CHANNEL_ID,
                         content=(
@@ -438,6 +467,44 @@ async def _scheduler_loop():
                             f"👉 Go to the **event signup post** and react there to join. (Reactions **here** won't count.)"
                         ),
                     )
+                    # Try to add a public ✅ reaction to the event message so people can react to join
+                    try:
+                        ch = None
+                        if data.get("channel_id"):
+                            try:
+                                ch = bot.get_channel(int(data.get("channel_id"))) or await bot.fetch_channel(int(data.get("channel_id")))
+                            except Exception:
+                                ch = None
+                        if ch:
+                            try:
+                                msg = await ch.fetch_message(int(mid))
+                                # Add join, backup, and leave reactions so members can interact
+                                for emoji in ("✅", "📝", "❌"):
+                                    try:
+                                        await msg.add_reaction(emoji)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                # Could be missing permissions or message deleted; ignore
+                                pass
+                    except Exception:
+                        pass
+                    # DM any backups that were pulled up to players
+                    try:
+                        guild = bot.get_guild(data.get("guild_id")) if data.get("guild_id") else None
+                        if guild and moved:
+                            for uid in moved:
+                                try:
+                                    member = guild.get_member(uid)
+                                    if member:
+                                        d = await member.create_dm()
+                                        await d.send(f"You've been promoted from Backup to Player for **{data.get('activity')}** at {data.get('when_text')}. See you there! ✅")
+                                except Exception:
+                                    pass
+                        if guild:
+                            await _update_schedule_message(guild, mid)
+                    except Exception:
+                        pass
 
                 # Reminders to participants and sherpas
                 for label, delta, key in (("2h", 2*60*60, "r_2h"), ("30m", 30*60, "r_30m"), ("start", 0, "r_0m")):
@@ -579,14 +646,22 @@ async def schedule_cmd(
         if promoter_id not in participant_ids:
             participant_ids.insert(0, promoter_id)
 
+        # Sherpas visually separate but should count toward player slots.
+        # Merge sherpas into the participant order (preserve provided participant order,
+        # then append any sherpas not already listed) so they consume player slots.
+        merged_participants = list(participant_ids)
+        for sid in list(sherpa_ids):
+            if sid not in merged_participants:
+                merged_participants.append(sid)
+
         # Compose when_text for embed
         when_text = f"<t:{start_ts}:F> ({timezone})" if start_ts else "TBD"
 
         # Split participants into actual players (up to available player slots) and backups
         player_slots = max(0, cap - reserved)
-        # Dedupe while preserving order
+        # Dedupe merged participants while preserving order
         seen = set(); uniq_participants: List[int] = []
-        for uid in participant_ids:
+        for uid in merged_participants:
             if uid not in seen:
                 uniq_participants.append(uid); seen.add(uid)
         players_final = uniq_participants[:player_slots]
@@ -613,6 +688,7 @@ async def schedule_cmd(
             "candidates": candidates,
             "players": players_final,           # participants (confirmed)
             "backups": backups_final,           # pre-slotted extras become backups
+            "promoter_id": promoter_id,
             "signups_open": False,
             "channel_id": channel_id,
             "start_ts": start_ts,
@@ -629,6 +705,19 @@ async def schedule_cmd(
                 ephemeral=True,
             )
             return
+
+        # Add immediate reactions for Backup and Leave only. Join (✅) is added later when signups_open = True
+        try:
+            try:
+                await ev_msg.add_reaction("📝")
+            except Exception:
+                pass
+            try:
+                await ev_msg.add_reaction("❌")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         mid = ev_msg.id
         SCHEDULES[mid] = data
@@ -756,41 +845,90 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await _update_schedule_message(guild, payload.message_id)
         return
 
-    # Event public joins only when signups_open via ✅
+    # ✅ behavior: before signups open, treat as Backup (user intends to backup). After signups_open=True, ✅ is the join action.
     if str(payload.emoji) == "✅":
         data = SCHEDULES.get(payload.message_id)
-        if not data or not data.get("signups_open"):
+        if not data:
             return
         guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
         if not guild:
             return
+        participants: List[int] = data.get("players", [])  # type: ignore
+        backups: List[int] = data.get("backups", [])  # type: ignore
+        # If signups aren't open yet, treat ✅ as a backup signup
+        if not data.get("signups_open"):
+            if payload.user_id not in participants and payload.user_id not in backups:
+                backups.append(payload.user_id)
+            await _update_schedule_message(guild, payload.message_id)
+            return
+
+        # Signups are open: treat ✅ as join (player if space, otherwise backup)
         cap = int(data.get("capacity", 0))
         reserved = int(data.get("reserved_sherpas", 0))
         player_slots = max(0, cap - reserved)
-        participants: List[int] = data.get("players", [])  # type: ignore
-        backups: List[int] = data.get("backups", [])  # type: ignore
-        if len(participants) < player_slots and payload.user_id not in participants:
+        if payload.user_id in participants or payload.user_id in backups:
+            # already signed up
+            await _update_schedule_message(guild, payload.message_id)
+            return
+        if len(participants) < player_slots:
             participants.append(payload.user_id)
         else:
-            if payload.user_id not in backups:
-                backups.append(payload.user_id)
+            backups.append(payload.user_id)
         await _update_schedule_message(guild, payload.message_id)
+        return
+
+    # Leave reaction: ❌ removes the user from players/backups
+    if str(payload.emoji) == "❌":
+        data = SCHEDULES.get(payload.message_id)
+        if not data:
+            return
+        guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+        if not guild:
+            return
+        participants: List[int] = data.get("players", [])  # type: ignore
+        backups: List[int] = data.get("backups", [])  # type: ignore
+        removed = False
+        if payload.user_id in participants:
+            participants[:] = [x for x in participants if x != payload.user_id]
+            removed = True
+            _autofill_from_backups(data)
+        if payload.user_id in backups:
+            backups[:] = [x for x in backups if x != payload.user_id]
+            removed = True
+        if removed:
+            await _update_schedule_message(guild, payload.message_id)
+        return
 
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    # If a participant removes ✅ from the event, treat as backing out: free slot and auto-fill from backups
+    # Removing reactions: handle ✅ differently depending on whether signups are open.
     data = SCHEDULES.get(payload.message_id)
-    if not data or str(payload.emoji) != "✅":
+    if not data:
         return
     guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
     if not guild:
         return
-    participants: List[int] = data.get("players", [])  # type: ignore
-    if payload.user_id in participants:
-        participants[:] = [x for x in participants if x != payload.user_id]
-        _autofill_from_backups(data)
-        await _update_schedule_message(guild, payload.message_id)
+
+    # ✅ removed
+    if str(payload.emoji) == "✅":
+        # If signups are open, removing ✅ frees a player slot and triggers autofill
+        if data.get("signups_open"):
+            participants: List[int] = data.get("players", [])  # type: ignore
+            if payload.user_id in participants:
+                participants[:] = [x for x in participants if x != payload.user_id]
+                _autofill_from_backups(data)
+                await _update_schedule_message(guild, payload.message_id)
+        else:
+            # Before signups open, ✅ was treated as a backup — removing it removes from backups
+            backups: List[int] = data.get("backups", [])  # type: ignore
+            if payload.user_id in backups:
+                backups[:] = [x for x in backups if x != payload.user_id]
+                await _update_schedule_message(guild, payload.message_id)
+        return
+
+    # For other emojis we don't need to special-case here (📝 handled on add; ❌ handled on add)
+    return
 
 
 # ---------------------------
