@@ -514,6 +514,15 @@ async def schedule_cmd(
         players_final = uniq_participants[:player_slots]
         backups_final = uniq_participants[player_slots:]
 
+        # Determine the channel to post the event in. Prefer configured env vars,
+        # otherwise fall back to the channel where the command was invoked.
+        channel_id = GENERAL_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID
+        if not channel_id and interaction.channel:
+            try:
+                channel_id = int(interaction.channel.id)
+            except Exception:
+                channel_id = None
+
         data = {
             "guild_id": guild.id if guild else None,
             "activity": activity,
@@ -527,7 +536,7 @@ async def schedule_cmd(
             "players": players_final,           # participants (confirmed)
             "backups": backups_final,           # pre-slotted extras become backups
             "signups_open": False,
-            "channel_id": GENERAL_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID,
+            "channel_id": channel_id,
             "start_ts": start_ts,
             "r_2h": False, "r_30m": False, "r_0m": False,
         }
@@ -536,7 +545,11 @@ async def schedule_cmd(
         embed, f = await _render_event_embed(guild, activity, data)
         ev_msg = await _send_to_channel_id(data["channel_id"], embed=embed, file=f)
         if not ev_msg:
-            await interaction.followup.send("Failed to post event.", ephemeral=True)
+            attempted = data.get("channel_id")
+            await interaction.followup.send(
+                f"Failed to post event — no channel available (attempted: {attempted}). Set GENERAL_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID, or run this command in a channel.",
+                ephemeral=True,
+            )
             return
 
         mid = ev_msg.id
