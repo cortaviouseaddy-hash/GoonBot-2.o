@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
 import discord
+import random
 from discord import app_commands
 from discord.ext import commands
 
@@ -526,21 +527,41 @@ async def promote(interaction: discord.Interaction, user: discord.Member):
             return
 
     lines = [
-        f"🎉 **Congratulations, {user.mention}!** 🏆",
+        f"🎉 Congratulations, {user.mention}! �",
         "",
-        "You’re now a **Sherpa Assistant** — patience, clarity, and positive vibes.",
-        "Help newer/returning players learn mechanics and win together.",
+        "✨ What it Means to be a Sherpa Assistant",
+        "You are now part of an elite group dedicated to helping Guardians conquer Destiny's toughest challenges.",
+        "Sherpas bring patience, clarity, and positive vibes to every fireteam.",
+        "You're the torchbearers — guiding others through chaos and turning doubt into understanding.",
+        "A Sherpa doesn't just guide — they inspire Guardians to rise higher.",
         "",
-        "⚔️ **Expectations**",
-        "• Be calm under pressure",
-        "• Explain mechanics clearly",
-        "• Turn wipes into lessons",
-        "• Keep runs welcoming and fun",
+        "❤️ Why We Do This",
+        "Every Guardian deserves the chance to experience the best of Destiny.",
+        "By serving as a Sherpa Assistant, you're building a stronger, more inclusive community where knowledge is shared freely and friendships are forged through every raid and exotic mission.",
         "",
-        "🌌 **Carry the Light**",
+        "🗡️ Expectations",
+        "• Be the calm voice when the fireteam feels the pressure",
+        "• Explain mechanics clearly so anyone can succeed",
+        "• Turn wipes into lessons, and lessons into victory",
+        "• Keep every run welcoming, fun, and unforgettable",
+        "",
+        "🪄 Carry the Light",
+        "Every Guardian you guide becomes part of your story.",
+        "Lead with patience, lift others up, and show what it truly means to Carry the Light.",
     ]
-    embed = discord.Embed(title="Sherpa Promotion 🌟", description="\n".join(lines), color=discord.Color.purple())
-    embed.set_footer(text="Carry the torch. Lead the way.")
+
+    # random color choice among a friendly palette
+    color_choices = [discord.Color.blurple(), discord.Color.green(), discord.Color.gold(), discord.Color.purple(), discord.Color.orange()]
+    color = random.choice(color_choices)
+
+    embed = discord.Embed(title="Sherpa Promotion 🌟", description="\n\n".join(lines), color=color)
+    # promoted user's avatar as thumbnail
+    try:
+        embed.set_thumbnail(url=user.display_avatar.url)
+    except Exception:
+        pass
+
+    embed.set_footer(text=f"Promoted by {interaction.user.display_name} 🌟")
 
     sent = 0
     for cid in (GENERAL_CHANNEL_ID, GENERAL_SHERPA_CHANNEL_ID):
@@ -777,19 +798,33 @@ async def _send_reminders(data: Dict[str, object], label: str):
 @founder_only()
 @app_commands.describe(
     activity="Activity name",
-    when_text="Shown in the embed (e.g., 'Today 5pm ET')",
-    date="YYYY-MM-DD (for reminders/auto-open)",
-    time="HH:MM 24h in America/New_York (for reminders/auto-open)",
+    datetime_str="Date and time (MM-DD HH:MM, 24h)",
+    timezone="Timezone (dropdown)",
     reserved_sherpas="Number of Sherpa slots to reserve (default 2)",
+    sherpas="User(s) to pre-slot as Sherpa (optional)",
+    participants="User(s) to pre-slot as Participant (optional)",
 )
 @app_commands.autocomplete(activity=_activity_autocomplete)
+@app_commands.choices(
+    timezone=[
+        app_commands.Choice(name="US Eastern", value="America/New_York"),
+        app_commands.Choice(name="US Central", value="America/Chicago"),
+        app_commands.Choice(name="US Mountain", value="America/Denver"),
+        app_commands.Choice(name="US Pacific", value="America/Los_Angeles"),
+        app_commands.Choice(name="UTC", value="UTC"),
+        app_commands.Choice(name="Europe/London", value="Europe/London"),
+        app_commands.Choice(name="Europe/Paris", value="Europe/Paris"),
+        app_commands.Choice(name="Asia/Tokyo", value="Asia/Tokyo"),
+    ]
+)
 async def schedule_cmd(
     interaction: discord.Interaction,
     activity: str,
-    when_text: str,
-    date: Optional[str] = None,
-    time: Optional[str] = None,
+    datetime_str: str,
+    timezone: str = "America/New_York",
     reserved_sherpas: Optional[int] = 2,
+    sherpas: Optional[str] = None,
+    participants: Optional[str] = None,
 ):
     if activity not in ALL_ACTIVITIES:
         await interaction.response.send_message("Unknown activity.", ephemeral=True)
@@ -801,7 +836,51 @@ async def schedule_cmd(
     q = QUEUES.get(activity, [])
     candidates = list(q)  # DM **everyone** in the queue
 
-    start_ts = _parse_date_time_to_epoch(date, time, tz_name="America/New_York")
+
+    # Parse datetime_str and timezone (MM-DD HH:MM)
+    try:
+        date_part, time_part = datetime_str.strip().split()
+        # Use current year
+        now = datetime.now()
+        year = now.year
+        date_full = f"{year}-{date_part}"
+    except Exception:
+        await interaction.response.send_message("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True)
+        return
+    start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
+
+    # Parse pre-slotted users
+    sherpa_ids = set()
+    participant_ids = []
+    if sherpas:
+        for mention in sherpas.split():
+            if mention.startswith("<@") and mention.endswith(">"):
+                try:
+                    uid = int(mention.replace("<@", "").replace(">", "").replace("!", ""))
+                    sherpa_ids.add(uid)
+                except Exception:
+                    pass
+    if participants:
+        for mention in participants.split():
+            if mention.startswith("<@") and mention.endswith(">"):
+                try:
+                    uid = int(mention.replace("<@", "").replace(">", "").replace("!", ""))
+                    participant_ids.append(uid)
+                except Exception:
+                    pass
+
+    # Compose when_text for embed
+    when_text = f"<t:{start_ts}:F> ({timezone})" if start_ts else "TBD"
+
+    # Ensure the scheduling user takes one participant slot
+    promoter_id = interaction.user.id
+    if promoter_id not in participant_ids:
+        participant_ids.insert(0, promoter_id)
+
+    # Split participants into actual players (up to available player slots) and backups
+    player_slots = max(0, cap - reserved)
+    players_final = participant_ids[:player_slots]
+    backups_final = participant_ids[player_slots:]
 
     data = {
         "guild_id": interaction.guild.id,
@@ -810,11 +889,11 @@ async def schedule_cmd(
         "when_text": when_text,
         "capacity": cap,
         "reserved_sherpas": reserved,
-        "sherpas": set(),
+        "sherpas": sherpa_ids,
         "sherpa_backup": set(),
         "candidates": candidates,
-        "players": [],           # participants (confirmed)
-        "backups": [],           # stays empty until roster is full
+        "players": players_final,           # participants (confirmed)
+        "backups": backups_final,           # pre-slotted extras become backups
         "signups_open": False,
         "channel_id": GENERAL_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID,
         "start_ts": start_ts,
@@ -851,6 +930,28 @@ async def schedule_cmd(
         except Exception as e:
             print("DM failed:", e)
 
+    # DM pre-slotted participants immediately (if any) with confirmation
+    pre_dmed = set(candidates)  # already attempted DMs to queue candidates
+    p_sent = 0
+    for uid in data.get("players", []) or []:
+        try:
+            if uid in pre_dmed:
+                continue
+            m = interaction.guild.get_member(uid)
+            if not m:
+                continue
+            dm = await m.create_dm()
+            # include jump link to the event post if available
+            event_link = ev_msg.jump_url if ev_msg else None
+            content = (
+                f"You're confirmed for **{activity}** at **{when_text}** in {interaction.guild.name}."
+                + (f"\nView the event: {event_link}" if event_link else "")
+            )
+            await dm.send(content=content)
+            p_sent += 1
+        except Exception as e:
+            print("Pre-slot DM failed:", e)
+
     # Sherpa alert (first R get slots; extras go to backup)
     if GENERAL_SHERPA_CHANNEL_ID and reserved > 0:
         alert = await _send_to_channel_id(
@@ -871,32 +972,7 @@ async def schedule_cmd(
     await interaction.followup.send(f"Scheduled **{activity}**. DMed {sent} queue member(s).", ephemeral=True)
 
 
-@bot.tree.command(name="open_signups", description="(Founder) Open event to everyone (react on event only; LFG is announcement-only)")
-@founder_only()
-@app_commands.describe(event_message_id="Right-click Copy ID of the event message")
-async def open_signups_cmd(interaction: discord.Interaction, event_message_id: str):
-    try:
-        mid = int(event_message_id)
-    except ValueError:
-        await interaction.response.send_message("Invalid message ID.", ephemeral=True)
-        return
-    data = SCHEDULES.get(mid)
-    if not data:
-        await interaction.response.send_message("I can't find that scheduled event.", ephemeral=True)
-        return
-    data["signups_open"] = True
-    # Promote backups into participants until full
-    _autofill_from_backups(data)
-    await _update_schedule_message(interaction.guild, mid)
-    # LFG announcement that directs users to the event post
-    await _send_to_channel_id(
-        LFG_CHAT_CHANNEL_ID or GENERAL_CHANNEL_ID,
-        content=(
-            f"📣 **{data['activity']}** signups are now open.\n"
-            f"👉 Go to the **event signup post** and react there to join. (Reactions **here** won't count.)"
-        ),
-    )
-    await interaction.response.send_message("Signups opened and LFG announcement posted.", ephemeral=True)
+# (open_signups command removed — schedule now auto-opens via scheduler loop 2h before start if slots remain)
 
 
 # ---------------------------
