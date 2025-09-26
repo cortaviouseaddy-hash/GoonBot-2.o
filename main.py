@@ -211,6 +211,14 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
             embed.add_field(name="Sherpas", value=", ".join(s_list), inline=False)
         except Exception:
             pass
+    # Sherpa backups
+    s_backups = data.get("sherpa_backup") or set()
+    if s_backups:
+        try:
+            sb_list = [f"<@{int(x)}>" for x in (list(s_backups)[:10])]
+            embed.add_field(name=f"Sherpa Backups ({len(s_backups)})", value="\n".join(sb_list), inline=False)
+        except Exception:
+            pass
 
     # Players and backups
     players = data.get("players", []) or []
@@ -266,11 +274,36 @@ def _find_activity_image(activity: str) -> Optional[str]:
                 best = os.path.join(root, fn)
     return best if best_score > 0 else None
 
-# Channel IDs from env if provided
-GENERAL_CHANNEL_ID = int(os.getenv("GENERAL_CHANNEL_ID")) if os.getenv("GENERAL_CHANNEL_ID") else None
-RAID_QUEUE_CHANNEL_ID = int(os.getenv("RAID_QUEUE_CHANNEL_ID")) if os.getenv("RAID_QUEUE_CHANNEL_ID") else None
-GENERAL_SHERPA_CHANNEL_ID = int(os.getenv("GENERAL_SHERPA_CHANNEL_ID")) if os.getenv("GENERAL_SHERPA_CHANNEL_ID") else None
-LFG_CHAT_CHANNEL_ID = int(os.getenv("LFG_CHAT_CHANNEL_ID")) if os.getenv("LFG_CHAT_CHANNEL_ID" ) else None
+# Helper to read integer env vars with multiple fallbacks
+def _env_int(*names) -> Optional[int]:
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            try:
+                return int(v)
+            except Exception:
+                try:
+                    # sometimes values are stored as quoted strings
+                    return int(v.strip())
+                except Exception:
+                    return None
+    return None
+
+# Channel IDs from env (accept several possible env names used in hosting dashboards)
+GENERAL_CHANNEL_ID = _env_int("GENERAL_CHANNEL_ID", "GENERAL", "general")
+RAID_QUEUE_CHANNEL_ID = _env_int("RAID_QUEUE_CHANNEL_ID", "RAID_QUEUE", "raid_queue", "RAID_QUEUE")
+GENERAL_SHERPA_CHANNEL_ID = _env_int("GENERAL_SHERPA_CHANNEL_ID", "GENERAL_SHERPA", "general_sherpa", "GENERAL_SHERPA_CHANNEL")
+# LFG/announce channel — try a few common names the dashboard might use
+LFG_CHAT_CHANNEL_ID = _env_int("LFG_CHAT_CHANNEL_ID", "RAID_SIGN_UP", "RAID_DUNGEON_EVENT_SIGNUP", "RAID_SIGNUP", "raid_sign_up")
+
+# Separate channel for sherpa claims (the "raid-sign-up" channel in your layout)
+RAID_SIGN_UP_CHANNEL_ID = _env_int("RAID_SIGN_UP_CHANNEL", "RAID_SIGN_UP", "RAID_SIGNUP_CHANNEL", "RAID_SIGN_UP")
+
+# Optional role ID to ping when posting sherpa alerts
+SHERPA_ROLE_ID = os.getenv("SHERPA_ROLE_ID") or os.getenv("SHERPA_ROLE")
+
+# Optional guild id
+GUILD_ID = _env_int("GUILD_ID", "GUILD")
 
 # Ensure bot startup syncs commands and starts scheduler
 @bot.event
@@ -405,6 +438,59 @@ class ConfirmView(discord.ui.View):
             if self.uid in participants:
                 participants[:] = [x for x in participants if x != self.uid]
                 _autofill_from_backups(data)
+            guild = interaction.client.get_guild(data.get("guild_id"))  # type: ignore
+            if guild:
+                await _update_schedule_message(guild, self.mid)
+        await interaction.response.send_message("All good. Thanks for letting us know.", ephemeral=True)
+
+
+class SherpaConfirmView(discord.ui.View):
+    def __init__(self, mid: int, uid: int):
+        super().__init__(timeout=None)
+        self.mid = mid
+        self.uid = uid
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, custom_id="sherpa_confirm_yes")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This DM button isn't for you.", ephemeral=True)
+            return
+        data = SCHEDULES.get(self.mid)
+        if not data:
+            await interaction.response.send_message("Event no longer exists.", ephemeral=True)
+            return
+        sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
+        sbackup: Set[int] = data.get("sherpa_backup") or set()  # type: ignore
+        reserved = int(data.get("reserved_sherpas", 0))
+        if self.uid in sherpas:
+            await interaction.response.send_message("You're already locked in as a Sherpa.", ephemeral=True)
+            return
+        if len(sherpas) < reserved:
+            sherpas.add(self.uid)
+            data["sherpas"] = sherpas
+            await interaction.response.send_message("Locked in as Sherpa. Thank you! ✅", ephemeral=True)
+        else:
+            if self.uid not in sbackup:
+                sbackup.add(self.uid)
+                data["sherpa_backup"] = sbackup
+            await interaction.response.send_message("All Sherpa slots are full — you've been added as Sherpa Backup.", ephemeral=True)
+        guild = interaction.client.get_guild(data.get("guild_id"))  # type: ignore
+        if guild:
+            await _update_schedule_message(guild, self.mid)
+
+    @discord.ui.button(label="Can't make it", style=discord.ButtonStyle.secondary, custom_id="sherpa_confirm_no")
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This DM button isn't for you.", ephemeral=True)
+            return
+        data = SCHEDULES.get(self.mid)
+        if data:
+            sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
+            sbackup: Set[int] = data.get("sherpa_backup") or set()  # type: ignore
+            if self.uid in sherpas:
+                sherpas.discard(self.uid)
+            if self.uid in sbackup:
+                sbackup.discard(self.uid)
             guild = interaction.client.get_guild(data.get("guild_id"))  # type: ignore
             if guild:
                 await _update_schedule_message(guild, self.mid)
@@ -667,9 +753,10 @@ async def schedule_cmd(
         players_final = uniq_participants[:player_slots]
         backups_final = uniq_participants[player_slots:]
 
-        # Determine the channel to post the event in. Prefer configured env vars,
-        # otherwise fall back to the channel where the command was invoked.
-        channel_id = GENERAL_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID
+        # Determine the channel to post the main event embed in.
+        # Prefer the raid/dungeon event signup (LFG) channel, then the raid queue channel,
+        # then the general channel; finally fall back to the channel where the command was invoked.
+        channel_id = LFG_CHAT_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID or GENERAL_CHANNEL_ID
         if not channel_id and interaction.channel:
             try:
                 channel_id = int(interaction.channel.id)
@@ -763,20 +850,64 @@ async def schedule_cmd(
             except Exception as e:
                 print("Pre-slot DM failed:", e)
 
-        # Sherpa alert (first R get slots; extras go to backup)
-        if GENERAL_SHERPA_CHANNEL_ID and reserved > 0:
-            alert = await _send_to_channel_id(
-                GENERAL_SHERPA_CHANNEL_ID,
-                content=(
-                    f"🧭 **Sherpa Alert:** {activity} at **{when_text}**. "
-                    f"{reserved} reserved Sherpa slot(s). React ✅ to claim."
-                ),
-            )
-            if alert:
-                SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
-                SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
+        # Sherpa alert (first R get slots; extras go to backup) — post as an embed so sherpas can sign up
+        # Post the sherpa alert in the raid-sign-up channel if available, otherwise fallback to the general sherpa channel
+        sherpa_post_channel = RAID_SIGN_UP_CHANNEL_ID or GENERAL_SHERPA_CHANNEL_ID
+        if sherpa_post_channel and reserved > 0:
+            try:
+                alert_embed = discord.Embed(
+                    title=f"🧭 Sherpa Alert — {activity}",
+                    description=(f"{reserved} reserved Sherpa slot(s). React ✅ to claim your slot."),
+                    color=_activity_color(activity),
+                )
+                alert_embed.add_field(name="When", value=when_text, inline=True)
+                alert_embed.add_field(name="Reserved Sherpas", value=str(reserved), inline=True)
+                # If we have the event message, include a jump link
                 try:
-                    await alert.add_reaction("✅")
+                    if ev_msg:
+                        alert_embed.add_field(name="Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
+                except Exception:
+                    pass
+
+                # Attach activity image to sherpa embed if available
+                img_path = _find_activity_image(activity)
+                alert_file = None
+                if img_path:
+                    try:
+                        filename = os.path.basename(img_path)
+                        alert_file = discord.File(img_path, filename=filename)
+                        alert_embed.set_image(url=f"attachment://{filename}")
+                    except Exception:
+                        alert_file = None
+
+                # Prepend a role ping if configured
+                ping_text = f"<@&{SHERPA_ROLE_ID}>\n" if SHERPA_ROLE_ID else None
+                alert = await _send_to_channel_id(sherpa_post_channel, content=ping_text, embed=alert_embed, file=alert_file)
+                if alert:
+                    SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
+                    SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
+                    try:
+                        await alert.add_reaction("✅")
+                    except Exception:
+                        pass
+            except Exception:
+                # If embed send fails, fall back to the plain text alert
+                try:
+                    ping_text = f"<@&{SHERPA_ROLE_ID}>\n" if SHERPA_ROLE_ID else None
+                    alert = await _send_to_channel_id(
+                        sherpa_post_channel,
+                        content=(ping_text or "") + (
+                            f"🧭 **Sherpa Alert:** {activity} at **{when_text}**. "
+                            f"{reserved} reserved Sherpa slot(s). React ✅ to claim."
+                        ),
+                    )
+                    if alert:
+                        SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
+                        SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
+                        try:
+                            await alert.add_reaction("✅")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -813,7 +944,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # Sherpa alert claim
     for mid, data in list(SCHEDULES.items()):
         alert_id = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None
-        if alert_id and payload.message_id == alert_id and str(payload.emoji) == "✅":
+        alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None
+        # Only accept sherpa claims when the reaction is on the stored sherpa alert message in the alert channel
+        if alert_id and payload.message_id == alert_id and str(payload.emoji) == "✅" and (alert_ch is None or payload.channel_id == alert_ch):
             guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
             if not guild:
                 return
@@ -828,6 +961,28 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             else:
                 backup.add(member.id)
             await _update_schedule_message(guild, mid)
+            # DM the claiming sherpa with a confirmation view so they can lock in or decline.
+            try:
+                dm = await member.create_dm()
+                event_link = None
+                try:
+                    ch_id = int(data.get("channel_id")) if data.get("channel_id") else None
+                    if ch_id:
+                        ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                        msg = await ch.fetch_message(int(mid)) if ch else None
+                        event_link = msg.jump_url if msg else None
+                except Exception:
+                    event_link = None
+                when_text = data.get("when_text")
+                activity = data.get("activity")
+                content = (
+                    f"You've claimed a Sherpa slot for **{activity}** at **{when_text}**.\n"
+                    + (f"View event: {event_link}\n" if event_link else "")
+                    + "Tap **Confirm** to lock your Sherpa slot."
+                )
+                await dm.send(content=content, view=ConfirmView(mid=mid, uid=member.id))
+            except Exception:
+                pass
             return
 
     # Backup self-sign on the EVENT message using 📝 anytime
