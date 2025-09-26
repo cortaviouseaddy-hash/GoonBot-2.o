@@ -132,6 +132,31 @@ def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[s
     except Exception:
         return None
 
+
+def _activity_color(activity: str) -> int:
+    """Pick an embed color based on activity category or name tokens."""
+    a = (activity or "").lower()
+    # Category-based colors
+    try:
+        # If activity is in presets categories, pick category color
+        for key, items in PRESETS.items():
+            if activity in items:
+                if key == "raids":
+                    return 0xE6B500  # gold
+                if key == "dungeons":
+                    return 0x8A2BE2  # purple
+                if key == "exotic_activities":
+                    return 0x00CED1  # dark turquoise
+    except Exception:
+        pass
+    # Keyword heuristics
+    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota")):
+        return 0xE6B500
+    if any(k in a for k in ("dungeon", "pit", "crypt", "deep", "spire")):
+        return 0x8A2BE2
+    # Default neutral color
+    return 0x2F3136
+
 async def _send_to_channel_id(channel_id: Optional[int], content: Optional[str] = None, *, embed: Optional[discord.Embed] = None, file: Optional[discord.File] = None):
     try:
         if not channel_id:
@@ -149,18 +174,71 @@ async def _send_to_channel_id(channel_id: Optional[int], content: Optional[str] 
         return None
 
 async def _render_event_embed(guild: Optional[discord.Guild], activity: str, data: Dict[str, object]):
-    # Minimal embed renderer; you can expand to include images/colors
+    # Enhanced embed renderer: adds image (if available) and lists promoter, sherpas, players, backups
     title = f"{activity} — Event"
     desc = data.get("desc", "")
-    embed = discord.Embed(title=title, description=desc, color=0x2F3136)
+    embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
     when = data.get("when_text")
     embed.add_field(name="When", value=when or "TBD", inline=False)
     cap = data.get("capacity")
     embed.add_field(name="Capacity", value=str(cap), inline=True)
-    players = data.get("players", [])
+
+    # Promoter
+    promoter_id = data.get("promoter_id")
+    if promoter_id:
+        embed.add_field(name="Scheduled by", value=f"<@{promoter_id}>", inline=True)
+
+    # Sherpas
+    sherpas = data.get("sherpas") or set()
+    if sherpas:
+        try:
+            s_list = [f"<@{int(x)}>" for x in (list(sherpas)[:10])]
+            embed.add_field(name="Sherpas", value=", ".join(s_list), inline=False)
+        except Exception:
+            pass
+
+    # Players and backups
+    players = data.get("players", []) or []
+    backups = data.get("backups", []) or []
     if players:
-        embed.add_field(name="Players", value="\n".join(f"<@{p}" for p in players), inline=False)
-    return embed, None
+        p_lines = [f"<@{p}>" for p in players]
+        embed.add_field(name=f"Players ({len(players)})", value="\n".join(p_lines), inline=False)
+    if backups:
+        b_lines = [f"<@{b}>" for b in backups]
+        embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(b_lines), inline=False)
+
+    # Attempt to attach an image from assets matching the activity name
+    file = None
+    img = _find_activity_image(activity)
+    if img:
+        try:
+            filename = os.path.basename(img)
+            file = discord.File(img, filename=filename)
+            embed.set_image(url=f"attachment://{filename}")
+        except Exception:
+            file = None
+
+    return embed, file
+
+
+def _find_activity_image(activity: str) -> Optional[str]:
+    # Search the assets directory for a filename containing words from the activity name.
+    aset = os.path.join(os.path.dirname(__file__), "assets")
+    if not os.path.isdir(aset):
+        return None
+    activity_key = ''.join(ch.lower() for ch in activity if ch.isalnum() or ch.isspace()).strip()
+    tokens = [t for t in activity_key.split() if t]
+    # Walk assets/ and try to find a file that matches tokens
+    best = None
+    best_score = 0
+    for root, _, files in os.walk(aset):
+        for fn in files:
+            name = os.path.splitext(fn)[0].lower()
+            score = sum(1 for t in tokens if t in name)
+            if score > best_score:
+                best_score = score
+                best = os.path.join(root, fn)
+    return best if best_score > 0 else None
 
 # Channel IDs from env if provided
 GENERAL_CHANNEL_ID = int(os.getenv("GENERAL_CHANNEL_ID")) if os.getenv("GENERAL_CHANNEL_ID") else None
