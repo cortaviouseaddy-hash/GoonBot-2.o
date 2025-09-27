@@ -335,6 +335,98 @@ async def on_ready():
     ZoneInfo = None  # If not available, continue without tz awareness
 
 
+@bot.event
+async def on_member_join(member: discord.Member):
+    # Welcome DM to the new member explaining the bot and basic commands
+    try:
+        dm = await member.create_dm()
+        dm_text = (
+            f"Welcome to {member.guild.name}, {member.display_name}!\n\n"
+            "I'm the raid/queue bot for this server. Here's a quick guide:\n"
+            "• To join a queue, use `/join activity:\"<name>\"` (autocomplete helps).\n"
+            "• To view queues, use `/queue` or `/queue activity:\"<name>\"` to view a specific activity.\n"
+            "• If you're DM'd by `/schedule`, you'll get a Confirm button — tap it to lock your spot.\n\n"
+            "Be respectful to everyone, be careful what you say while streaming, and most importantly — have fun!"
+        )
+        try:
+            await dm.send(dm_text)
+        except Exception:
+            # Member has DMs closed or blocked bot; ignore
+            pass
+    except Exception:
+        pass
+
+    # Post a welcome embed in the general channel (if configured) with the member's avatar as thumbnail
+    try:
+        ch = None
+        if GENERAL_CHANNEL_ID:
+            try:
+                ch = bot.get_channel(int(GENERAL_CHANNEL_ID)) or await bot.fetch_channel(int(GENERAL_CHANNEL_ID))
+            except Exception:
+                ch = None
+        if not ch:
+            # try guild system channel or a channel named 'general'
+            try:
+                ch = member.guild.system_channel
+            except Exception:
+                ch = None
+        if not ch:
+            for c in member.guild.text_channels:
+                if c.name.lower() == "general":
+                    ch = c
+                    break
+        if not ch:
+            return
+
+        welcome_embed = discord.Embed(
+            title=f"Welcome, {member.display_name}!",
+            description=(
+                "Welcome to our community! We're glad you're here.\n\n"
+                "Quick start:\n"
+                "• Use `/join activity:\"<name>\"` to join an activity queue.\n"
+                "• Use `/queue` to see current queues.\n"
+                "• If you receive a DM from `/schedule`, tap Confirm to lock your spot.\n\n"
+                "Rules: Be respectful to everyone. Be mindful on stream. Have fun!"
+            ),
+            color=0x00FF88,
+        )
+        # Try to set thumbnail to the member's avatar
+        try:
+            if member.avatar:
+                welcome_embed.set_thumbnail(url=member.avatar.url)
+            elif member.display_avatar:
+                welcome_embed.set_thumbnail(url=member.display_avatar.url)
+        except Exception:
+            pass
+
+        # If a welcome background image exists in assets/, attach it as the embed image.
+        try:
+            aset = os.path.join(os.path.dirname(__file__), "assets")
+            bg_path = None
+            for candidate in ("welcome_bg.jpg", "welcome_bg.png", "welcome_background.jpg", "welcome_background.png"):
+                p = os.path.join(aset, candidate)
+                if os.path.isfile(p):
+                    bg_path = p
+                    break
+            if bg_path:
+                try:
+                    filename = os.path.basename(bg_path)
+                    file = discord.File(bg_path, filename=filename)
+                    welcome_embed.set_image(url=f"attachment://{filename}")
+                    await ch.send(embed=welcome_embed, file=file)
+                except Exception:
+                    await ch.send(embed=welcome_embed)
+            else:
+                await ch.send(embed=welcome_embed)
+        except Exception:
+            try:
+                await ch.send(embed=welcome_embed)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 # ---------------------------
 # Slash Commands: ping / join / queue / add/remove / check-in
 # ---------------------------
