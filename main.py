@@ -49,6 +49,22 @@ for v in PRESETS.values():
     if isinstance(v, list):
         ALL_ACTIVITIES.extend(v)
 
+# Permanently pre-slot a specific user ID into the Crota's End queue if that activity exists.
+# This scans loaded activity names for 'crota' (case-insensitive) and appends the ID once.
+try:
+    PREPOPULATE_USER_ID = 683712515821404250
+    for act in ALL_ACTIVITIES:
+        try:
+            if "crota" in (act or "").lower():
+                q = _ensure_queue(act)
+                if PREPOPULATE_USER_ID not in q:
+                    q.append(PREPOPULATE_USER_ID)
+                break
+        except Exception:
+            continue
+except Exception:
+    pass
+
 # Explicit activity -> image map (lowercase keys). Add more mappings as needed.
 # Example: map "desert perpetual" to assets/raids/desert_perpetual.jpg
 ACTIVITY_IMAGE_MAP: Dict[str, str] = {
@@ -354,11 +370,20 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
     await _post_activity_board(activity)
 
 
-@bot.tree.command(name="queue", description="Post the current queues (one embed per activity, all names)")
-async def queue_cmd(interaction: discord.Interaction):
+@bot.tree.command(name="queue", description="Post the current queues (one embed per activity, or pick a specific activity)")
+@app_commands.describe(activity="(Optional) Choose an activity to show its queue only")
+@app_commands.autocomplete(activity=_activity_autocomplete)
+async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = None):
     await interaction.response.defer(ephemeral=True)
-    await _post_all_activity_boards()
-    await interaction.followup.send("Queue boards posted.", ephemeral=True)
+    if activity:
+        if activity not in ALL_ACTIVITIES:
+            await interaction.followup.send("Unknown activity.", ephemeral=True)
+            return
+        await _post_activity_board(activity)
+        await interaction.followup.send(f"Queue board posted for: {activity}", ephemeral=True)
+    else:
+        await _post_all_activity_boards()
+        await interaction.followup.send("Queue boards posted.", ephemeral=True)
 
 
 # helper to parse mentions/IDs/names
