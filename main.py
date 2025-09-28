@@ -136,6 +136,23 @@ def founder_only():
             return False
     return app_commands.check(_check)
 
+
+def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
+    """Return True if the interaction user is the event promoter or the configured founder."""
+    try:
+        uid = int(interaction.user.id)
+        # founder env var
+        fid = os.getenv("FOUNDER_USER_ID")
+        if fid and int(fid) == uid:
+            return True
+        if data:
+            pid = data.get("promoter_id")
+            if pid and int(pid) == uid:
+                return True
+    except Exception:
+        pass
+    return False
+
 def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[str] = None) -> Optional[int]:
     # date_iso expected as YYYY-MM-DD
     try:
@@ -321,6 +338,9 @@ SHERPA_ROLE_ID = os.getenv("SHERPA_ROLE_ID") or os.getenv("SHERPA_ROLE")
 # Optional guild id
 GUILD_ID = _env_int("GUILD_ID", "GUILD")
 
+# Optional role id to assign when promoting users to Sherpa Assistant
+SHERPA_ASSISTANT_ROLE_ID = _env_int("SHERPA_ASSISTANT_ROLE_ID", "SHERPA_ASSISTANT_ROLE", "SHERPA_ASSISTANT")
+
 # Ensure bot startup syncs commands and starts scheduler
 @bot.event
 async def on_ready():
@@ -460,6 +480,267 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
     _ensure_queue(activity).append(uid)
     await interaction.response.send_message(f"Joined queue for: {activity}", ephemeral=True)
     await _post_activity_board(activity)
+
+
+@bot.tree.command(name="leave", description="Leave an activity queue or an event by message ID")
+@app_commands.describe(activity="(Optional) activity name to leave", message_id="(Optional) event message ID to leave")
+async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = None, message_id: Optional[int] = None):
+    uid = interaction.user.id
+    changed = False
+    # If message_id given, remove from that event's players/backups
+    if message_id:
+        data = SCHEDULES.get(message_id)
+        if not data:
+            await interaction.response.send_message("No event found with that message ID.", ephemeral=True)
+            return
+        participants: List[int] = data.get("players", [])
+        backups: List[int] = data.get("backups", [])
+        if uid in participants:
+            participants[:] = [x for x in participants if x != uid]
+            _autofill_from_backups(data)
+            changed = True
+        if uid in backups:
+            backups[:] = [x for x in backups if x != uid]
+            changed = True
+        if changed:
+            guild = interaction.client.get_guild(data.get("guild_id"))
+            if guild:
+                await _update_schedule_message(guild, message_id)
+            await interaction.response.send_message("Left the event.", ephemeral=True)
+            return
+
+    # Otherwise remove from queue/activity
+    if activity:
+        if activity not in QUEUES:
+            await interaction.response.send_message("Unknown activity.", ephemeral=True)
+            return
+        q = QUEUES.get(activity, [])
+        if uid in q:
+            q[:] = [x for x in q if x != uid]
+            await interaction.response.send_message(f"Left queue: {activity}", ephemeral=True)
+            await _post_activity_board(activity)
+            return
+        else:
+            await interaction.response.send_message("You are not in that queue.", ephemeral=True)
+            return
+
+    await interaction.response.send_message("Specify an activity or a message_id to leave.", ephemeral=True)
+
+
+
+
+
+@bot.tree.command(name="promote", description="Assign Sherpa Assistant role to a chosen user and announce it")
+@app_commands.describe(user="User to promote to Sherpa Assistant", message_id="(Optional) event message ID to add them as a Sherpa for")
+async def promote_cmd(interaction: discord.Interaction, user: discord.User, message_id: Optional[int] = None):
+    # If message_id provided, require promoter or founder for that event
+    data = SCHEDULES.get(message_id) if message_id else None
+    if message_id and not data:
+        await interaction.response.send_message("No event found with that message ID.", ephemeral=True)
+        return
+    if data and not _is_promoter_or_founder(interaction, data):
+        await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
+        return
+
+    # If no event provided, require founder (if configured)
+    fid = os.getenv("FOUNDER_USER_ID")
+    if not data and fid:
+        try:
+            if int(fid) != int(interaction.user.id):
+                await interaction.response.send_message("Only the founder can run this command without an event.", ephemeral=True)
+                return
+        except Exception:
+            pass
+
+    guild = interaction.guild
+    promoted_uid = int(user.id)
+    promoted_member = guild.get_member(promoted_uid) if guild else None
+
+    assigned = False
+    # Assign Sherpa Assistant role if configured
+    if promoted_member and SHERPA_ASSISTANT_ROLE_ID:
+        try:
+            role = guild.get_role(int(SHERPA_ASSISTANT_ROLE_ID))
+            if role:
+                await promoted_member.add_roles(role, reason="Assigned Sherpa Assistant via /promote")
+                assigned = True
+        except Exception:
+            assigned = False
+
+    # If event provided, add them to the event sherpas
+    if data:
+        try:
+            sherpas: Set[int] = data.get("sherpas") or set()
+            sbackup: Set[int] = data.get("sherpa_backup") or set()
+            if promoted_uid in sbackup:
+                sbackup.discard(promoted_uid)
+                data["sherpa_backup"] = sbackup
+            if promoted_uid not in sherpas:
+                sherpas.add(promoted_uid)
+                data["sherpas"] = sherpas
+            if guild:
+                await _update_schedule_message(guild, message_id)
+        except Exception:
+            pass
+
+    # Announcement embed with celebratory Sherpa Assistant message, thumbnail, and color
+    try:
+        title = f"🎉 Congratulations, {user.mention}! 🎉"
+        desc = (
+            "✨ What it Means to be a Sherpa Assistant\n"
+            "You are now part of an elite group dedicated to helping Guardians conquer Destiny’s toughest challenges.\n"
+            "Sherpas bring patience, clarity, and positive vibes to every fireteam.\n"
+            "You’re the torchbearers — guiding others through chaos and turning doubt into understanding.\n\n"
+            "❤️ Why We Do This\n"
+            "Every Guardian deserves the chance to experience the best of Destiny.\n"
+            "By serving as a Sherpa Assistant, you’re building a stronger, more inclusive community where knowledge is shared freely and friendships are forged through every raid and exotic mission.\n\n"
+            "⚔️ Expectations\n"
+            "• Be the calm voice when the fireteam feels the pressure\n"
+            "• Explain mechanics clearly so anyone can succeed\n"
+            "• Turn wipes into lessons, and lessons into victory\n"
+            "• Keep every run welcoming, fun, and unforgettable\n\n"
+            "🧭 Carry the Light\n"
+            "Every Guardian you guide becomes part of your story.\n"
+            "Lead with patience, lift others up, and show what it truly means to Carry the Light."
+        )
+        emb = discord.Embed(title=title, description=desc, color=0xFFD700)
+        # Include event info if available
+        if data:
+            try:
+                emb.add_field(name="Event", value=data.get("activity", "event"), inline=True)
+                emb.add_field(name="When", value=data.get("when_text", "TBD"), inline=True)
+            except Exception:
+                pass
+        emb.set_footer(text=f"Assigned by {interaction.user.display_name}")
+        # (No thumbnail/image requested) keep embed text and color only
+    except Exception:
+        emb = None
+
+    posted = 0
+    for ch_id in (GENERAL_CHANNEL_ID, GENERAL_SHERPA_CHANNEL_ID):
+        try:
+            if ch_id:
+                msg = await _send_to_channel_id(ch_id, embed=emb)
+                if msg:
+                    posted += 1
+                    try:
+                        await msg.add_reaction("🎉")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # DM the user
+    try:
+        if promoted_member:
+            d = await promoted_member.create_dm()
+            await d.send(f"You've been assigned the Sherpa Assistant role{f' for {data.get('activity')}' if data else ''}.")
+    except Exception:
+        pass
+
+    await interaction.response.send_message(f"Promotion applied. Role assigned: {assigned}. Announced in {posted} channel(s).", ephemeral=True)
+
+
+@bot.tree.command(name="add", description="Add a user to a queue or event (promoter/founder for events)")
+@app_commands.describe(activity="(Optional) activity to add to", message_id="(Optional) event message ID to add to", user="User mention or ID to add")
+async def add_cmd(interaction: discord.Interaction, user: str, activity: Optional[str] = None, message_id: Optional[int] = None):
+    # Try to resolve user to ID in guild
+    guild = interaction.guild
+    uid_list = _parse_user_ids(user, guild) if guild else []
+    if not uid_list:
+        await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+        return
+    uid = uid_list[0]
+    if message_id:
+        data = SCHEDULES.get(message_id)
+        if not data:
+            await interaction.response.send_message("No event found with that message ID.", ephemeral=True)
+            return
+        if not _is_promoter_or_founder(interaction, data):
+            await interaction.response.send_message("Only the promoter or founder can add users to this event.", ephemeral=True)
+            return
+        participants: List[int] = data.get("players", [])
+        backups: List[int] = data.get("backups", [])
+        cap = int(data.get("capacity", 0))
+        reserved = int(data.get("reserved_sherpas", 0))
+        player_slots = max(0, cap - reserved)
+        if uid in participants or uid in backups:
+            await interaction.response.send_message("User already in event.", ephemeral=True)
+            return
+        if len(participants) < player_slots:
+            participants.append(uid)
+            status = "Player"
+        else:
+            backups.append(uid)
+            status = "Backup"
+        if guild:
+            await _update_schedule_message(guild, message_id)
+        await interaction.response.send_message(f"Added user as {status}.", ephemeral=True)
+        return
+
+    if activity:
+        if activity not in ALL_ACTIVITIES:
+            await interaction.response.send_message("Unknown activity.", ephemeral=True)
+            return
+        q = _ensure_queue(activity)
+        if uid in q:
+            await interaction.response.send_message("User already in queue.", ephemeral=True)
+            return
+        q.append(uid)
+        await interaction.response.send_message(f"Added user to queue: {activity}", ephemeral=True)
+        await _post_activity_board(activity)
+        return
+
+    await interaction.response.send_message("Specify an activity or message_id to add the user to.", ephemeral=True)
+
+
+@founder_only()
+@bot.tree.command(name="remove", description="Remove a user from a queue or event (founder only)")
+@app_commands.describe(activity="(Optional) activity to remove from", message_id="(Optional) event message ID", user="User mention or ID to remove")
+async def remove_cmd(interaction: discord.Interaction, user: str, activity: Optional[str] = None, message_id: Optional[int] = None):
+    guild = interaction.guild
+    uid_list = _parse_user_ids(user, guild) if guild else []
+    if not uid_list:
+        await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+        return
+    uid = uid_list[0]
+    if message_id:
+        data = SCHEDULES.get(message_id)
+        if not data:
+            await interaction.response.send_message("No event found with that message ID.", ephemeral=True)
+            return
+        if not _is_promoter_or_founder(interaction, data):
+            await interaction.response.send_message("Only the promoter or founder can remove users from this event.", ephemeral=True)
+            return
+        participants: List[int] = data.get("players", [])
+        backups: List[int] = data.get("backups", [])
+        removed = False
+        if uid in participants:
+            participants[:] = [x for x in participants if x != uid]
+            _autofill_from_backups(data)
+            removed = True
+        if uid in backups:
+            backups[:] = [x for x in backups if x != uid]
+            removed = True
+        if removed and guild:
+            await _update_schedule_message(guild, message_id)
+        await interaction.response.send_message("Removed user from event." if removed else "User not in that event.", ephemeral=True)
+        return
+
+    if activity:
+        if activity not in QUEUES:
+            await interaction.response.send_message("Unknown activity.", ephemeral=True)
+            return
+        q = QUEUES.get(activity)
+        if uid in q:
+            q[:] = [x for x in q if x != uid]
+            await interaction.response.send_message("Removed user from queue.", ephemeral=True)
+            await _post_activity_board(activity)
+            return
+        await interaction.response.send_message("User not in that queue.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Specify an activity or message_id to remove the user from.", ephemeral=True)
 
 
 @bot.tree.command(name="queue", description="Post the current queues (one embed per activity, or pick a specific activity)")
@@ -870,10 +1151,9 @@ async def schedule_cmd(
         players_final = uniq_participants[:player_slots]
         backups_final = uniq_participants[player_slots:]
 
-        # Determine the channel to post the main event embed in.
-        # Prefer the raid/dungeon event signup (LFG) channel, then the raid queue channel,
-        # then the general channel; finally fall back to the channel where the command was invoked.
-        channel_id = LFG_CHAT_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID or GENERAL_CHANNEL_ID
+    # Determine the channel to post the main event embed in.
+    # Prefer the raid/dungeon event signup channel specifically for main event embed
+    channel_id = LFG_CHAT_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID or GENERAL_CHANNEL_ID
         if not channel_id and interaction.channel:
             try:
                 channel_id = int(interaction.channel.id)
@@ -899,9 +1179,14 @@ async def schedule_cmd(
             "r_2h": False, "r_30m": False, "r_0m": False,
         }
 
-        # Post event embed
+        # Post main event embed to the raid/dungeon event signup (LFG) channel if available
         embed, f = await _render_event_embed(guild, activity, data)
-        ev_msg = await _send_to_channel_id(data["channel_id"], embed=embed, file=f)
+        ev_msg = None
+        if LFG_CHAT_CHANNEL_ID:
+            ev_msg = await _send_to_channel_id(int(LFG_CHAT_CHANNEL_ID), embed=embed, file=f)
+        if not ev_msg:
+            # fallback to configured channel_id
+            ev_msg = await _send_to_channel_id(data["channel_id"], embed=embed, file=f)
         if not ev_msg:
             attempted = data.get("channel_id")
             await interaction.followup.send(
@@ -926,6 +1211,26 @@ async def schedule_cmd(
         mid = ev_msg.id
         SCHEDULES[mid] = data
 
+        # DM any pre-slotted sherpas immediately with a SherpaConfirmView
+        try:
+            event_link = ev_msg.jump_url if ev_msg else None
+            for sid in list(sherpa_ids):
+                try:
+                    m = guild.get_member(sid) if guild else None
+                    if not m:
+                        continue
+                    dm = await m.create_dm()
+                    content = (
+                        f"You've been pre-slotted as a Sherpa for **{activity}** at **{when_text}**."
+                        + (f"\nView the event: {event_link}" if event_link else "")
+                        + "\nTap **Confirm** to lock your Sherpa slot."
+                    )
+                    await dm.send(content=content, view=SherpaConfirmView(mid=mid, uid=sid))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # DM **all** queue members with Confirm button
         sent = 0
         for uid in candidates:
@@ -945,7 +1250,7 @@ async def schedule_cmd(
             except Exception as e:
                 print("DM failed:", e)
 
-        # DM pre-slotted participants immediately (if any) with confirmation
+        # DM pre-slotted participants immediately (if any) with a ConfirmView so they can lock/unlock
         pre_dmed = set(candidates)  # already attempted DMs to queue candidates
         p_sent = 0
         for uid in data.get("players", []) or []:
@@ -959,47 +1264,33 @@ async def schedule_cmd(
                 # include jump link to the event post if available
                 event_link = ev_msg.jump_url if ev_msg else None
                 content = (
-                    f"You're confirmed for **{activity}** at **{when_text}** in {guild.name if guild else 'server'}."
-                    + (f"\nView the event: {event_link}" if event_link else "")
+                    f"You're pre-slotted as a Player for **{activity}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
+                    + (f"View the event: {event_link}\n" if event_link else "")
+                    + "Tap **Confirm** to lock your spot, or **Can't make it** to decline."
                 )
-                await dm.send(content=content)
+                await dm.send(content=content, view=ConfirmView(mid=mid, uid=uid))
                 p_sent += 1
             except Exception as e:
                 print("Pre-slot DM failed:", e)
 
-        # Sherpa alert (first R get slots; extras go to backup) — post as an embed so sherpas can sign up
-        # Post the sherpa alert in the raid-sign-up channel if available, otherwise fallback to the general sherpa channel
-        sherpa_post_channel = RAID_SIGN_UP_CHANNEL_ID or GENERAL_SHERPA_CHANNEL_ID
-        if sherpa_post_channel and reserved > 0:
+        # Sherpa alert (post one embed in the raid-sign-up channel so sherpas sign up only there)
+        if reserved > 0 and RAID_SIGN_UP_CHANNEL_ID:
             try:
-                alert_embed = discord.Embed(
+                sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Alert — {activity}",
-                    description=(f"{reserved} reserved Sherpa slot(s). React ✅ to claim your slot."),
+                    description=(f"{reserved} reserved Sherpa slot(s). React ✅ on this message to claim your slot (or become Sherpa Backup)."),
                     color=_activity_color(activity),
                 )
-                alert_embed.add_field(name="When", value=when_text, inline=True)
-                alert_embed.add_field(name="Reserved Sherpas", value=str(reserved), inline=True)
-                # If we have the event message, include a jump link
+                sherpa_embed.add_field(name="When", value=when_text, inline=True)
+                sherpa_embed.add_field(name="Reserved Sherpas", value=str(reserved), inline=True)
                 try:
                     if ev_msg:
-                        alert_embed.add_field(name="Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
+                        sherpa_embed.add_field(name="Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
                 except Exception:
                     pass
 
-                # Attach activity image to sherpa embed if available
-                img_path = _find_activity_image(activity)
-                alert_file = None
-                if img_path:
-                    try:
-                        filename = os.path.basename(img_path)
-                        alert_file = discord.File(img_path, filename=filename)
-                        alert_embed.set_image(url=f"attachment://{filename}")
-                    except Exception:
-                        alert_file = None
-
-                # Prepend a role ping if configured
-                ping_text = f"<@&{SHERPA_ROLE_ID}>\n" if SHERPA_ROLE_ID else None
-                alert = await _send_to_channel_id(sherpa_post_channel, content=ping_text, embed=alert_embed, file=alert_file)
+                # Post sherpa-only alert in RAID_SIGN_UP_CHANNEL_ID
+                alert = await _send_to_channel_id(int(RAID_SIGN_UP_CHANNEL_ID), embed=sherpa_embed)
                 if alert:
                     SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
                     SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
@@ -1008,25 +1299,26 @@ async def schedule_cmd(
                     except Exception:
                         pass
             except Exception:
-                # If embed send fails, fall back to the plain text alert
+                pass
+
+        # Also post a short announcement ping to GENERAL_SHERPA_CHANNEL_ID so all Sherpa Assistants see the event
+        if GENERAL_SHERPA_CHANNEL_ID:
+            try:
+                ping_text = f"<@&{SHERPA_ROLE_ID}>\n" if SHERPA_ROLE_ID else ""
+                gen_embed = discord.Embed(title=f"Sherpa Signup — {activity}", description=(f"{when_text}\nGo to the Sherpa signup post to claim a slot."), color=_activity_color(activity))
                 try:
-                    ping_text = f"<@&{SHERPA_ROLE_ID}>\n" if SHERPA_ROLE_ID else None
-                    alert = await _send_to_channel_id(
-                        sherpa_post_channel,
-                        content=(ping_text or "") + (
-                            f"🧭 **Sherpa Alert:** {activity} at **{when_text}**. "
-                            f"{reserved} reserved Sherpa slot(s). React ✅ to claim."
-                        ),
-                    )
-                    if alert:
-                        SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
-                        SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
-                        try:
-                            await alert.add_reaction("✅")
-                        except Exception:
-                            pass
+                    if ev_msg:
+                        gen_embed.add_field(name="Event Link", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
                 except Exception:
                     pass
+                ann = await _send_to_channel_id(int(GENERAL_SHERPA_CHANNEL_ID), content=(ping_text or None), embed=gen_embed)
+                try:
+                    if ann:
+                        await ann.add_reaction("🎉")
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         # Final acknowledge to the command invoker
         await interaction.followup.send(
