@@ -322,129 +322,86 @@ def _env_int(*names) -> Optional[int]:
                     return None
     return None
 
-# Channel IDs from env (accept several possible env names used in hosting dashboards)
-GENERAL_CHANNEL_ID = _env_int("GENERAL_CHANNEL_ID", "GENERAL", "general")
-RAID_QUEUE_CHANNEL_ID = _env_int("RAID_QUEUE_CHANNEL_ID", "RAID_QUEUE", "raid_queue", "RAID_QUEUE")
-GENERAL_SHERPA_CHANNEL_ID = _env_int("GENERAL_SHERPA_CHANNEL_ID", "GENERAL_SHERPA", "general_sherpa", "GENERAL_SHERPA_CHANNEL")
-# LFG/announce channel — try a few common names the dashboard might use
-LFG_CHAT_CHANNEL_ID = _env_int("LFG_CHAT_CHANNEL_ID", "RAID_SIGN_UP", "RAID_DUNGEON_EVENT_SIGNUP", "RAID_SIGNUP", "raid_sign_up")
 
-# Separate channel for sherpa claims (the "raid-sign-up" channel in your layout)
-RAID_SIGN_UP_CHANNEL_ID = _env_int("RAID_SIGN_UP_CHANNEL", "RAID_SIGN_UP", "RAID_SIGNUP_CHANNEL", "RAID_SIGN_UP")
+# ---------------------------
+# Permissions
+# ---------------------------
 
-# Optional role ID to ping when posting sherpa alerts
-SHERPA_ROLE_ID = os.getenv("SHERPA_ROLE_ID") or os.getenv("SHERPA_ROLE")
+def promoter_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.CheckFailure("This command can only be used in a server.")
+        try:
+            if FOUNDER_USER_ID and interaction.user.id == int(FOUNDER_USER_ID):
+                return True
+        except Exception:
+            pass
+        if isinstance(interaction.user, discord.Member):
+            # fallback by role name in case founder id not set
+            if any(r.name.lower() == "founder" for r in interaction.user.roles):
+                return True
+        raise app_commands.CheckFailure("You are not authorized to use this command.")
+    return app_commands.check(predicate)
 
-# Optional guild id
-GUILD_ID = _env_int("GUILD_ID", "GUILD")
 
-# Optional role id to assign when promoting users to Sherpa Assistant
-SHERPA_ASSISTANT_ROLE_ID = _env_int("SHERPA_ASSISTANT_ROLE_ID", "SHERPA_ASSISTANT_ROLE", "SHERPA_ASSISTANT")
+def founder_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.CheckFailure("Use this in a server.")
+        try:
+            return bool(FOUNDER_USER_ID) and interaction.user.id == int(FOUNDER_USER_ID)
+        except Exception:
+            return False
+    return app_commands.check(predicate)
 
-# Ensure bot startup syncs commands and starts scheduler
+
+# ---------------------------
+# Lifecycle
+# ---------------------------
+
 @bot.event
 async def on_ready():
     try:
         await bot.tree.sync()
-    except Exception:
-        pass
-    try:
-        bot.loop.create_task(_scheduler_loop())
-    except Exception:
-        pass
-    ZoneInfo = None  # If not available, continue without tz awareness
+    except Exception as e:
+        print("Slash sync failed:", e)
+    # Start scheduler loop once
+    if not getattr(bot, "_sched_task", None):
+        bot._sched_task = bot.loop.create_task(_scheduler_loop())
+    print(f"Ready as {bot.user}")
 
 
-@bot.event
-async def on_member_join(member: discord.Member):
-    # Welcome DM to the new member explaining the bot and basic commands
-    try:
-        dm = await member.create_dm()
-        dm_text = (
-            f"Welcome to {member.guild.name}, {member.display_name}!\n\n"
-            "I'm the raid/queue bot for this server. Here's a quick guide:\n"
-            "• To join a queue, use `/join activity:\"<name>\"` (autocomplete helps).\n"
-            "• To view queues, use `/queue` or `/queue activity:\"<name>\"` to view a specific activity.\n"
-            "• If you're DM'd by `/schedule`, you'll get a Confirm button — tap it to lock your spot.\n\n"
-            "Be respectful to everyone, be careful what you say while streaming, and most importantly — have fun!"
-        )
-        try:
-            await dm.send(dm_text)
-        except Exception:
-            # Member has DMs closed or blocked bot; ignore
-            pass
-    except Exception:
-        pass
+# ---------------------------
+# Queue Boards
+# ---------------------------
 
-    # Post a welcome embed in the general channel (if configured) with the member's avatar as thumbnail
-    try:
-        ch = None
-        if GENERAL_CHANNEL_ID:
-            try:
-                ch = bot.get_channel(int(GENERAL_CHANNEL_ID)) or await bot.fetch_channel(int(GENERAL_CHANNEL_ID))
-            except Exception:
-                ch = None
-        if not ch:
-            # try guild system channel or a channel named 'general'
-            try:
-                ch = member.guild.system_channel
-            except Exception:
-                ch = None
-        if not ch:
-            for c in member.guild.text_channels:
-                if c.name.lower() == "general":
-                    ch = c
-                    break
-        if not ch:
-            return
+async def _post_all_activity_boards():
+    if not RAID_QUEUE_CHANNEL_ID:
+        return
+    for act in list(QUEUES.keys()):
+        await _post_activity_board(act)
 
-        welcome_embed = discord.Embed(
-            title=f"Welcome, {member.display_name}!",
-            description=(
-                "Welcome to our community! We're glad you're here.\n\n"
-                "Quick start:\n"
-                "• Use `/join activity:\"<name>\"` to join an activity queue.\n"
-                "• Use `/queue` to see current queues.\n"
-                "• If you receive a DM from `/schedule`, tap Confirm to lock your spot.\n\n"
-                "Rules: Be respectful to everyone. Be mindful on stream. Have fun!"
-            ),
-            color=0x00FF88,
-        )
-        # Try to set thumbnail to the member's avatar
-        try:
-            if member.avatar:
-                welcome_embed.set_thumbnail(url=member.avatar.url)
-            elif member.display_avatar:
-                welcome_embed.set_thumbnail(url=member.display_avatar.url)
-        except Exception:
-            pass
 
-        # If a welcome background image exists in assets/, attach it as the embed image.
-        try:
-            aset = os.path.join(os.path.dirname(__file__), "assets")
-            bg_path = None
-            for candidate in ("welcome_bg.jpg", "welcome_bg.png", "welcome_background.jpg", "welcome_background.png"):
-                p = os.path.join(aset, candidate)
-                if os.path.isfile(p):
-                    bg_path = p
-                    break
-            if bg_path:
-                try:
-                    filename = os.path.basename(bg_path)
-                    file = discord.File(bg_path, filename=filename)
-                    welcome_embed.set_image(url=f"attachment://{filename}")
-                    await ch.send(embed=welcome_embed, file=file)
-                except Exception:
-                    await ch.send(embed=welcome_embed)
-            else:
-                await ch.send(embed=welcome_embed)
-        except Exception:
-            try:
-                await ch.send(embed=welcome_embed)
-            except Exception:
-                pass
-    except Exception:
-        pass
+async def _post_activity_board(activity: str) -> None:
+    if not RAID_QUEUE_CHANNEL_ID or activity not in QUEUES:
+        return
+    q = QUEUES.get(activity, [])
+    checked = _ensure_checked(activity)
+
+    embed = discord.Embed(title=f"Queue — {activity}", color=_activity_color(activity))
+    embed.add_field(name="Signed Up", value=str(len(q)), inline=True)
+
+    if q:
+        lines = []
+        for uid in q:
+            mark = " ✅" if uid in checked else ""
+            lines.append(f"<@{uid}>{mark}")
+        embed.add_field(name="Players (in order)", value="\n".join(lines), inline=False)
+    else:
+        embed.description = "No sign-ups yet. Use `/join` to get started."
+
+    embed, attachment = _apply_activity_image(embed, activity)
+    await _send_to_channel_id(RAID_QUEUE_CHANNEL_ID, None, embed=embed, file=attachment)
 
 
 # ---------------------------
@@ -1108,57 +1065,7 @@ async def schedule_cmd(
         q = QUEUES.get(activity, [])
         candidates = list(q)  # DM **everyone** in the queue
 
-        # Parse datetime_str and timezone (MM-DD HH:MM)
-        try:
-            date_part, time_part = datetime_str.strip().split()
-            # Use current year
-            now = datetime.now()
-            year = now.year
-            date_full = f"{year}-{date_part}"
-        except Exception:
-            await interaction.followup.send("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True)
-            return
-        start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
-
-        # Parse pre-slotted users using helper (handles mentions and names)
-        guild = interaction.guild
-        sherpa_ids = set(_parse_user_ids(sherpas or "", guild)) if sherpas else set()
-        participant_ids = _parse_user_ids(participants or "", guild) if participants else []
-
-        # Ensure the scheduling user takes one participant slot
-        promoter_id = interaction.user.id
-        if promoter_id not in participant_ids:
-            participant_ids.insert(0, promoter_id)
-
-        # Sherpas visually separate but should count toward player slots.
-        # Merge sherpas into the participant order (preserve provided participant order,
-        # then append any sherpas not already listed) so they consume player slots.
-        merged_participants = list(participant_ids)
-        for sid in list(sherpa_ids):
-            if sid not in merged_participants:
-                merged_participants.append(sid)
-
-        # Compose when_text for embed
-        when_text = f"<t:{start_ts}:F> ({timezone})" if start_ts else "TBD"
-
-        # Split participants into actual players (up to available player slots) and backups
-        player_slots = max(0, cap - reserved)
-        # Dedupe merged participants while preserving order
-        seen = set(); uniq_participants: List[int] = []
-        for uid in merged_participants:
-            if uid not in seen:
-                uniq_participants.append(uid); seen.add(uid)
-        players_final = uniq_participants[:player_slots]
-        backups_final = uniq_participants[player_slots:]
-
-    # Determine the channel to post the main event embed in.
-    # Prefer the raid/dungeon event signup channel specifically for main event embed
-    channel_id = LFG_CHAT_CHANNEL_ID or RAID_QUEUE_CHANNEL_ID or GENERAL_CHANNEL_ID
-        if not channel_id and interaction.channel:
-            try:
-                channel_id = int(interaction.channel.id)
-            except Exception:
-                channel_id = None
+    start_ts = _parse_date_time_to_epoch(date, time, tz_name="America/New_York")
 
         data = {
             "guild_id": guild.id if guild else None,
