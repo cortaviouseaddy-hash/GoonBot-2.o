@@ -1,10 +1,12 @@
-# GoonBot main.py — queues, check‑in, promotions, scheduling
-# 2 embeds + 2 announcements logic EXACTLY as requested:
+# GoonBot main.py — queues, check-in, promotions, scheduling
+# Exact behavior:
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
-# - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ claim Sherpa; overflow -> Sherpa Backup)
-# - Sherpa Announcement -> GENERAL_SHERPA_CHANNEL_ID (ping Sherpa role; point to Sherpa signup post)
-# - LFG Announcement (2h before if player slots remain) -> LFG_CHAT_CHANNEL_ID
-# Also: DMs to queue with Confirm buttons; auto-open ✅ at T-2h if not full; reminders & survey.
+# - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
+# - Sherpa Announcement -> GENERAL_SHERPA_CHANNEL_ID (pings SHERPA_ROLE_ID if set; points to Sherpa signup post)
+# - T-2h before start (if player slots remain): add ✅ to main embed + single LFG nudge in LFG_CHAT_CHANNEL_ID
+# - DM the entire queue with Confirm buttons; confirming joins as participant; no response = nothing
+# - Colors based on category; optional activity images from ./assets/** by fuzzy filename match
+# - Reminders at T-2h, T-30m, and start; survey DM 3h after start
 
 import os
 import asyncio
@@ -27,7 +29,7 @@ except Exception:
 def _env_int(*names) -> Optional[int]:
     for n in names:
         v = os.getenv(n)
-        if v is not None and v != "":
+        if v is not None and str(v).strip() != "":
             try:
                 return int(str(v).strip())
             except Exception:
@@ -116,14 +118,14 @@ def _activity_color(activity: str) -> int:
     try:
         for key, items in PRESETS.items():
             if activity in items:
-                if key == "raids": return 0xE6B500
-                if key == "dungeons": return 0x8A2BE2
-                if key == "exotic_activities": return 0x00CED1
+                if key == "raids": return 0xE6B500  # gold
+                if key == "dungeons": return 0x8A2BE2  # purple
+                if key == "exotic_activities": return 0x00CED1  # teal
     except Exception:
         pass
-    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota")): return 0xE6B500
+    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation")): return 0xE6B500
     if any(k in a for k in ("dungeon", "pit", "crypt", "deep", "spire")): return 0x8A2BE2
-    return 0x2F3136
+    return 0x2F3136  # neutral
 
 async def _send_to_channel_id(channel_id: Optional[int], content: Optional[str] = None, *, embed: Optional[discord.Embed] = None, file: Optional[discord.File] = None):
     try:
@@ -722,17 +724,14 @@ async def _scheduler_loop():
                 # Auto-open at T-2h if player slots remain
                 if not data.get("signups_open") and now >= start_ts - 2*60*60 and len(participants) < player_slots:
                     data["signups_open"] = True
-                    # Add ✅ to main event post
+                    # Add ✅, 📝, ❌ to main event post
                     try:
                         ch = bot.get_channel(int(data.get("channel_id"))) or await bot.fetch_channel(int(data.get("channel_id")))
                         if ch:
                             msg = await ch.fetch_message(int(mid))
-                            try: await msg.add_reaction("✅")
-                            except Exception: pass
-                            try: await msg.add_reaction("📝")
-                            except Exception: pass
-                            try: await msg.add_reaction("❌")
-                            except Exception: pass
+                            for emoji in ("✅", "📝", "❌"):
+                                try: await msg.add_reaction(emoji)
+                                except Exception: pass
                     except Exception:
                         pass
                     # LFG announcement ONLY if channel configured
@@ -751,10 +750,66 @@ async def _scheduler_loop():
                                 + (f"Join here: {event_link}" if event_link else "Check the event signup post to join.")
                             ),
                         )
+
+                # DM Reminders: 2h, 30m, start
+                for label, delta, key in (("2h", 2*60*60, "r_2h"), ("30m", 30*60, "r_30m"), ("start", 0, "r_0m")):
+                    if not data.get(key) and now >= start_ts - delta:
+                        await _send_reminders(data, label)
+                        data[key] = True
+
         except Exception as e:
             print("scheduler error:", e)
         finally:
             await asyncio.sleep(60)
+
+async def _send_reminders(data: Dict[str, object], label: str):
+    guild = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+    if not guild: return
+    activity = data.get("activity", "Event")
+    when_text = data.get("when_text", "soon")
+    participants: List[int] = data.get("players", [])  # type: ignore
+    sherpas: Set[int] = data.get("sherpas", set())  # type: ignore
+
+    msg = {
+        "2h": f"Reminder: **{activity}** in ~2 hours ({when_text}).",
+        "30m": f"Reminder: **{activity}** in ~30 minutes ({when_text}).",
+        "start": f"It's time: **{activity}** ({when_text}).",
+    }.get(label, f"Reminder: **{activity}** ({when_text}).")
+
+    async def dm(uid: int):
+        try:
+            member = guild.get_member(uid)
+            if not member: return
+            d = await member.create_dm()
+            await d.send(msg)
+        except Exception:
+            pass
+
+    for uid in participants: await dm(uid)
+    for uid in sherpas: await dm(uid)
+
+    # Schedule a survey DM 3h after start (for 'start' only)
+    if label == "start":
+        async def survey_task():
+            try:
+                await asyncio.sleep(3 * 60 * 60)
+                g = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+                if not g: return
+                survey_msg = (
+                    f"Thanks for running **{activity}**! We'd love your feedback.\n"
+                    f"Please fill out the survey in **#survey-and-suggestions**."
+                )
+                for uid in participants:
+                    try:
+                        member = g.get_member(uid)
+                        if member:
+                            d = await member.create_dm()
+                            await d.send(survey_msg)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        bot.loop.create_task(survey_task())
 
 # ---------------------------
 # /schedule
@@ -924,6 +979,23 @@ async def schedule_cmd(
                 await _send_to_channel_id(int(GENERAL_SHERPA_CHANNEL_ID), content=ping_text, embed=gen_embed)
             except Exception:
                 pass
+
+        # ---- DM pre-slotted sherpas with a SherpaConfirmView ----
+        try:
+            for sid in list(sherpa_ids):
+                try:
+                    m = guild.get_member(sid) if guild else None
+                    if not m: continue
+                    dm = await m.create_dm()
+                    content = (
+                        f"You've been pre-slotted as a **Sherpa** for **{activity}** at **{when_text}**.\n"
+                        "Tap **Confirm Sherpa** to lock your Sherpa slot, or **Can't make it** to decline."
+                    )
+                    await dm.send(content=content, view=SherpaConfirmView(mid=mid, uid=sid))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # ---- DMs to entire queue (ConfirmView) ----
         sent = 0
