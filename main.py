@@ -1065,7 +1065,48 @@ async def schedule_cmd(
         q = QUEUES.get(activity, [])
         candidates = list(q)  # DM **everyone** in the queue
 
-    start_ts = _parse_date_time_to_epoch(date, time, tz_name="America/New_York")
+        # Parse datetime_str and timezone (MM-DD HH:MM)
+        try:
+            date_part, time_part = datetime_str.strip().split()
+            # Use current year
+            now = datetime.now()
+            year = now.year
+            date_full = f"{year}-{date_part}"
+        except Exception:
+            await interaction.followup.send("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True)
+            return
+        start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
+
+        # Parse pre-slotted users using helper (handles mentions and names)
+        guild = interaction.guild
+        sherpa_ids = set(_parse_user_ids(sherpas or "", guild)) if sherpas else set()
+        participant_ids = _parse_user_ids(participants or "", guild) if participants else []
+
+        # Ensure the scheduling user takes one participant slot
+        promoter_id = interaction.user.id
+        if promoter_id not in participant_ids:
+            participant_ids.insert(0, promoter_id)
+
+        # Sherpas visually separate but should count toward player slots.
+        # Merge sherpas into the participant order (preserve provided participant order,
+        # then append any sherpas not already listed) so they consume player slots.
+        merged_participants = list(participant_ids)
+        for sid in list(sherpa_ids):
+            if sid not in merged_participants:
+                merged_participants.append(sid)
+
+        # Compose when_text for embed
+        when_text = f"<t:{start_ts}:F> ({timezone})" if start_ts else "TBD"
+
+        # Split participants into actual players (up to available player slots) and backups
+        player_slots = max(0, cap - reserved)
+        # Dedupe merged participants while preserving order
+        seen = set(); uniq_participants: List[int] = []
+        for uid in merged_participants:
+            if uid not in seen:
+                uniq_participants.append(uid); seen.add(uid)
+        players_final = uniq_participants[:player_slots]
+        backups_final = uniq_participants[player_slots:]
 
         data = {
             "guild_id": guild.id if guild else None,
