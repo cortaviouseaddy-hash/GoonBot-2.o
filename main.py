@@ -1,4 +1,4 @@
-# GoonBot main.py — queues, check-in, promotions, scheduling
+THIS SHOULD BE A LINTER ERROR# GoonBot main.py — queues, check-in, promotions, scheduling
 # Exact behavior:
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
 # - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
@@ -426,19 +426,30 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User, mess
         "✨ What it Means to be a Sherpa Assistant\n"
         "You are now part of an elite group dedicated to helping Guardians conquer Destiny’s toughest challenges.\n"
         "Sherpas bring patience, clarity, and positive vibes to every fireteam.\n"
-        "You’re the torchbearers — guiding others through chaos and turning doubt into understanding.\n\n"
+        "You’re the torchbearers — guiding others through chaos and turning doubt into understanding.\n"
+        "A Sherpa doesn’t just guide — they inspire Guardians to rise higher.\n\n"
         "❤️ Why We Do This\n"
         "Every Guardian deserves the chance to experience the best of Destiny.\n"
-        "By serving as a Sherpa Assistant, you’re building a stronger, more inclusive community where knowledge is shared.\n\n"
-        "⚔️ Expectations\n"
-        "• Be the calm voice when the fireteam feels the pressure\n"
-        "• Explain mechanics clearly so anyone can succeed\n"
-        "• Turn wipes into lessons, and lessons into victory\n"
-        "• Keep every run welcoming, fun, and unforgettable\n\n"
+        "By serving as a Sherpa Assistant, you’re building a stronger, more inclusive community where knowledge is shared freely and friendships are forged through every raid and exotic mission.\n\n"
+        "⚔️ Expectations\n\n"
+        "- Be the calm voice when the fireteam feels the pressure\n"
+        "- Explain mechanics clearly so anyone can succeed\n"
+        "- Turn wipes into lessons, and lessons into victory\n"
+        "- Keep every run welcoming, fun, and unforgettable\n\n"
         "🧭 Carry the Light\n"
+        "Every Guardian you guide becomes part of your story.\n"
         "Lead with patience, lift others up, and show what it truly means to Carry the Light."
     )
-    emb = discord.Embed(title=title, description=desc, color=0xFFD700)
+    # Vivid, rotating color palette for a colorful look
+    _vivid_colors = [0xF1C40F, 0xE91E63, 0x9B59B6, 0x1ABC9C, 0x3498DB, 0xE67E22]
+    _chosen_color = _vivid_colors[int(user.id) % len(_vivid_colors)]
+    emb = discord.Embed(title=title, description=desc, color=_chosen_color)
+    try:
+        if getattr(user, "display_avatar", None):
+            emb.set_thumbnail(url=user.display_avatar.url)
+            emb.set_author(name=f"{user.display_name}", icon_url=user.display_avatar.url)
+    except Exception:
+        pass
     if data:
         try:
             emb.add_field(name="Event", value=data.get("activity", "event"), inline=True)
