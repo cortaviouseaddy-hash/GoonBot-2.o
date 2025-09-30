@@ -210,9 +210,15 @@ def founder_only():
         if not FOUNDER_USER_ID:
             return True
         try:
-            return interaction.user.id == int(FOUNDER_USER_ID)
+            if FOUNDER_USER_ID and interaction.user.id == int(FOUNDER_USER_ID):
+                return True
         except Exception:
-            return False
+            pass
+        if isinstance(interaction.user, discord.Member):
+            # fallback by role name in case founder id not set
+            if any(r.name.lower() == "founder" for r in interaction.user.roles):
+                return True
+        raise app_commands.CheckFailure("You are not authorized to use this command.")
     return app_commands.check(predicate)
 
 def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
