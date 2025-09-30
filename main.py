@@ -45,7 +45,7 @@ SHERPA_ASSISTANT_ROLE_ID      = _env_int("SHERPA_ASSISTANT_ROLE_ID")
 SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
 
-FOUNDER_USER_ID               = os.getenv("FOUNDER_USER_ID")  # str
+FOUNDER_USER_ID               = os.getenv("FOUNDER_USER_ID", "606274733750878218")  # str
 
 # ---------------------------
 # Intents & Bot
