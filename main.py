@@ -941,6 +941,7 @@ async def schedule_cmd(
         SCHEDULES[mid] = data
 
         # ---- EMBED 2: Sherpa Signup Embed (RAID_SIGN_UP_CHANNEL_ID) ----
+        sherpa_alert_url = None
         if RAID_SIGN_UP_CHANNEL_ID and reserved > 0:
             try:
                 sherpa_embed = discord.Embed(
@@ -963,6 +964,10 @@ async def schedule_cmd(
                     SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
                     try: await alert.add_reaction("✅")
                     except Exception: pass
+                    try:
+                        sherpa_alert_url = alert.jump_url
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -979,8 +984,11 @@ async def schedule_cmd(
                     ),
                     color=_activity_color(activity),
                 )
+                # Prefer linking directly to the Sherpa signup post; fall back to main event
                 try:
-                    if ev_msg:
+                    if sherpa_alert_url:
+                        gen_embed.add_field(name="Sherpa Signup", value=f"[Tap here to claim]({sherpa_alert_url})", inline=False)
+                    elif ev_msg:
                         gen_embed.add_field(name="Main Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
                 except Exception:
                     pass
