@@ -4,7 +4,7 @@ Minimal Discord.py bot wired for Render deployment with themed Destiny activity 
 No commands included—just connects and loads presets for your cogs/AI to use.
 
 ## Files
-- main.py — bot entry (no commands)
+- main.py — bot entry (queues, scheduling, welcomes)
 - activities.json — raids/dungeons/exotics with emojis
 - presets_loader.py — loads/validates presets
 - env_safety.py — reads DISCORD_TOKEN from env
@@ -22,6 +22,20 @@ No commands included—just connects and loads presets for your cogs/AI to use.
 ## Discord Portal Settings
 - Enable Message Content Intent if you plan to process messages later.
 - Reset your token if it was ever leaked.
+
+## Welcome Messages
+New members get a welcome embed in your general chat and a DM with quick instructions.
+
+Environment variables:
+- `GENERAL_CHANNEL_ID` (required for embed): ID of your general channel
+- `WELCOME_EMBED_ENABLED` (default true): toggle the embed in general
+- `WELCOME_DM_ENABLED` (default true): toggle the DM
+
+What the embed/DM explains:
+- `/join`: Join a specific activity queue (e.g., a raid)
+- `/queue`: Post or view current queues
+- `/schedule`: Founder schedules events; look for the signup post in your signup channel
+- Watch for reactions on event posts: `📝` backup, `✅` confirm/join (when open), `❌` leave
 
 ## Next Steps
 - Add a `cogs/` folder and load extensions from main.py if you want modular features.

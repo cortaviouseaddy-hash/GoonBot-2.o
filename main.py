@@ -36,6 +36,15 @@ def _env_int(*names) -> Optional[int]:
                 return None
     return None
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return bool(default)
+    s = str(val).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}: return True
+    if s in {"0", "false", "no", "n", "off"}: return False
+    return bool(default)
+
 GENERAL_CHANNEL_ID            = _env_int("GENERAL_CHANNEL_ID")
 GENERAL_SHERPA_CHANNEL_ID     = _env_int("GENERAL_SHERPA_CHANNEL_ID")
 LFG_CHAT_CHANNEL_ID           = _env_int("LFG_CHAT_CHANNEL_ID")
@@ -46,6 +55,10 @@ SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
 
 FOUNDER_USER_ID               = os.getenv("FOUNDER_USER_ID")  # str
+
+# Welcome settings (embed goes to GENERAL_CHANNEL_ID)
+WELCOME_DM_ENABLED            = _env_bool("WELCOME_DM_ENABLED", True)
+WELCOME_EMBED_ENABLED         = _env_bool("WELCOME_EMBED_ENABLED", True)
 
 # ---------------------------
 # Intents & Bot
@@ -182,6 +195,12 @@ def _apply_activity_image(embed: discord.Embed, activity: str) -> Tuple[discord.
             file = None
     return embed, file
 
+def _channel_mention(cid: Optional[int], fallback: str = "#channel"):
+    try:
+        return f"<#{int(cid)}>" if cid else fallback
+    except Exception:
+        return fallback
+
 def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[str] = None) -> Optional[int]:
     try:
         dt = datetime.strptime(f"{date_iso} {time_part}", "%Y-%m-%d %H:%M")
@@ -284,6 +303,56 @@ async def on_ready():
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     print(f"Ready as {bot.user}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        guild = member.guild
+        if not guild:
+            return
+
+        # Build shared content about commands and signals
+        general_mention = _channel_mention(GENERAL_CHANNEL_ID, "#general")
+        signup_mention = _channel_mention(EVENT_SIGNUP_CHANNEL_ID, "#signups")
+        queue_mention = _channel_mention(RAID_QUEUE_CHANNEL_ID, "#queues")
+
+        explain = (
+            "Here’s how to get started:\n\n"
+            "• /join — Join a specific activity queue (e.g., a raid).\n"
+            "• /queue — Post or view current queues to see sign-ups.\n"
+            "• /schedule — Founder schedules an event; watch for the signup post in " + signup_mention + ".\n\n"
+            "Watch for these on event posts:\n"
+            "• 📝 add yourself as a backup\n"
+            "• ✅ confirm or join when signups open\n"
+            "• ❌ remove yourself if you can’t make it"
+        )
+
+        # Send embed in general channel
+        if WELCOME_EMBED_ENABLED and GENERAL_CHANNEL_ID:
+            try:
+                title = f"Welcome to {guild.name}, {member.display_name}!"
+                desc = (
+                    f"Glad to have you, {member.mention}! Say hi in {general_mention}.\n\n" + explain
+                )
+                emb = discord.Embed(title=title, description=desc, color=0x2F3136)
+                emb.set_footer(text=f"Member #{guild.member_count}")
+                await _send_to_channel_id(GENERAL_CHANNEL_ID, embed=emb)
+            except Exception:
+                pass
+
+        # DM the member
+        if WELCOME_DM_ENABLED:
+            try:
+                dm = await member.create_dm()
+                dm_text = (
+                    f"Welcome to {guild.name}, {member.display_name}!\n\n"
+                    f"Say hi in {general_mention}.\n\n" + explain
+                )
+                await dm.send(dm_text)
+            except Exception:
+                pass
+    except Exception as e:
+        print("on_member_join error:", e)
 
 # ---------------------------
 # Queue Boards (optional utility)
