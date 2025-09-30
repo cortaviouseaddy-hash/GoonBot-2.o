@@ -300,10 +300,6 @@ async def _post_all_activity_boards():
 # Slash Commands
 # ---------------------------
 
-@bot.tree.command(name="ping", description="Check bot latency")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)} ms")
-
 @bot.tree.command(name="join", description="Join an activity queue")
 @app_commands.describe(activity="Choose an activity to join")
 @app_commands.autocomplete(activity=_activity_autocomplete)
