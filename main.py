@@ -317,7 +317,8 @@ async def ping(interaction: discord.Interaction):
 @app_commands.autocomplete(activity=_activity_autocomplete)
 async def join_cmd(interaction: discord.Interaction, activity: str):
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if member and _is_sherpa(member):
+    # Only block Sherpa Assistants from joining queues (full Sherpas may join)
+    if member and _is_sherpa_assistant(member):
         await interaction.response.send_message("Sherpa Assistants cannot join queues.", ephemeral=True)
         return
     if activity not in ALL_ACTIVITIES:
