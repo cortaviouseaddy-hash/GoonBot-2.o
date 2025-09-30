@@ -103,6 +103,14 @@ def _is_sherpa(member: discord.Member) -> bool:
     except Exception:
         return False
 
+def _is_sherpa_assistant(member: discord.Member) -> bool:
+    try:
+        if SHERPA_ASSISTANT_ROLE_ID:
+            return any(r.id == int(SHERPA_ASSISTANT_ROLE_ID) for r in member.roles)
+        return any(r.name.lower() == "sherpa assistant" for r in member.roles)
+    except Exception:
+        return False
+
 async def _activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     cur = (current or "").lower()
     out: List[app_commands.Choice[str]] = []
@@ -961,7 +969,7 @@ async def schedule_cmd(
         # ---- ANNOUNCEMENT 1: General Sherpa ping (GENERAL_SHERPA_CHANNEL_ID) ----
         if GENERAL_SHERPA_CHANNEL_ID:
             try:
-                ping_text = f"<@&{SHERPA_ROLE_ID}>" if SHERPA_ROLE_ID else None
+                ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
                 gen_embed = discord.Embed(
                     title=f"Sherpa Signup — {activity}",
                     description=(
@@ -1065,7 +1073,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
             if not guild: return
             member = guild.get_member(payload.user_id)
-            if not member or not _is_sherpa(member):
+            if not member or not _is_sherpa_assistant(member):
                 return
             reserved = int(data.get("reserved_sherpas", 0))
             sherpas: Set[int] = data.get("sherpas")  # type: ignore
