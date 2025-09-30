@@ -1,4 +1,4 @@
-THIS SHOULD BE A LINTER ERROR# GoonBot main.py — queues, check-in, promotions, scheduling
+# GoonBot main.py — queues, check-in, promotions, scheduling
 # Exact behavior:
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
 # - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
