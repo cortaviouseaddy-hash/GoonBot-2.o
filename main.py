@@ -858,6 +858,71 @@ async def _send_reminders(data: Dict[str, object], label: str):
         bot.loop.create_task(survey_task())
 
 # ---------------------------
+# Auto-restore deleted event embeds
+# ---------------------------
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    try:
+        data = SCHEDULES.get(message.id)
+        if not data:
+            return
+        guild = message.guild or (bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None)  # type: ignore
+        embed, f = await _render_event_embed(guild, str(data.get("activity", "Event")), data)
+        ch_id = int(data.get("channel_id")) if data.get("channel_id") else (message.channel.id if message.channel else None)  # type: ignore
+        if not ch_id:
+            return
+        new_msg = await _send_to_channel_id(int(ch_id), embed=embed, file=f)
+        if not new_msg:
+            return
+        # Re-add standard reactions
+        for emoji in ("📝", "❌"):
+            try:
+                await new_msg.add_reaction(emoji)
+            except Exception:
+                pass
+        # Update schedule mapping to include the new message id while preserving the old for DM callbacks
+        new_mid = int(new_msg.id)
+        SCHEDULES[new_mid] = data
+        # Also keep old key mapped to the same data so existing DM views continue to work
+        SCHEDULES[message.id] = data
+        # Update stored channel id in case the restore posted to a different channel
+        data["channel_id"] = int(new_msg.channel.id)
+
+        # If a Sherpa signup alert exists, update its link to point to the restored event
+        try:
+            alert_mid = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None  # type: ignore
+            alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None  # type: ignore
+            if alert_mid and alert_ch:
+                ch = bot.get_channel(alert_ch) or await bot.fetch_channel(alert_ch)
+                if ch:
+                    amsg = await ch.fetch_message(alert_mid)
+                    if amsg and amsg.embeds:
+                        src = amsg.embeds[0]
+                        new_emb = discord.Embed(title=src.title, description=src.description, color=src.color)
+                        # Preserve existing fields, but update/ensure Main Event link
+                        main_event_updated = False
+                        for field in src.fields:
+                            if str(field.name).lower().startswith("main event"):
+                                new_emb.add_field(name=field.name, value=f"[Jump to event]({new_msg.jump_url})", inline=field.inline)
+                                main_event_updated = True
+                            else:
+                                new_emb.add_field(name=field.name, value=field.value, inline=field.inline)
+                        if not main_event_updated:
+                            new_emb.add_field(name="Main Event", value=f"[Jump to event]({new_msg.jump_url})", inline=False)
+                        # Preserve image if any
+                        try:
+                            if src.image and src.image.url:
+                                new_emb.set_image(url=src.image.url)
+                        except Exception:
+                            pass
+                        await amsg.edit(embed=new_emb)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+# ---------------------------
 # /schedule
 # ---------------------------
 
@@ -980,7 +1045,7 @@ async def schedule_cmd(
 
         # ---- EMBED 2: Sherpa Signup Embed (RAID_SIGN_UP_CHANNEL_ID) ----
         sherpa_alert_url = None
-        if RAID_SIGN_UP_CHANNEL_ID and reserved > 0:
+        if RAID_SIGN_UP_CHANNEL_ID:
             try:
                 sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Signup — {activity}",
