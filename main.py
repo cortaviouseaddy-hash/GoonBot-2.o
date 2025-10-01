@@ -980,7 +980,7 @@ async def schedule_cmd(
 
         # ---- EMBED 2: Sherpa Signup Embed (RAID_SIGN_UP_CHANNEL_ID) ----
         sherpa_alert_url = None
-        if RAID_SIGN_UP_CHANNEL_ID and reserved > 0:
+        if RAID_SIGN_UP_CHANNEL_ID:
             try:
                 sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Signup — {activity}",
