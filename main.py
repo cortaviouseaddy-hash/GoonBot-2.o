@@ -872,14 +872,22 @@ async def _send_reminders(data: Dict[str, object], label: str):
     async def dm(uid: int):
         try:
             member = guild.get_member(uid)
-            if not member: return
+            if not member: return False
             d = await member.create_dm()
             await d.send(msg)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            try: print("DM reminder failed:", label, uid, e)
+            except Exception: pass
+            return False
 
-    for uid in participants: await dm(uid)
-    for uid in sherpas: await dm(uid)
+    sent_p = 0; sent_s = 0
+    for uid in participants:
+        if await dm(uid): sent_p += 1
+    for uid in sherpas:
+        if await dm(uid): sent_s += 1
+    try: print(f"Reminders sent ({label}): players={sent_p}, sherpas={sent_s}")
+    except Exception: pass
 
     # Schedule a survey DM 3h after start (for 'start' only)
     if label == "start":
