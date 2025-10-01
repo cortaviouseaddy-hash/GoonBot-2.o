@@ -10,6 +10,7 @@
 
 import os
 import asyncio
+import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -198,6 +199,36 @@ def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[s
         return int(dt.timestamp())
     except Exception:
         return None
+
+# ---------------------------
+# Counter Utilities
+# ---------------------------
+
+COUNT_FILE = os.path.join(os.path.dirname(__file__), "counts.json")
+COUNTER_LOCK = asyncio.Lock()
+
+def _read_counter() -> int:
+    try:
+        with open(COUNT_FILE, "r") as f:
+            data = json.load(f)
+        value = int(data.get("count", 0))
+        return value if value >= 0 else 0
+    except Exception:
+        return 0
+
+def _write_counter(value: int) -> None:
+    try:
+        with open(COUNT_FILE, "w") as f:
+            json.dump({"count": int(value)}, f)
+    except Exception:
+        pass
+
+async def _increment_counter() -> int:
+    async with COUNTER_LOCK:
+        current = _read_counter()
+        new_value = current + 1
+        _write_counter(new_value)
+        return new_value
 
 # ---------------------------
 # Permissions
@@ -579,6 +610,11 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     else:
         await _post_all_activity_boards()
         await interaction.followup.send("Queue boards posted.", ephemeral=True)
+
+@bot.tree.command(name="count", description="Increment a persistent counter and show the value")
+async def count_cmd(interaction: discord.Interaction):
+    new_value = await _increment_counter()
+    await interaction.response.send_message(f"Count: {new_value}")
 
 # ---------------------------
 # Parser
