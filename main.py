@@ -650,6 +650,15 @@ async def count_cmd(interaction: discord.Interaction):
     new_value = await _increment_counter()
     await interaction.response.send_message(f"Count: {new_value}")
 
+# Simple health check
+@bot.tree.command(name="ping", description="Health check: bot latency")
+async def ping_cmd(interaction: discord.Interaction):
+    try:
+        latency_ms = int((bot.latency or 0.0) * 1000)
+    except Exception:
+        latency_ms = 0
+    await interaction.response.send_message(f"Pong! {latency_ms} ms")
+
 # ---------------------------
 # Parser
 # ---------------------------
