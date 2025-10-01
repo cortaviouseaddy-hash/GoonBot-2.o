@@ -1069,11 +1069,10 @@ async def schedule_cmd(
             "players": players_final,
             "backups": backups_final,
             "promoter_id": promoter_id,
-            "signups_open": True,
+            "signups_open": False,
             "channel_id": channel_id,
             "start_ts": start_ts,
             "r_2h": False, "r_30m": False, "r_0m": False,
-            "lfg_nudged": False,
         }
 
         # ---- EMBED 1: Main Event Embed (EVENT_SIGNUP_CHANNEL_ID) ----
@@ -1083,8 +1082,8 @@ async def schedule_cmd(
             await interaction.followup.send("Failed to post event — set RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID or run this in a channel.", ephemeral=True)
             return
 
-        # Add initial ✅, 📝 and ❌ so signups are open immediately
-        for emoji in ("✅", "📝", "❌"):
+        # Add initial 📝 and ❌ only; ✅ appears at T-2h if player slots remain
+        for emoji in ("📝", "❌"):
             try: await ev_msg.add_reaction(emoji)
             except Exception: pass
 
@@ -1212,7 +1211,7 @@ async def schedule_cmd(
                 try: print("General announcement fallback failed:", e)
                 except Exception: pass
 
-        # ---- DM pre-slotted sherpas with a SherpaConfirmView ----
+        # ---- DM pre-slotted sherpas (info-only) ----
         try:
             for sid in list(sherpa_ids):
                 try:
@@ -1220,10 +1219,10 @@ async def schedule_cmd(
                     if not m: continue
                     dm = await m.create_dm()
                     content = (
-                        f"You've been pre-slotted as a **Sherpa** for **{activity}** at **{when_text}**.\n"
-                        "Tap **Confirm Sherpa** to lock your Sherpa slot, or **Can't make it** to decline."
+                        f"You're pre-slotted as a **Sherpa** for **{activity}** at **{when_text}**.\n"
+                        "No action needed. If plans change, please let the promoter know."
                     )
-                    await dm.send(content=content, view=SherpaConfirmView(mid=mid, uid=sid))
+                    await dm.send(content=content)
                 except Exception:
                     pass
         except Exception:
@@ -1247,7 +1246,7 @@ async def schedule_cmd(
             except Exception as e:
                 print("DM failed:", e)
 
-        # DM any pre-slotted players we didn't DM above
+        # DM any pre-slotted players we didn't DM above (info-only)
         pre_dmed = set(candidates)
         p_sent = 0
         for uid in data.get("players", []) or []:
@@ -1257,10 +1256,10 @@ async def schedule_cmd(
                 if not m: continue
                 dm = await m.create_dm()
                 content = (
-                    f"You're pre-slotted as a Player for **{activity}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
-                    "Tap **Confirm** to lock your spot, or **Can't make it** to decline."
+                    f"You're pre-slotted as a **Player** for **{activity}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
+                    "No action needed. If you can't make it, please let the promoter know."
                 )
-                await dm.send(content=content, view=ConfirmView(mid=mid, uid=uid))
+                await dm.send(content=content)
                 p_sent += 1
             except Exception as e:
                 print("Pre-slot DM failed:", e)
