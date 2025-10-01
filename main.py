@@ -46,6 +46,34 @@ SHERPA_ASSISTANT_ROLE_ID      = _env_int("SHERPA_ASSISTANT_ROLE_ID")
 SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
 
+# Optional local overrides via channel_ids.json (non-secret, deploy-time config)
+def _load_channel_overrides() -> None:
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), "channel_ids.json")
+        if not os.path.isfile(cfg_path):
+            return
+        with open(cfg_path, "r") as f:
+            data = json.load(f)
+        def _to_int(v):
+            try:
+                return int(str(v).strip())
+            except Exception:
+                return None
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID
+        gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
+        rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
+        gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
+        if gs and not GENERAL_SHERPA_CHANNEL_ID:
+            GENERAL_SHERPA_CHANNEL_ID = gs
+        if rs and not RAID_SIGN_UP_CHANNEL_ID:
+            RAID_SIGN_UP_CHANNEL_ID = rs
+        if gc and not GENERAL_CHANNEL_ID:
+            GENERAL_CHANNEL_ID = gc
+    except Exception:
+        pass
+
+_load_channel_overrides()
+
 FOUNDER_USER_ID               = os.getenv("FOUNDER_USER_ID")  # str
 
 # ---------------------------
