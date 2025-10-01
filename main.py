@@ -59,16 +59,19 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
+        lf = _to_int(data.get("LFG_CHAT_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
             RAID_SIGN_UP_CHANNEL_ID = rs
         if gc and not GENERAL_CHANNEL_ID:
             GENERAL_CHANNEL_ID = gc
+        if lf and not LFG_CHAT_CHANNEL_ID:
+            LFG_CHAT_CHANNEL_ID = lf
     except Exception:
         pass
 
@@ -808,7 +811,7 @@ async def _scheduler_loop():
                                 except Exception: pass
                     except Exception:
                         pass
-                    # LFG announcement ONLY if channel configured
+                    # LFG announcement ONLY if channel configured: @everyone and point to event signup channel
                     if LFG_CHAT_CHANNEL_ID:
                         event_link = None
                         try:
@@ -817,12 +820,14 @@ async def _scheduler_loop():
                             event_link = m.jump_url if m else None
                         except Exception:
                             event_link = None
+                        signup_channel_mention = f"<#{int(data.get('channel_id'))}>" if data.get('channel_id') else "the event signup channel"
                         await _send_to_channel_id(
                             LFG_CHAT_CHANNEL_ID,
                             content=(
-                                f"📣 **{data['activity']}** starts in ~2 hours and still has open slots.\n"
-                                + (f"Join here: {event_link}" if event_link else "Check the event signup post to join.")
-                            ),
+                                f"@everyone 📣 Slots open for **{data['activity']}** starting in ~2 hours!\n"
+                                f"Head to {signup_channel_mention} to join. "
+                                + (f"Jump to the event: {event_link}" if event_link else "")
+                            ).strip(),
                         )
 
                 # DM Reminders: 2h, 30m, start
