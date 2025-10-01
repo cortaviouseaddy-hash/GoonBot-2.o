@@ -1045,6 +1045,8 @@ async def schedule_cmd(
 
         # ---- EMBED 2: Sherpa Signup Embed (RAID_SIGN_UP_CHANNEL_ID) ----
         sherpa_alert_url = None
+        posted_sherpa_signup = False
+        sherpa_signup_fallback = None
         if RAID_SIGN_UP_CHANNEL_ID:
             try:
                 sherpa_embed = discord.Embed(
@@ -1071,10 +1073,43 @@ async def schedule_cmd(
                         sherpa_alert_url = alert.jump_url
                     except Exception:
                         pass
-            except Exception:
-                pass
+                    posted_sherpa_signup = True
+            except Exception as e:
+                try: print("Sherpa signup post failed:", e)
+                except Exception: pass
+        # fallback: if RAID_SIGN_UP_CHANNEL_ID missing or failed, try posting in the event channel
+        if not posted_sherpa_signup:
+            try:
+                sherpa_embed = discord.Embed(
+                    title=f"🧭 Sherpa Signup — {activity}",
+                    description=(
+                        f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
+                        f"Overflow becomes **Sherpa Backup**."
+                    ),
+                    color=_activity_color(activity),
+                )
+                sherpa_embed.add_field(name="When", value=when_text, inline=True)
+                try:
+                    sherpa_embed.add_field(name="Main Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
+                except Exception:
+                    pass
+                alert = await _send_to_channel_id(int(channel_id), embed=sherpa_embed)
+                if alert:
+                    try: await alert.add_reaction("✅")
+                    except Exception: pass
+                    try:
+                        sherpa_alert_url = alert.jump_url
+                    except Exception:
+                        pass
+                    sherpa_signup_fallback = int(channel_id)
+                    posted_sherpa_signup = True
+            except Exception as e:
+                try: print("Sherpa signup fallback post failed:", e)
+                except Exception: pass
 
         # ---- ANNOUNCEMENT 1: General Sherpa ping (GENERAL_SHERPA_CHANNEL_ID) ----
+        posted_general_announce = False
+        general_announce_fallback = None
         if GENERAL_SHERPA_CHANNEL_ID:
             try:
                 ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
@@ -1095,9 +1130,39 @@ async def schedule_cmd(
                         gen_embed.add_field(name="Main Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
                 except Exception:
                     pass
-                await _send_to_channel_id(int(GENERAL_SHERPA_CHANNEL_ID), content=ping_text, embed=gen_embed)
-            except Exception:
-                pass
+                msg = await _send_to_channel_id(int(GENERAL_SHERPA_CHANNEL_ID), content=ping_text, embed=gen_embed)
+                if msg:
+                    posted_general_announce = True
+            except Exception as e:
+                try: print("General Sherpa announcement failed:", e)
+                except Exception: pass
+        # fallback: if GENERAL_SHERPA_CHANNEL_ID missing or failed, try GENERAL_CHANNEL_ID
+        if not posted_general_announce and GENERAL_CHANNEL_ID:
+            try:
+                ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
+                gen_embed = discord.Embed(
+                    title=f"Sherpa Signup — {activity}",
+                    description=(
+                        f"{when_text}\n"
+                        f"Please use the **Sherpa signup post** to claim your slot (✅). "
+                        f"Extras become **Sherpa Backup**."
+                    ),
+                    color=_activity_color(activity),
+                )
+                try:
+                    if sherpa_alert_url:
+                        gen_embed.add_field(name="Sherpa Signup", value=f"[Tap here to claim]({sherpa_alert_url})", inline=False)
+                    elif ev_msg:
+                        gen_embed.add_field(name="Main Event", value=f"[Jump to event]({ev_msg.jump_url})", inline=False)
+                except Exception:
+                    pass
+                msg = await _send_to_channel_id(int(GENERAL_CHANNEL_ID), content=ping_text, embed=gen_embed)
+                if msg:
+                    posted_general_announce = True
+                    general_announce_fallback = int(GENERAL_CHANNEL_ID)
+            except Exception as e:
+                try: print("General announcement fallback failed:", e)
+                except Exception: pass
 
         # ---- DM pre-slotted sherpas with a SherpaConfirmView ----
         try:
@@ -1152,10 +1217,14 @@ async def schedule_cmd(
             except Exception as e:
                 print("Pre-slot DM failed:", e)
 
-        await interaction.followup.send(
-            f"Scheduled **{activity}**. DMed {sent} queued player(s), notified {p_sent} pre-slotted participant(s).",
-            ephemeral=True,
-        )
+        # Build a concise status summary for the promoter
+        status_lines = [
+            f"Scheduled **{activity}**.",
+            f"DMed {sent} queued player(s), notified {p_sent} pre-slotted participant(s).",
+            f"Sherpa signup posted: {'Yes' if posted_sherpa_signup else 'No'}" + (f" (fallback in <#{sherpa_signup_fallback}>)" if sherpa_signup_fallback else ""),
+            f"General-sherpa announcement: {'Yes' if posted_general_announce else 'No'}" + (f" (fallback in <#{general_announce_fallback}>)" if general_announce_fallback else ""),
+        ]
+        await interaction.followup.send("\n".join(status_lines), ephemeral=True)
 
     except Exception as e:
         print("/schedule command error:", e)
