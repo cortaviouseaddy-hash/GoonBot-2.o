@@ -1,4 +1,4 @@
-THIS SHOULD BE A LINTER ERROR# GoonBot main.py — queues, check-in, promotions, scheduling
+# GoonBot main.py — queues, check-in, promotions, scheduling
 # Exact behavior:
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
 # - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
@@ -1060,10 +1060,11 @@ async def schedule_cmd(
             "players": players_final,
             "backups": backups_final,
             "promoter_id": promoter_id,
-            "signups_open": False,
+            "signups_open": True,
             "channel_id": channel_id,
             "start_ts": start_ts,
             "r_2h": False, "r_30m": False, "r_0m": False,
+            "lfg_nudged": False,
         }
 
         # ---- EMBED 1: Main Event Embed (EVENT_SIGNUP_CHANNEL_ID) ----
@@ -1073,8 +1074,8 @@ async def schedule_cmd(
             await interaction.followup.send("Failed to post event — set RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID or run this in a channel.", ephemeral=True)
             return
 
-        # Add initial 📝 and ❌ only (✅ appears at T-2h if player slots remain)
-        for emoji in ("📝", "❌"):
+        # Add initial ✅, 📝 and ❌ so signups are open immediately
+        for emoji in ("✅", "📝", "❌"):
             try: await ev_msg.add_reaction(emoji)
             except Exception: pass
 
