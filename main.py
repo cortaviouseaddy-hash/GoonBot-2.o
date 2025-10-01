@@ -1,4 +1,4 @@
-# GoonBot main.py — queues, check-in, promotions, scheduling
+THIS SHOULD BE A LINTER ERROR# GoonBot main.py — queues, check-in, promotions, scheduling
 # Exact behavior:
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
 # - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
@@ -59,11 +59,12 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
         lf = _to_int(data.get("LFG_CHAT_CHANNEL_ID"))
+        ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
@@ -72,6 +73,8 @@ def _load_channel_overrides() -> None:
             GENERAL_CHANNEL_ID = gc
         if lf and not LFG_CHAT_CHANNEL_ID:
             LFG_CHAT_CHANNEL_ID = lf
+        if ev and not EVENT_SIGNUP_CHANNEL_ID:
+            EVENT_SIGNUP_CHANNEL_ID = ev
     except Exception:
         pass
 
@@ -820,7 +823,9 @@ async def _scheduler_loop():
                             event_link = m.jump_url if m else None
                         except Exception:
                             event_link = None
-                        signup_channel_mention = f"<#{int(data.get('channel_id'))}>" if data.get('channel_id') else "the event signup channel"
+                        # Always direct to the configured event signup channel if present
+                        target_signup_ch = int(EVENT_SIGNUP_CHANNEL_ID) if EVENT_SIGNUP_CHANNEL_ID else (int(data.get('channel_id')) if data.get('channel_id') else None)
+                        signup_channel_mention = f"<#{target_signup_ch}>" if target_signup_ch else "the event signup channel"
                         await _send_to_channel_id(
                             LFG_CHAT_CHANNEL_ID,
                             content=(
