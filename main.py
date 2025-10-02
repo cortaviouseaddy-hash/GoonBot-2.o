@@ -37,6 +37,13 @@ def _env_int(*names) -> Optional[int]:
                 return None
     return None
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
 GENERAL_CHANNEL_ID            = _env_int("GENERAL_CHANNEL_ID")
 GENERAL_SHERPA_CHANNEL_ID     = _env_int("GENERAL_SHERPA_CHANNEL_ID")
 LFG_CHAT_CHANNEL_ID           = _env_int("LFG_CHAT_CHANNEL_ID")
@@ -45,6 +52,7 @@ RAID_SIGN_UP_CHANNEL_ID       = _env_int("RAID_SIGN_UP_CHANNEL_ID")  # Sherpa si
 SHERPA_ASSISTANT_ROLE_ID      = _env_int("SHERPA_ASSISTANT_ROLE_ID")
 SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
+EVENT_HOST_AUTOJOIN           = _env_bool("EVENT_HOST_AUTOJOIN", True)
 
 # Optional local overrides via channel_ids.json (non-secret, deploy-time config)
 def _load_channel_overrides() -> None:
@@ -336,38 +344,70 @@ def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dic
 # ---------------------------
 
 async def _render_event_embed(guild: Optional[discord.Guild], activity: str, data: Dict[str, object]) -> Tuple[discord.Embed, Optional[discord.File]]:
-    title = f"{activity} — Event"
+    is_user_event = bool(data.get("format") == "user_event")
     desc = str(data.get("desc", "") or "")
-    embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
     when = data.get("when_text")
-    embed.add_field(name="When", value=when or "TBD", inline=False)
-    cap = data.get("capacity")
-    embed.add_field(name="Capacity", value=str(cap), inline=True)
+    cap = int(data.get("capacity", 0))
+
+    if is_user_event:
+        title = f"🗓️ {activity} — {when or 'TBD'}"
+    else:
+        title = f"{activity} — Event"
+
+    embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
+
+    if not is_user_event:
+        embed.add_field(name="When", value=when or "TBD", inline=False)
+        embed.add_field(name="Capacity", value=str(cap), inline=True)
 
     promoter_id = data.get("promoter_id")
     if promoter_id:
-        embed.add_field(name="Scheduled by", value=f"<@{promoter_id}>", inline=True)
+        host_label = "Host" if is_user_event else "Scheduled by"
+        embed.add_field(name=host_label, value=f"<@{promoter_id}>", inline=True)
         try:
             member = guild.get_member(int(promoter_id)) if guild and promoter_id else None
-            if member and member.avatar: embed.set_thumbnail(url=member.avatar.url)
+            if member and member.avatar:
+                embed.set_thumbnail(url=member.avatar.url)
         except Exception:
             pass
+
+    if is_user_event:
+        req = int(data.get("requested_sherpas", 0))
+        voice_name = data.get("voice_name")
+        embed.add_field(name="Capacity", value=str(cap), inline=True)
+        embed.add_field(name="Requested Sherpas", value=str(req), inline=True)
+        if voice_name:
+            embed.add_field(name="Voice", value=str(voice_name), inline=True)
 
     sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
     s_backups: Set[int] = data.get("sherpa_backup") or set()  # type: ignore
     players: List[int] = data.get("players", []) or []  # type: ignore
     backups: List[int] = data.get("backups", []) or []  # type: ignore
 
-    if sherpas:
-        embed.add_field(name="Sherpas", value=", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10]), inline=False)
-    if s_backups:
-        embed.add_field(name=f"Sherpa Backups ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in list(s_backups)[:10]), inline=False)
-    if players:
-        embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
-    if backups:
-        embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(f"<@{b}>" for b in backups), inline=False)
+    if not is_user_event:
+        if sherpas:
+            embed.add_field(name="Sherpas", value=", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10]), inline=False)
+        if s_backups:
+            embed.add_field(name=f"Sherpa Backups ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in list(s_backups)[:10]), inline=False)
 
-    embed_with_img, attachment = _apply_activity_image(embed, activity)
+    if players:
+        if is_user_event:
+            lines = [f"{i+1}. <@{uid}>" for i, uid in enumerate(players)]
+            embed.add_field(name=f"Participants ({len(players)}/{cap})", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
+    if backups:
+        if is_user_event:
+            embed.add_field(name=f"Backup ({len(backups)})", value="\n".join(f"– <@{b}>" for b in backups), inline=False)
+        else:
+            embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(f"<@{b}>" for b in backups), inline=False)
+
+    if is_user_event and desc:
+        embed.add_field(name="Notes", value=desc, inline=False)
+
+    # Prefer encounter/preset for image search if provided
+    search_text = str(data.get("encounter") or activity)
+    embed_with_img, attachment = _apply_activity_image(embed, search_text)
     return embed_with_img, attachment
 
 # ---------------------------
@@ -452,8 +492,10 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
         backups: List[int] = data.get("backups", [])  # type: ignore
         if uid in participants:
             participants[:] = [x for x in participants if x != uid]
-            _autofill_from_backups(data)
+            moved = _autofill_from_backups(data)
             changed = True
+            guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+            await _dm_promoted_users(guild, moved, data)
         if uid in backups:
             backups[:] = [x for x in backups if x != uid]
             changed = True
@@ -826,6 +868,21 @@ def _autofill_from_backups(data: Dict[str, object]):
             participants.append(nxt); moved.append(nxt)
     return moved
 
+async def _dm_promoted_users(guild: Optional[discord.Guild], moved: List[int], data: Dict[str, object]):
+    if not guild or not moved:
+        return
+    activity = data.get("activity", "Event")
+    when_text = data.get("when_text", "soon")
+    for uid in moved:
+        try:
+            member = guild.get_member(uid)
+            if not member:
+                continue
+            d = await member.create_dm()
+            await d.send(f"You have been pulled from Backup into the roster for **{activity}** ({when_text}).")
+        except Exception:
+            pass
+
 async def _update_schedule_message(guild: discord.Guild, message_id: int):
     data = SCHEDULES.get(message_id)
     if not data: return
@@ -905,10 +962,18 @@ async def _send_reminders(data: Dict[str, object], label: str):
     participants: List[int] = data.get("players", [])  # type: ignore
     sherpas: Set[int] = data.get("sherpas", set())  # type: ignore
 
+    voice_mention = None
+    try:
+        vc_id = int(data.get("voice_channel_id")) if data.get("voice_channel_id") else None  # type: ignore
+        if vc_id:
+            voice_mention = f" <#{vc_id}>"
+    except Exception:
+        voice_mention = None
+
     msg = {
-        "2h": f"Reminder: **{activity}** in ~2 hours ({when_text}).",
-        "30m": f"Reminder: **{activity}** in ~30 minutes ({when_text}).",
-        "start": f"It's time: **{activity}** ({when_text}).",
+        "2h": f"Eyes up! Your **{activity}** starts in ~2 hours ({when_text}). Be in{voice_mention or ' voice channel'} on time. If you can’t make it, hit ❌ on the signup to free the slot.",
+        "30m": f"30-minute check: **{activity}** starts soon ({when_text}). Grab loadout, shaders, and water. See you in{voice_mention or ' voice channel'}.",
+        "start": f"It’s go time: **{activity}** ({when_text}). Join{voice_mention or ' voice channel'} now. If you’re late, we may pull from Backup.",
     }.get(label, f"Reminder: **{activity}** ({when_text}).")
 
     async def dm(uid: int):
@@ -973,7 +1038,7 @@ async def on_message_delete(message: discord.Message):
         if not new_msg:
             return
         # Re-add standard reactions
-        for emoji in ("📝", "❌"):
+        for emoji in ("📝", "🔁", "❌"):
             try:
                 await new_msg.add_reaction(emoji)
             except Exception:
@@ -1336,6 +1401,149 @@ async def schedule_cmd(
                 pass
 
 # ---------------------------
+# /event — Player-Created Signup (with Sherpa Requests)
+# ---------------------------
+
+@bot.tree.command(name="event", description="Create a player event signup with requested Sherpas and LFG notify")
+@app_commands.describe(
+    activity="Activity name",
+    encounter="(Optional) encounter/preset image selector",
+    datetime="Date and time (single field, e.g., 10-05 19:00)",
+    timezone="Timezone (dropdown)",
+    requested_sherpas="Number of Sherpas requested (>= 0)",
+    notes="(Optional) special instructions",
+    voice_channel="(Optional) voice channel for meetup",
+)
+@app_commands.autocomplete(activity=_activity_autocomplete)
+@app_commands.choices(
+    timezone=[
+        app_commands.Choice(name="US Eastern", value="America/New_York"),
+        app_commands.Choice(name="US Central", value="America/Chicago"),
+        app_commands.Choice(name="US Mountain", value="America/Denver"),
+        app_commands.Choice(name="US Pacific", value="America/Los_Angeles"),
+        app_commands.Choice(name="UTC", value="UTC"),
+        app_commands.Choice(name="Europe/London", value="Europe/London"),
+        app_commands.Choice(name="Europe/Paris", value="Europe/Paris"),
+        app_commands.Choice(name="Asia/Tokyo", value="Asia/Tokyo"),
+    ]
+)
+async def event_cmd(
+    interaction: discord.Interaction,
+    activity: str,
+    datetime: str,
+    timezone: str,
+    requested_sherpas: int,
+    encounter: Optional[str] = None,
+    notes: Optional[str] = None,
+    voice_channel: Optional[discord.VoiceChannel] = None,
+):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    # Channel safety
+    if not EVENT_SIGNUP_CHANNEL_ID or not LFG_CHAT_CHANNEL_ID:
+        await interaction.followup.send("Event channels are not configured. Ask an admin to set EVENT_SIGNUP_CHANNEL_ID and LFG_CHAT_CHANNEL_ID.", ephemeral=True)
+        return
+
+    # Resolve activity and capacity
+    act, sug = _resolve_activity(activity)
+    if not act:
+        hint = (" Try: " + ", ".join(sug)) if sug else ""
+        await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
+        return
+    cap = _cap_for_activity(act)
+
+    # Parse date
+    try:
+        date_part, time_part = datetime.strip().split()
+        year = datetime_now_year = datetime_module_now = datetime.now().year
+        date_full = f"{datetime_now_year}-{date_part}"
+    except Exception:
+        await interaction.followup.send("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True)
+        return
+
+    start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
+    when_text = f"<t:{start_ts}:F> ({timezone})" if start_ts else "TBD"
+
+    # Validate requested sherpas
+    req_s = max(0, int(requested_sherpas))
+    if req_s > max(0, cap - 1):
+        req_s = max(0, cap - 1)
+        try:
+            await interaction.followup.send(f"requested_sherpas capped at {req_s} (capacity - 1).", ephemeral=True)
+        except Exception:
+            pass
+
+    guild = interaction.guild
+    promoter_id = interaction.user.id
+
+    # Participants and backups
+    players: List[int] = []
+    backups: List[int] = []
+    if EVENT_HOST_AUTOJOIN:
+        players.append(promoter_id)
+
+    data = {
+        "format": "user_event",
+        "guild_id": guild.id if guild else None,
+        "activity": act,
+        "encounter": encounter,
+        "desc": notes or "",
+        "when_text": when_text,
+        "capacity": cap,
+        "requested_sherpas": req_s,
+        "players": players,
+        "backups": backups,
+        "sherpas": set(),
+        "sherpa_backup": set(),
+        "promoter_id": promoter_id,
+        "signups_open": False,
+        "channel_id": int(EVENT_SIGNUP_CHANNEL_ID),
+        "start_ts": start_ts,
+        "voice_channel_id": int(voice_channel.id) if voice_channel else None,
+        "voice_name": getattr(voice_channel, "name", None) if voice_channel else None,
+        "r_2h": False, "r_30m": False, "r_0m": False,
+    }
+
+    # Post embed to signup channel
+    embed, f = await _render_event_embed(guild, act, data)
+    ev_msg = await _send_to_channel_id(int(EVENT_SIGNUP_CHANNEL_ID), embed=embed, file=f)
+    if not ev_msg:
+        await interaction.followup.send("Failed to post event.", ephemeral=True)
+        return
+
+    # Add reactions: ✅ appears immediately for user events, plus 🔁 and ❌
+    for emoji in ("✅", "🔁", "❌"):
+        try: await ev_msg.add_reaction(emoji)
+        except Exception: pass
+
+    mid = ev_msg.id
+    SCHEDULES[mid] = data
+
+    # LFG announcement
+    try:
+        event_link = ev_msg.jump_url
+    except Exception:
+        event_link = None
+    lfg_lines = [
+        "@everyone",
+        f"{act} — {when_text}",
+        f"Slots: {cap} • Sherpas requested: {req_s}",
+        "Tap the embed to ✅ Join or 🔁 Backup. New players welcome!",
+        event_link or "",
+    ]
+    content = "\n".join([ln for ln in lfg_lines if ln])
+    await _send_to_channel_id(LFG_CHAT_CHANNEL_ID, content=content)
+
+    # Optional Sherpa ping if requested
+    if req_s > 0 and SHERPA_ASSISTANT_ROLE_ID:
+        await _send_to_channel_id(LFG_CHAT_CHANNEL_ID, content=f"<@&{SHERPA_ASSISTANT_ROLE_ID}> — Need {req_s} Sherpa(s) for this run.")
+
+    await interaction.followup.send("Event posted.", ephemeral=True)
+
+# ---------------------------
 # Reactions
 # ---------------------------
 
@@ -1377,7 +1585,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             return
 
     # 📝 on main event message → add as backup
-    if str(payload.emoji) == "📝":
+    if str(payload.emoji) in ("📝", "🔁"):
         data = SCHEDULES.get(payload.message_id)
         if not data: return
         guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
@@ -1429,7 +1637,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         removed = False
         if payload.user_id in participants:
             participants[:] = [x for x in participants if x != payload.user_id]; removed = True
-            _autofill_from_backups(data)
+            moved = _autofill_from_backups(data)
+            await _dm_promoted_users(guild, moved, data)
         if payload.user_id in backups:
             backups[:] = [x for x in backups if x != payload.user_id]; removed = True
         if removed: await _update_schedule_message(guild, int(payload.message_id))
@@ -1447,7 +1656,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
             participants: List[int] = data.get("players", [])  # type: ignore
             if payload.user_id in participants:
                 participants[:] = [x for x in participants if x != payload.user_id]
-                _autofill_from_backups(data)
+                moved = _autofill_from_backups(data)
+                await _dm_promoted_users(guild, moved, data)
                 await _update_schedule_message(guild, int(payload.message_id))
         else:
             backups: List[int] = data.get("backups", [])  # type: ignore
