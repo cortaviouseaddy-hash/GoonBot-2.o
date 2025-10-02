@@ -388,10 +388,13 @@ async def on_ready():
 # Queue Boards (optional utility)
 # ---------------------------
 
-async def _post_activity_board(activity: str) -> None:
-    if not RAID_QUEUE_CHANNEL_ID or activity not in QUEUES:
+async def _post_activity_board(activity: str, fallback_channel_id: Optional[int] = None) -> None:
+    # Choose target channel: configured RAID_QUEUE_CHANNEL_ID or provided fallback
+    target_channel_id = RAID_QUEUE_CHANNEL_ID or fallback_channel_id
+    if not target_channel_id:
         return
-    q = QUEUES.get(activity, [])
+    # Always ensure a queue exists so we can render empty boards as well
+    q = _ensure_queue(activity)
     checked = _ensure_checked(activity)
     embed = discord.Embed(title=f"Queue — {activity}", color=_activity_color(activity))
     embed.add_field(name="Signed Up", value=str(len(q)), inline=True)
@@ -401,13 +404,15 @@ async def _post_activity_board(activity: str) -> None:
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
     embed, attachment = _apply_activity_image(embed, activity)
-    await _send_to_channel_id(RAID_QUEUE_CHANNEL_ID, None, embed=embed, file=attachment)
+    await _send_to_channel_id(int(target_channel_id), None, embed=embed, file=attachment)
 
-async def _post_all_activity_boards():
-    if not RAID_QUEUE_CHANNEL_ID:
+async def _post_all_activity_boards(fallback_channel_id: Optional[int] = None):
+    # If nothing configured, use the provided fallback channel (e.g., the invoking channel)
+    target_channel_id = RAID_QUEUE_CHANNEL_ID or fallback_channel_id
+    if not target_channel_id:
         return
     for act in list(QUEUES.keys()):
-        await _post_activity_board(act)
+        await _post_activity_board(act, target_channel_id)
 
 # ---------------------------
 # Slash Commands
@@ -681,10 +686,10 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
             hint = (" Try: " + ", ".join(sug)) if sug else ""
             await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
             return
-        await _post_activity_board(act)
+        await _post_activity_board(act, interaction.channel_id)
         await interaction.followup.send(f"Queue board posted for: {act}", ephemeral=True)
     else:
-        await _post_all_activity_boards()
+        await _post_all_activity_boards(interaction.channel_id)
         await interaction.followup.send("Queue boards posted.", ephemeral=True)
 
 @bot.tree.command(name="count", description="Increment a persistent counter and show the value")
