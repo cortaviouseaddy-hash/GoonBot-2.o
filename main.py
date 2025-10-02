@@ -120,6 +120,40 @@ for v in PRESETS.values():
 # Utilities
 # ---------------------------
 
+def _normalize_activity_text(text: Optional[str]) -> str:
+    base = ''.join((ch.lower() if (ch.isalnum() or ch.isspace()) else ' ') for ch in (text or ""))
+    return ' '.join(base.split())
+
+def _resolve_activity(user_input: Optional[str], pool: Optional[List[str]] = None) -> Tuple[Optional[str], List[str]]:
+    if not user_input:
+        return None, []
+    candidates = pool or ALL_ACTIVITIES
+    # Exact match first
+    if user_input in candidates:
+        return user_input, []
+    norm_in = _normalize_activity_text(user_input)
+    normalized_map: List[Tuple[str, str]] = [(act, _normalize_activity_text(act)) for act in candidates]
+
+    # Exact normalized match
+    exact_norm = [act for act, norm in normalized_map if norm == norm_in]
+    if len(exact_norm) == 1:
+        return exact_norm[0], []
+
+    # Unique substring on normalized text
+    subs_norm = [act for act, norm in normalized_map if norm_in and norm_in in norm]
+    if len(subs_norm) == 1:
+        return subs_norm[0], []
+
+    # Unique substring on raw, case-insensitive
+    low_in = (user_input or "").lower()
+    subs_raw = [act for act in candidates if low_in and low_in in act.lower()]
+    if len(subs_raw) == 1:
+        return subs_raw[0], []
+
+    # Suggestions (top up to 5 from best candidate list)
+    suggestions = subs_norm[:5] if subs_norm else subs_raw[:5]
+    return None, suggestions
+
 def _ensure_queue(activity: str) -> List[int]:
     return QUEUES.setdefault(activity, [])
 
@@ -387,20 +421,22 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
     if member and _is_sherpa(member):
         await interaction.response.send_message("Sherpa Assistants cannot join queues.", ephemeral=True)
         return
-    if activity not in ALL_ACTIVITIES:
-        await interaction.response.send_message("Unknown activity.", ephemeral=True)
+    act, sug = _resolve_activity(activity)
+    if not act:
+        hint = (" Try: " + ", ".join(sug)) if sug else ""
+        await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
         return
     uid = interaction.user.id
     in_any = [a for a, lst in QUEUES.items() if uid in lst]
-    if activity in in_any:
+    if act in in_any:
         await interaction.response.send_message("You're already in that queue.", ephemeral=True)
         return
     if len(in_any) >= 2:
         await interaction.response.send_message("You can be in at most 2 different activity queues.", ephemeral=True)
         return
-    _ensure_queue(activity).append(uid)
-    await interaction.response.send_message(f"Joined queue for: {activity}", ephemeral=True)
-    await _post_activity_board(activity)
+    _ensure_queue(act).append(uid)
+    await interaction.response.send_message(f"Joined queue for: {act}", ephemeral=True)
+    await _post_activity_board(act)
 
 @bot.tree.command(name="leave", description="Leave an activity queue or an event by message ID")
 @app_commands.describe(activity="(Optional) activity name to leave", message_id="(Optional) event message ID to leave")
@@ -428,14 +464,15 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
             await interaction.response.send_message("Left the event.", ephemeral=True)
             return
     if activity:
-        if activity not in QUEUES:
+        act, _ = _resolve_activity(activity, list(ALL_ACTIVITIES) + list(QUEUES.keys()))
+        if not act:
             await interaction.response.send_message("Unknown activity.", ephemeral=True)
             return
-        q = QUEUES.get(activity, [])
+        q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
-            await interaction.response.send_message(f"Left queue: {activity}", ephemeral=True)
-            await _post_activity_board(activity)
+            await interaction.response.send_message(f"Left queue: {act}", ephemeral=True)
+            await _post_activity_board(act)
             return
         else:
             await interaction.response.send_message("You are not in that queue.", ephemeral=True)
@@ -569,16 +606,18 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
         return
 
     if activity:
-        if activity not in ALL_ACTIVITIES:
-            await interaction.response.send_message("Unknown activity.", ephemeral=True)
+        act, sug = _resolve_activity(activity)
+        if not act:
+            hint = (" Try: " + ", ".join(sug)) if sug else ""
+            await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
             return
-        q = _ensure_queue(activity)
+        q = _ensure_queue(act)
         if uid in q:
             await interaction.response.send_message("User already in queue.", ephemeral=True)
             return
         q.append(uid)
-        await interaction.response.send_message(f"Added user to queue: {activity}", ephemeral=True)
-        await _post_activity_board(activity)
+        await interaction.response.send_message(f"Added user to queue: {act}", ephemeral=True)
+        await _post_activity_board(act)
         return
 
     await interaction.response.send_message("Specify an activity or message_id to add the user to.", ephemeral=True)
@@ -616,14 +655,15 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
         return
 
     if activity:
-        if activity not in QUEUES:
+        act, _ = _resolve_activity(activity, list(ALL_ACTIVITIES) + list(QUEUES.keys()))
+        if not act:
             await interaction.response.send_message("Unknown activity.", ephemeral=True)
             return
-        q = QUEUES.get(activity, [])
+        q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
             await interaction.response.send_message("Removed user from queue.", ephemeral=True)
-            await _post_activity_board(activity)
+            await _post_activity_board(act)
             return
         await interaction.response.send_message("User not in that queue.", ephemeral=True)
         return
@@ -636,11 +676,13 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
 async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = None):
     await interaction.response.defer(ephemeral=True)
     if activity:
-        if activity not in ALL_ACTIVITIES:
-            await interaction.followup.send("Unknown activity.", ephemeral=True)
+        act, sug = _resolve_activity(activity)
+        if not act:
+            hint = (" Try: " + ", ".join(sug)) if sug else ""
+            await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
             return
-        await _post_activity_board(activity)
-        await interaction.followup.send(f"Queue board posted for: {activity}", ephemeral=True)
+        await _post_activity_board(act)
+        await interaction.followup.send(f"Queue board posted for: {act}", ephemeral=True)
     else:
         await _post_all_activity_boards()
         await interaction.followup.send("Queue boards posted.", ephemeral=True)
@@ -1019,16 +1061,18 @@ async def schedule_cmd(
         pass
 
     try:
-        if activity not in ALL_ACTIVITIES:
-            await interaction.followup.send("Unknown activity.", ephemeral=True); return
+        act, sug = _resolve_activity(activity)
+        if not act:
+            hint = (" Try: " + ", ".join(sug)) if sug else ""
+            await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True); return
 
         # Channel: main event embed must go into EVENT_SIGNUP_CHANNEL_ID (fallback: current channel)
         channel_id = (EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id)
 
-        cap = _cap_for_activity(activity)
+        cap = _cap_for_activity(act)
         reserved = max(0, min(int(reserved_sherpas or 0), cap))
 
-        q = QUEUES.get(activity, [])
+        q = QUEUES.get(act, [])
         candidates = list(q)  # DM everyone in queue
 
         # Parse datetime_str (MM-DD HH:MM) with current year
@@ -1066,7 +1110,7 @@ async def schedule_cmd(
 
         data = {
             "guild_id": guild.id if guild else None,
-            "activity": activity,
+            "activity": act,
             "desc": f"Scheduled by {interaction.user.mention}. Check your DMs to confirm.",
             "when_text": when_text,
             "capacity": cap,
@@ -1084,7 +1128,7 @@ async def schedule_cmd(
         }
 
         # ---- EMBED 1: Main Event Embed (EVENT_SIGNUP_CHANNEL_ID) ----
-        embed, f = await _render_event_embed(guild, activity, data)
+        embed, f = await _render_event_embed(guild, act, data)
         ev_msg = await _send_to_channel_id(int(channel_id), embed=embed, file=f)
         if not ev_msg:
             await interaction.followup.send("Failed to post event — set RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID or run this in a channel.", ephemeral=True)
@@ -1105,12 +1149,12 @@ async def schedule_cmd(
         if RAID_SIGN_UP_CHANNEL_ID:
             try:
                 sherpa_embed = discord.Embed(
-                    title=f"🧭 Sherpa Signup — {activity}",
+                    title=f"🧭 Sherpa Signup — {act}",
                     description=(
                         f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
                         f"Overflow becomes **Sherpa Backup**."
                     ),
-                    color=_activity_color(activity),
+                    color=_activity_color(act),
                 )
                 sherpa_embed.add_field(name="When", value=when_text, inline=True)
                 try:
@@ -1136,12 +1180,12 @@ async def schedule_cmd(
         if not posted_sherpa_signup:
             try:
                 sherpa_embed = discord.Embed(
-                    title=f"🧭 Sherpa Signup — {activity}",
+                    title=f"🧭 Sherpa Signup — {act}",
                     description=(
                         f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
                         f"Overflow becomes **Sherpa Backup**."
                     ),
-                    color=_activity_color(activity),
+                    color=_activity_color(act),
                 )
                 sherpa_embed.add_field(name="When", value=when_text, inline=True)
                 try:
@@ -1169,13 +1213,13 @@ async def schedule_cmd(
             try:
                 ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
                 gen_embed = discord.Embed(
-                    title=f"Sherpa Signup — {activity}",
+                    title=f"Sherpa Signup — {act}",
                     description=(
                         f"{when_text}\n"
                         f"Please use the **Sherpa signup post** to claim your slot (✅). "
                         f"Extras become **Sherpa Backup**."
                     ),
-                    color=_activity_color(activity),
+                    color=_activity_color(act),
                 )
                 # Prefer linking directly to the Sherpa signup post; fall back to main event
                 try:
@@ -1196,13 +1240,13 @@ async def schedule_cmd(
             try:
                 ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
                 gen_embed = discord.Embed(
-                    title=f"Sherpa Signup — {activity}",
+                    title=f"Sherpa Signup — {act}",
                     description=(
                         f"{when_text}\n"
                         f"Please use the **Sherpa signup post** to claim your slot (✅). "
                         f"Extras become **Sherpa Backup**."
                     ),
-                    color=_activity_color(activity),
+                    color=_activity_color(act),
                 )
                 try:
                     if sherpa_alert_url:
@@ -1227,7 +1271,7 @@ async def schedule_cmd(
                     if not m: continue
                     dm = await m.create_dm()
                     content = (
-                        f"You're pre-slotted as a **Sherpa** for **{activity}** at **{when_text}**.\n"
+                        f"You're pre-slotted as a **Sherpa** for **{act}** at **{when_text}**.\n"
                         "No action needed. If plans change, please let the promoter know."
                     )
                     await dm.send(content=content)
@@ -1245,7 +1289,7 @@ async def schedule_cmd(
                 dm = await m.create_dm()
                 await dm.send(
                     content=(
-                        f"You've been selected for **{activity}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
+                        f"You've been selected for **{act}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
                         f"Tap **Confirm** to lock your spot."
                     ),
                     view=ConfirmView(mid=mid, uid=uid),
@@ -1264,7 +1308,7 @@ async def schedule_cmd(
                 if not m: continue
                 dm = await m.create_dm()
                 content = (
-                    f"You're pre-slotted as a **Player** for **{activity}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
+                    f"You're pre-slotted as a **Player** for **{act}** at **{when_text}** in {guild.name if guild else 'server'}.\n"
                     "No action needed. If you can't make it, please let the promoter know."
                 )
                 await dm.send(content=content)
@@ -1274,7 +1318,7 @@ async def schedule_cmd(
 
         # Build a concise status summary for the promoter
         status_lines = [
-            f"Scheduled **{activity}**.",
+            f"Scheduled **{act}**.",
             f"DMed {sent} queued player(s), notified {p_sent} pre-slotted participant(s).",
             f"Sherpa signup posted: {'Yes' if posted_sherpa_signup else 'No'}" + (f" (fallback in <#{sherpa_signup_fallback}>)" if sherpa_signup_fallback else ""),
             f"General-sherpa announcement: {'Yes' if posted_general_announce else 'No'}" + (f" (fallback in <#{general_announce_fallback}>)" if general_announce_fallback else ""),
