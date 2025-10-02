@@ -38,6 +38,7 @@ def _env_int(*names) -> Optional[int]:
     return None
 
 GENERAL_CHANNEL_ID            = _env_int("GENERAL_CHANNEL_ID")
+WELCOME_CHANNEL_ID            = _env_int("WELCOME_CHANNEL_ID")
 GENERAL_SHERPA_CHANNEL_ID     = _env_int("GENERAL_SHERPA_CHANNEL_ID")
 LFG_CHAT_CHANNEL_ID           = _env_int("LFG_CHAT_CHANNEL_ID")
 RAID_QUEUE_CHANNEL_ID         = _env_int("RAID_QUEUE_CHANNEL_ID")
@@ -59,12 +60,13 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
         lf = _to_int(data.get("LFG_CHAT_CHANNEL_ID"))
         ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
+        wc = _to_int(data.get("WELCOME_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
@@ -75,6 +77,8 @@ def _load_channel_overrides() -> None:
             LFG_CHAT_CHANNEL_ID = lf
         if ev and not EVENT_SIGNUP_CHANNEL_ID:
             EVENT_SIGNUP_CHANNEL_ID = ev
+        if wc and not WELCOME_CHANNEL_ID:
+            WELCOME_CHANNEL_ID = wc
     except Exception:
         pass
 
@@ -383,6 +387,50 @@ async def on_ready():
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     print(f"Ready as {bot.user}")
+
+# ---------------------------
+# Welcome Flow (member join)
+# ---------------------------
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        guild = member.guild
+        target_channel_id = WELCOME_CHANNEL_ID or GENERAL_CHANNEL_ID
+        if target_channel_id:
+            try:
+                title = f"Welcome, {member.display_name}!"
+                desc = (
+                    f"{member.mention} just joined {guild.name} — glad to have you here!\n\n"
+                    "Take a moment to say hi and check out current activities."
+                )
+                emb = discord.Embed(title=title, description=desc, color=0x00BFFF)
+                try:
+                    if member.avatar:
+                        emb.set_thumbnail(url=member.avatar.url)
+                except Exception:
+                    pass
+                emb.add_field(name="Getting Started", value="Browse events and feel free to join in!", inline=False)
+                await _send_to_channel_id(int(target_channel_id), content=None, embed=emb)
+            except Exception as e:
+                try: print("welcome channel send failed:", e)
+                except Exception: pass
+
+        try:
+            dm = await member.create_dm()
+            dm_msg = (
+                f"Welcome to {guild.name}!\n\n"
+                "Here are a few tips to get started:\n"
+                "• Check the event signup channel for upcoming runs\n"
+                "• Say hi and let us know what you like to play\n\n"
+                "If you have any questions, just reply here."
+            )
+            await dm.send(content=dm_msg)
+        except Exception as e:
+            try: print("welcome DM failed:", member.id, e)
+            except Exception: pass
+    except Exception:
+        pass
 
 # ---------------------------
 # Queue Boards (optional utility)
