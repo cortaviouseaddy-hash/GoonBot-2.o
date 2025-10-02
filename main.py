@@ -522,7 +522,24 @@ async def on_member_join(member: discord.Member):
                         emb.set_thumbnail(url=member.avatar.url)
                 except Exception:
                     pass
-                emb.add_field(name="Getting Started", value="Browse events and feel free to join in!", inline=False)
+                emb.add_field(name="Getting Started", value="Say hi in chat and browse upcoming events.", inline=False)
+                emb.add_field(
+                    name="Commands",
+                    value=(
+                        "• /join — choose an activity to enter its queue (max 2)\n"
+                        "• /queue — view current queues or a specific activity\n"
+                        "• /schedule — founder-only: creates the event post you can react to"
+                    ),
+                    inline=False,
+                )
+                emb.add_field(
+                    name="What to look for",
+                    value=(
+                        "• Event posts with reactions: 📝 to note interest, ✅ to join when open, ❌ to leave\n"
+                        "• DMs for confirmations and reminders (2h/30m/start)"
+                    ),
+                    inline=False,
+                )
                 await _send_to_channel_id(int(target_channel_id), content=None, embed=emb)
             except Exception as e:
                 try: print("welcome channel send failed:", e)
@@ -532,10 +549,16 @@ async def on_member_join(member: discord.Member):
             dm = await member.create_dm()
             dm_msg = (
                 f"Welcome to {guild.name}!\n\n"
-                "Here are a few tips to get started:\n"
-                "• Check the event signup channel for upcoming runs\n"
-                "• Say hi and let us know what you like to play\n\n"
-                "If you have any questions, just reply here."
+                "Getting started:\n"
+                "• Say hi and meet the group\n"
+                "• Check the event signup channel for upcoming runs\n\n"
+                "Commands:\n"
+                "• /join — choose an activity to enter its queue (max 2)\n"
+                "• /queue — view current queues or a specific activity\n"
+                "• /schedule — founder-only: creates an event post you can react to\n\n"
+                "What to look for:\n"
+                "• Event posts: 📝 adds you as backup; ✅ tries to join when signups open; ❌ leaves\n"
+                "• DMs for confirmations and reminders (2h/30m/start); you can reply here with questions"
             )
             await dm.send(content=dm_msg)
         except Exception as e:
