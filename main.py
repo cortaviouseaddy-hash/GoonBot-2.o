@@ -1741,13 +1741,15 @@ async def event_cmd(
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if bot.user and payload.user_id == bot.user.id:
         return
+    # Normalize emoji to string once
+    emoji_str = str(payload.emoji)
 
     # Sherpa alert claim (✅ or 🔁 on the sherpa signup message in RAID_SIGN_UP_CHANNEL)
     for mid, data in list(SCHEDULES.items()):
         alert_id = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None
         alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None
         if alert_id and payload.message_id == alert_id and (alert_ch is None or payload.channel_id == alert_ch):
-            emoji_str = str(payload.emoji)
+            # Only allow ✅ and 🔁 on the Sherpa signup alert
             if emoji_str in ("✅", "🔁"):
                 guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
                 if not guild: return
@@ -1781,6 +1783,29 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                         backup.add(member.id)
                         await _update_schedule_message(guild, int(mid))
                     return
+            else:
+                # Remove any non-whitelisted reactions on the Sherpa signup alert
+                try:
+                    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+                    channel = bot.get_channel(payload.channel_id) if payload.channel_id else None
+                    if channel:
+                        msg = await channel.fetch_message(payload.message_id)
+                        user = None
+                        if guild:
+                            user = guild.get_member(payload.user_id)
+                        if not user:
+                            try:
+                                user = await bot.fetch_user(payload.user_id)
+                            except Exception:
+                                user = None
+                        if user:
+                            try:
+                                await msg.remove_reaction(payload.emoji, user)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                return
 
     # Sherpa-only event reactions
     data = SCHEDULES.get(payload.message_id)
@@ -1838,8 +1863,36 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 await _update_schedule_message(guild, int(payload.message_id))
                 return
 
+    # For the main event embed created by /schedule, allow only specific reactions
+    # Whitelist: 📝, 🔁, ✅, ❌. Remove any others users add.
+    data = SCHEDULES.get(payload.message_id)
+    if data and ("reserved_sherpas" in data) and str(data.get("format") or "") != "user_event":
+        allowed_emojis = {"📝", "🔁", "✅", "❌"}
+        if emoji_str not in allowed_emojis:
+            try:
+                guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+                channel = bot.get_channel(payload.channel_id) if payload.channel_id else None
+                if channel:
+                    msg = await channel.fetch_message(payload.message_id)
+                    user = None
+                    if guild:
+                        user = guild.get_member(payload.user_id)
+                    if not user:
+                        try:
+                            user = await bot.fetch_user(payload.user_id)
+                        except Exception:
+                            user = None
+                    if user:
+                        try:
+                            await msg.remove_reaction(payload.emoji, user)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            return
+
     # 📝 on main event message → add as backup
-    if str(payload.emoji) in ("📝", "🔁"):
+    if emoji_str in ("📝", "🔁"):
         data = SCHEDULES.get(payload.message_id)
         if not data: return
         guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
@@ -1852,7 +1905,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     # ✅ on main event message
-    if str(payload.emoji) == "✅":
+    if emoji_str == "✅":
         data = SCHEDULES.get(payload.message_id)
         if not data: return
         guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
