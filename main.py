@@ -245,8 +245,68 @@ async def _send_to_channel_id(channel_id: Optional[int], content: Optional[str] 
             return await ch.send(content=content, embed=embed)
         return await ch.send(content=content)
     except Exception as e:
-        print("_send_to_channel_id error:", e)
+        try: print("_send_to_channel_id error:", channel_id, e)
+        except Exception: pass
         return None
+
+def _can_send_in_channel(guild: Optional[discord.Guild], channel: object) -> bool:
+    try:
+        if not guild or not channel:
+            return False
+        me = guild.me
+        if not me:
+            return False
+        # Some channel types (e.g., categories) will not have permissions_for/send
+        perms = getattr(channel, "permissions_for", None)
+        if not callable(perms):
+            return False
+        p = channel.permissions_for(me)
+        return bool(getattr(p, "send_messages", False))
+    except Exception:
+        return False
+
+def _resolve_welcome_channel_id(guild: Optional[discord.Guild]) -> Optional[int]:
+    """
+    Resolve a safe channel id to post the welcome embed:
+    1) Use configured WELCOME_CHANNEL_ID or GENERAL_CHANNEL_ID if sendable
+    2) Use guild.system_channel if sendable
+    3) Prefer common names: welcome, general, introductions, start-here, lounge, chat
+    4) Fallback to the first text channel the bot can send in
+    """
+    try:
+        # 1) Configured ids first
+        for cid in (WELCOME_CHANNEL_ID, GENERAL_CHANNEL_ID):
+            if cid:
+                ch = bot.get_channel(int(cid))
+                if ch and _can_send_in_channel(guild, ch):
+                    return int(cid)
+        # 2) System channel
+        if guild and guild.system_channel and _can_send_in_channel(guild, guild.system_channel):
+            return int(guild.system_channel.id)
+        # 3) Preferred names
+        preferred_names = (
+            "welcome", "welcome-and-rules", "welcome-rules", "rules", "start-here", "get-started",
+            "general", "general-chat", "lounge", "chat", "introductions", "introduce-yourself"
+        )
+        if guild:
+            try:
+                for name in preferred_names:
+                    ch = discord.utils.find(
+                        lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == name,
+                        getattr(guild, "text_channels", []),
+                    )
+                    if ch and _can_send_in_channel(guild, ch):
+                        return int(ch.id)
+            except Exception:
+                pass
+            # 4) First sendable text channel
+            for ch in getattr(guild, "text_channels", []):
+                if _can_send_in_channel(guild, ch):
+                    return int(ch.id)
+    except Exception as e:
+        try: print("resolve_welcome_channel error:", e)
+        except Exception: pass
+    return None
 
 def _find_activity_image(activity: str) -> Optional[str]:
     aset = os.path.join(os.path.dirname(__file__), "assets")
@@ -531,7 +591,7 @@ async def on_ready():
 async def on_member_join(member: discord.Member):
     try:
         guild = member.guild
-        target_channel_id = WELCOME_CHANNEL_ID or GENERAL_CHANNEL_ID
+        target_channel_id = _resolve_welcome_channel_id(guild)
         if target_channel_id:
             try:
                 title = f"Welcome, {member.display_name}!"
@@ -563,10 +623,15 @@ async def on_member_join(member: discord.Member):
                     ),
                     inline=False,
                 )
+                try: print(f"welcome: posting in <#{int(target_channel_id)}>")
+                except Exception: pass
                 await _send_to_channel_id(int(target_channel_id), content=None, embed=emb)
             except Exception as e:
                 try: print("welcome channel send failed:", e)
                 except Exception: pass
+        else:
+            try: print("welcome: no sendable channel found; set WELCOME_CHANNEL_ID or GENERAL_CHANNEL_ID")
+            except Exception: pass
 
         try:
             dm = await member.create_dm()
