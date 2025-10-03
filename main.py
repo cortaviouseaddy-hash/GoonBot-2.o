@@ -1403,7 +1403,7 @@ async def schedule_cmd(
                     title=f"🧭 Sherpa Signup — {act}",
                     description=(
                         f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
-                        f"Overflow becomes **Sherpa Backup**."
+                        f"Or react 🔁 to be **Sherpa Backup**."
                     ),
                     color=_activity_color(act),
                 )
@@ -1418,6 +1418,8 @@ async def schedule_cmd(
                     SCHEDULES[mid]["sherpa_alert_channel_id"] = str(alert.channel.id)
                     SCHEDULES[mid]["sherpa_alert_message_id"] = str(alert.id)
                     try: await alert.add_reaction("✅")
+                    except Exception: pass
+                    try: await alert.add_reaction("🔁")
                     except Exception: pass
                     try:
                         sherpa_alert_url = alert.jump_url
@@ -1434,7 +1436,7 @@ async def schedule_cmd(
                     title=f"🧭 Sherpa Signup — {act}",
                     description=(
                         f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
-                        f"Overflow becomes **Sherpa Backup**."
+                        f"Or react 🔁 to be **Sherpa Backup**."
                     ),
                     color=_activity_color(act),
                 )
@@ -1446,6 +1448,8 @@ async def schedule_cmd(
                 alert = await _send_to_channel_id(int(channel_id), embed=sherpa_embed)
                 if alert:
                     try: await alert.add_reaction("✅")
+                    except Exception: pass
+                    try: await alert.add_reaction("🔁")
                     except Exception: pass
                     try:
                         sherpa_alert_url = alert.jump_url
@@ -1738,37 +1742,45 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if bot.user and payload.user_id == bot.user.id:
         return
 
-    # Sherpa alert claim (✅ on the sherpa signup message in RAID_SIGN_UP_CHANNEL)
+    # Sherpa alert claim (✅ or 🔁 on the sherpa signup message in RAID_SIGN_UP_CHANNEL)
     for mid, data in list(SCHEDULES.items()):
         alert_id = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None
         alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None
-        if alert_id and payload.message_id == alert_id and str(payload.emoji) == "✅" and (alert_ch is None or payload.channel_id == alert_ch):
-            guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-            if not guild: return
-            member = guild.get_member(payload.user_id)
-            if not member or not _is_sherpa_assistant(member):
-                return
-            reserved = int(data.get("reserved_sherpas", 0))
-            sherpas: Set[int] = data.get("sherpas")  # type: ignore
-            backup: Set[int] = data.get("sherpa_backup")  # type: ignore
-            if len(sherpas) < reserved and member.id not in sherpas:
-                sherpas.add(member.id)
-            else:
-                backup.add(member.id)
-            await _update_schedule_message(guild, int(mid))
-            try:
-                dm = await member.create_dm()
-                when_text = data.get("when_text"); activity = data.get("activity")
-                await dm.send(
-                    content=(
-                        f"You've claimed a Sherpa slot for **{activity}** at **{when_text}**.\n"
-                        "Tap **Confirm Sherpa** to lock your Sherpa slot."
-                    ),
-                    view=SherpaConfirmView(mid=int(mid), uid=member.id),
-                )
-            except Exception:
-                pass
-            return
+        if alert_id and payload.message_id == alert_id and (alert_ch is None or payload.channel_id == alert_ch):
+            emoji_str = str(payload.emoji)
+            if emoji_str in ("✅", "🔁"):
+                guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+                if not guild: return
+                member = guild.get_member(payload.user_id)
+                if not member or not _is_sherpa_assistant(member):
+                    return
+                reserved = int(data.get("reserved_sherpas", 0))
+                sherpas: Set[int] = data.get("sherpas")  # type: ignore
+                backup: Set[int] = data.get("sherpa_backup")  # type: ignore
+                if emoji_str == "✅":
+                    if len(sherpas) < reserved and member.id not in sherpas:
+                        sherpas.add(member.id)
+                    else:
+                        backup.add(member.id)
+                    await _update_schedule_message(guild, int(mid))
+                    try:
+                        dm = await member.create_dm()
+                        when_text = data.get("when_text"); activity = data.get("activity")
+                        await dm.send(
+                            content=(
+                                f"You've claimed a Sherpa slot for **{activity}** at **{when_text}**.\n"
+                                "Tap **Confirm Sherpa** to lock your Sherpa slot."
+                            ),
+                            view=SherpaConfirmView(mid=int(mid), uid=member.id),
+                        )
+                    except Exception:
+                        pass
+                    return
+                elif emoji_str == "🔁":
+                    if member.id not in sherpas and member.id not in backup:
+                        backup.add(member.id)
+                        await _update_schedule_message(guild, int(mid))
+                    return
 
     # Sherpa-only event reactions
     data = SCHEDULES.get(payload.message_id)
