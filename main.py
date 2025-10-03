@@ -268,8 +268,21 @@ def _find_activity_image(activity: str) -> Optional[str]:
     return best if best_score > 0 else None
 
 def _apply_activity_image(embed: discord.Embed, activity: str) -> Tuple[discord.Embed, Optional[discord.File]]:
+    # Known fallbacks for newer activities that may not exist in assets yet
+    # Map canonicalized activity names -> local asset path (temporary placeholder)
+    FALLBACK_LOCAL_IMAGES = {
+        "desert perpetual": os.path.join(os.path.dirname(__file__), "assets", "raids", "salvations_edge.jpg"),
+    }
+
     img = _find_activity_image(activity)
     file = None
+    if not img:
+        # Try a simple alias-based fallback (temporary until a proper asset is added)
+        key = ''.join(ch.lower() for ch in (activity or "") if ch.isalnum() or ch.isspace()).strip()
+        img = FALLBACK_LOCAL_IMAGES.get(key)
+        if img and not os.path.isfile(img):
+            img = None
+
     if img:
         try:
             filename = os.path.basename(img)
@@ -1073,9 +1086,16 @@ async def _scheduler_loop():
                     player_slots = max(0, cap - reserved)
                 participants: List[int] = data.get("players", [])  # type: ignore
 
-                # Auto-open at T-2h if player slots remain
+                # At T-2h, open signups if slots remain
                 if str(data.get("type")) != "sherpa_only" and (not data.get("signups_open")) and now >= start_ts - 2*60*60 and len(participants) < player_slots:
                     data["signups_open"] = True
+                    # Try to promote from backups immediately when opening
+                    try:
+                        moved = _autofill_from_backups(data)
+                        guild = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+                        await _dm_promoted_users(guild, moved, data)
+                    except Exception:
+                        pass
                     # Add ✅, 📝, ❌ to main event post
                     try:
                         ch = bot.get_channel(int(data.get("channel_id"))) or await bot.fetch_channel(int(data.get("channel_id")))
@@ -1890,6 +1910,42 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             except Exception:
                 pass
             return
+
+        # Prevent Sherpas from using main event reactions; direct them to Sherpa signup
+        try:
+            guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+            if guild:
+                member = guild.get_member(payload.user_id)
+                if member and _is_sherpa(member):
+                    channel = bot.get_channel(payload.channel_id) if payload.channel_id else None
+                    if channel:
+                        try:
+                            msg = await channel.fetch_message(payload.message_id)
+                            await msg.remove_reaction(payload.emoji, member)
+                        except Exception:
+                            pass
+                    # DM the member to use the Sherpa signup instead
+                    try:
+                        d = await member.create_dm()
+                        alert_mid = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None  # type: ignore
+                        alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None  # type: ignore
+                        link = None
+                        if alert_mid and alert_ch:
+                            ch = bot.get_channel(alert_ch) or await bot.fetch_channel(alert_ch)
+                            if ch:
+                                try:
+                                    m = await ch.fetch_message(alert_mid)
+                                    link = m.jump_url
+                                except Exception:
+                                    link = None
+                        await d.send(
+                            ("Sherpas should use the dedicated Sherpa signup post to claim slots." + (f"\nLink: {link}" if link else ""))
+                        )
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
 
     # 📝 on main event message → add as backup
     if emoji_str in ("📝", "🔁"):
