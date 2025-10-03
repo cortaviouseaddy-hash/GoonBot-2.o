@@ -1064,6 +1064,12 @@ async def on_message_delete(message: discord.Message):
                     await new_msg.add_reaction(emoji)
                 except Exception:
                     pass
+        # Persist rehosted image URL if present on restored embed
+        try:
+            if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
+                data["image_url"] = new_msg.embeds[0].image.url
+        except Exception:
+            pass
         # Update schedule mapping to include the new message id while preserving the old for DM callbacks
         new_mid = int(new_msg.id)
         SCHEDULES[new_mid] = data
