@@ -382,6 +382,14 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
     if backups:
         embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(f"<@{b}>" for b in backups), inline=False)
 
+    # Preserve previously uploaded image if known
+    try:
+        img_url = data.get("image_url")
+        if img_url:
+            embed.set_image(url=str(img_url))
+            return embed, None
+    except Exception:
+        pass
     embed_with_img, attachment = _apply_activity_image(embed, activity)
     return embed_with_img, attachment
 
@@ -421,6 +429,14 @@ async def _render_sherpa_only_embed(guild: Optional[discord.Guild], activity: st
     if s_backups:
         embed.add_field(name=f"Backup ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in s_backups), inline=False)
 
+    # Preserve previously uploaded image if known
+    try:
+        img_url = data.get("image_url")
+        if img_url:
+            embed.set_image(url=str(img_url))
+            return embed, None
+    except Exception:
+        pass
     embed_with_img, attachment = _apply_activity_image(embed, activity)
     return embed_with_img, attachment
 
@@ -1210,6 +1226,12 @@ async def schedule_cmd(
             except Exception: pass
 
         mid = ev_msg.id
+        # Persist image URL if Discord re-hosted the attachment
+        try:
+            if ev_msg.embeds and ev_msg.embeds[0].image and ev_msg.embeds[0].image.url:
+                data["image_url"] = ev_msg.embeds[0].image.url
+        except Exception:
+            pass
         SCHEDULES[mid] = data
 
         # ---- EMBED 2: Sherpa Signup Embed (RAID_SIGN_UP_CHANNEL_ID) ----
@@ -1724,6 +1746,12 @@ async def event_sherpa_cmd(
         except Exception:
             pass
 
+    # Persist image URL if Discord re-hosted the attachment
+    try:
+        if msg.embeds and msg.embeds[0].image and msg.embeds[0].image.url:
+            data["image_url"] = msg.embeds[0].image.url
+    except Exception:
+        pass
     SCHEDULES[int(msg.id)] = data
 
     # Announcement in #general-sherpa
