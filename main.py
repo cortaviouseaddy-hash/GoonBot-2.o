@@ -463,9 +463,19 @@ async def _render_sherpa_only_embed(guild: Optional[discord.Guild], activity: st
     cap = int(data.get("capacity", 0))
     sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
     embed.add_field(name="Slots", value=f"{len(sherpas)} of {cap} (Sherpa-only)", inline=True)
-    voice = str(data.get("voice") or "").strip()
-    if voice:
-        embed.add_field(name="Voice", value=voice, inline=True)
+    # Voice info: prefer explicit voice_name; otherwise try to mention by id; fallback to empty
+    voice_name = data.get("voice_name")
+    voice_channel_id = data.get("voice_channel_id")
+    voice_value = None
+    try:
+        if voice_name:
+            voice_value = str(voice_name)
+        elif voice_channel_id:
+            voice_value = f"<#{int(voice_channel_id)}>"
+    except Exception:
+        voice_value = None
+    if voice_value:
+        embed.add_field(name="Voice", value=voice_value, inline=True)
 
     # Participants and backup lists
     if sherpas:
@@ -1935,11 +1945,10 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 @sherpa_host_only()
 @app_commands.describe(
     activity="Activity name",
-    date="Date (YYYY-MM-DD)",
-    time="Time (HH:MM, 24h)",
+    datetime_str="Date and time (MM-DD HH:MM, 24h)",
     timezone="Timezone (dropdown)",
     slots="Number of Sherpas needed",
-    voice="(Optional) Voice channel / location",
+    voice_channel="(Optional) voice channel for meetup",
     notes="(Optional) Extra details",
 )
 @app_commands.autocomplete(activity=_activity_autocomplete)
@@ -1958,11 +1967,10 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 async def event_sherpa_cmd(
     interaction: discord.Interaction,
     activity: str,
-    date: str,
-    time: str,
+    datetime_str: str,
     timezone: str = "America/New_York",
     slots: int = 2,
-    voice: Optional[str] = None,
+    voice_channel: Optional[discord.VoiceChannel] = None,
     notes: Optional[str] = None,
 ):
     try:
@@ -1981,18 +1989,16 @@ async def event_sherpa_cmd(
         await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
         return
 
-    # Parse date/time
+    # Parse datetime_str (MM-DD HH:MM) with current year
     try:
-        date_iso = date.strip()
-        time_part = time.strip()
-        # Validate formats like YYYY-MM-DD and HH:MM
-        datetime.strptime(date_iso, "%Y-%m-%d")
-        datetime.strptime(time_part, "%H:%M")
+        date_part, time_part = datetime_str.strip().split()
+        year = datetime.now().year
+        date_full = f"{year}-{date_part}"
     except Exception:
-        await interaction.followup.send("Invalid date/time. Use YYYY-MM-DD and HH:MM (24h).", ephemeral=True)
+        await interaction.followup.send("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True)
         return
 
-    start_ts = _parse_date_time_to_epoch(date_iso, time_part, tz_name=timezone)
+    start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
     when_text = _format_title_when(start_ts, timezone)
 
     cap_limit = _cap_for_activity(act)
@@ -2013,7 +2019,8 @@ async def event_sherpa_cmd(
         "sherpas": sherpa_set,
         "sherpa_backup": [],
         "host_id": host_id,
-        "voice": (voice or "").strip(),
+        "voice_channel_id": int(voice_channel.id) if voice_channel else None,
+        "voice_name": getattr(voice_channel, "name", None) if voice_channel else None,
         "notes": (notes or "").strip(),
         "start_ts": start_ts,
         "timezone": timezone,
