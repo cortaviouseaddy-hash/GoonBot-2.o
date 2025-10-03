@@ -1189,27 +1189,6 @@ async def on_message_delete(message: discord.Message):
         new_msg = await _send_to_channel_id(int(ch_id), embed=embed, file=f)
         if not new_msg:
             return
-<<<<<<< HEAD
-        # Re-add standard reactions depending on type
-        if str(data.get("type")) == "sherpa_only":
-            for emoji in ("✅", "🔁", "❌"):
-                try:
-                    await new_msg.add_reaction(emoji)
-                except Exception:
-                    pass
-        else:
-            for emoji in ("📝", "❌"):
-                try:
-                    await new_msg.add_reaction(emoji)
-                except Exception:
-                    pass
-        # Persist rehosted image URL if present on restored embed
-        try:
-            if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
-                data["image_url"] = new_msg.embeds[0].image.url
-        except Exception:
-            pass
-=======
         # Re-add standard reactions depending on type
         if str(data.get("type")) == "sherpa_only":
             for emoji in ("✅", "🔁", "❌"):
@@ -1223,7 +1202,12 @@ async def on_message_delete(message: discord.Message):
                     await new_msg.add_reaction(emoji)
                 except Exception:
                     pass
->>>>>>> cursor/explain-the-event-command-5de3
+        # Persist rehosted image URL if present on restored embed
+        try:
+            if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
+                data["image_url"] = new_msg.embeds[0].image.url
+        except Exception:
+            pass
         # Update schedule mapping to include the new message id while preserving the old for DM callbacks
         new_mid = int(new_msg.id)
         SCHEDULES[new_mid] = data
