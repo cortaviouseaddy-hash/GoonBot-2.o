@@ -758,16 +758,63 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     await interaction.response.send_message("Specify an activity or a message_id to leave.", ephemeral=True)
 
 @bot.tree.command(name="promote", description="Assign Sherpa Assistant role to a chosen user and announce it")
-@app_commands.describe(user="User to promote to Sherpa Assistant", message_id="(Optional) event message ID to add them as a Sherpa for")
-async def promote_cmd(interaction: discord.Interaction, user: discord.User, message_id: Optional[int] = None):
-    data = SCHEDULES.get(message_id) if message_id else None
-    if message_id and not data:
-        await interaction.response.send_message("No event found with that message ID.", ephemeral=True)
-        return
+@app_commands.describe(user="User to promote to Sherpa Assistant")
+async def promote_cmd(interaction: discord.Interaction, user: discord.User):
+    guild = interaction.guild
+
+    # Try to auto-detect the relevant event when none is specified
+    selected_mid: Optional[int] = None
+    data: Optional[Dict[str, object]] = None
+    try:
+        invoker_uid = int(interaction.user.id)
+        channel_id = int(interaction.channel.id) if interaction.channel else None  # type: ignore
+
+        # Prefer events in the current channel where the invoker is the promoter (or founder)
+        if channel_id is not None:
+            channel_candidates: List[Tuple[int, Dict[str, object]]] = []
+            for mid, d in list(SCHEDULES.items()):
+                try:
+                    ch_id = int(d.get("channel_id")) if d.get("channel_id") else None  # type: ignore
+                except Exception:
+                    ch_id = None
+                if ch_id == channel_id:
+                    channel_candidates.append((int(mid), d))
+
+            authorized_in_channel: List[Tuple[int, Dict[str, object]]] = []
+            for mid, d in channel_candidates:
+                try:
+                    pid = int(d.get("promoter_id")) if d.get("promoter_id") else None  # type: ignore
+                except Exception:
+                    pid = None
+                if pid == invoker_uid or (FOUNDER_USER_ID and invoker_uid == int(FOUNDER_USER_ID)):
+                    authorized_in_channel.append((mid, d))
+
+            if authorized_in_channel:
+                selected_mid, data = max(authorized_in_channel, key=lambda x: x[0])
+
+        # Fallback: latest event where the invoker is the promoter
+        if data is None:
+            owned: List[Tuple[int, Dict[str, object]]] = []
+            for mid, d in list(SCHEDULES.items()):
+                try:
+                    pid = int(d.get("promoter_id")) if d.get("promoter_id") else None  # type: ignore
+                except Exception:
+                    pid = None
+                if pid == invoker_uid:
+                    owned.append((int(mid), d))
+            if owned:
+                selected_mid, data = max(owned, key=lambda x: x[0])
+    except Exception:
+        # If auto-detection fails, continue without event context
+        data = None
+        selected_mid = None
+
+    # If we found an event, enforce promoter/founder permission for that event
     if data and not _is_promoter_or_founder(interaction, data):
         await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
         return
-    if not data and FOUNDER_USER_ID:
+    # If no event context, only founder can run this
+    if data is None and FOUNDER_USER_ID:
         try:
             if int(FOUNDER_USER_ID) != int(interaction.user.id):
                 await interaction.response.send_message("Only the founder can run this command without an event.", ephemeral=True)
@@ -775,7 +822,6 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User, mess
         except Exception:
             pass
 
-    guild = interaction.guild
     promoted_uid = int(user.id)
     promoted_member = guild.get_member(promoted_uid) if guild else None
 
@@ -789,7 +835,8 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User, mess
         except Exception:
             assigned = False
 
-    if data:
+    # If we have event context, update event's sherpa lists and refresh the message
+    if data is not None:
         try:
             sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
             sbackup: Set[int] = data.get("sherpa_backup") or set()  # type: ignore
@@ -799,10 +846,12 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User, mess
             if promoted_uid not in sherpas:
                 sherpas.add(promoted_uid)
                 data["sherpas"] = sherpas
-            if guild: await _update_schedule_message(guild, message_id)  # type: ignore
+            if guild and selected_mid is not None:
+                await _update_schedule_message(guild, selected_mid)
         except Exception:
             pass
 
+    # Build announcement embed
     title = f"🎉 Congratulations, {user.mention}! 🎉"
     desc = (
         "✨ What it Means to be a Sherpa Assistant\n"
@@ -821,10 +870,16 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User, mess
         "Lead with patience, lift others up, and show what it truly means to Carry the Light."
     )
     emb = discord.Embed(title=title, description=desc, color=0xFFD700)
-    if data:
+    if data is not None:
         try:
-            emb.add_field(name="Event", value=data.get("activity", "event"), inline=True)
-            emb.add_field(name="When", value=data.get("when_text", "TBD"), inline=True)
+            emb.add_field(name="Event", value=str(data.get("activity", "event")), inline=True)
+            emb.add_field(name="When", value=str(data.get("when_text", "TBD")), inline=True)
+            # Include a link to the sign-up post if we know it
+            guild_id = int(data.get("guild_id")) if data.get("guild_id") else (guild.id if guild else None)  # type: ignore
+            ch_id = int(data.get("channel_id")) if data.get("channel_id") else None  # type: ignore
+            if guild_id and ch_id and selected_mid:
+                link = f"https://discord.com/channels/{guild_id}/{ch_id}/{selected_mid}"
+                emb.add_field(name="Sign-up Post", value=f"[Open]({link})", inline=False)
         except Exception:
             pass
     emb.set_footer(text=f"Assigned by {interaction.user.display_name}")
@@ -836,19 +891,27 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User, mess
                 msg = await _send_to_channel_id(ch_id, embed=emb)  # type: ignore[arg-type]
                 if msg:
                     posted += 1
-                    try: await msg.add_reaction("🎉")
-                    except Exception: pass
+                    try:
+                        await msg.add_reaction("🎉")
+                    except Exception:
+                        pass
         except Exception:
             pass
 
+    # DM the promoted member
     try:
         if promoted_member:
             d = await promoted_member.create_dm()
-            await d.send(f"You've been assigned the Sherpa Assistant role{(f' for {data.get('activity')}' if data else '')}.")
+            activity_name = str(data.get("activity")) if data else None
+            suffix = f" for {activity_name}" if activity_name else ""
+            await d.send(f"You've been assigned the Sherpa Assistant role{suffix}.")
     except Exception:
         pass
 
-    await interaction.response.send_message(f"Promotion applied. Role assigned: {assigned}. Announced in {posted} channel(s).", ephemeral=True)
+    await interaction.response.send_message(
+        f"Promotion applied. Role assigned: {assigned}. Announced in {posted} channel(s).",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="add", description="Add a user to a queue or event (promoter/founder for events)")
 @app_commands.describe(activity="(Optional) activity to add to", message_id="(Optional) event message ID to add to", user="User mention or ID to add")
