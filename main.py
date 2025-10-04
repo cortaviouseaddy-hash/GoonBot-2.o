@@ -194,6 +194,37 @@ def _is_sherpa_assistant(member: discord.Member) -> bool:
     except Exception:
         return False
 
+def _is_core_sherpa(member: discord.Member) -> bool:
+    """Return True if member has the core Sherpa role (not assistant-only).
+
+    Prefers explicit SHERPA_ROLE_ID when configured; otherwise heuristics exclude 'assistant'.
+    """
+    try:
+        if SHERPA_ROLE_ID:
+            return any(r.id == int(SHERPA_ROLE_ID) for r in member.roles)
+        for role in member.roles:
+            role_name = (role.name or "").lower()
+            if "sherpa" in role_name and "assistant" not in role_name:
+                return True
+        return False
+    except Exception:
+        return False
+
+def _is_founder_member(member: discord.Member) -> bool:
+    """Return True if the member is the founder by ID or by role name.
+
+    This mirrors the behavior of founder-only checks, but as a reusable helper.
+    """
+    try:
+        if FOUNDER_USER_ID and int(FOUNDER_USER_ID) == int(member.id):
+            return True
+    except Exception:
+        pass
+    try:
+        return any((role.name or "").lower() == "founder" for role in member.roles)
+    except Exception:
+        return False
+
 def sherpa_host_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -813,14 +844,18 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
     if data and not _is_promoter_or_founder(interaction, data):
         await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
         return
-    # If no event context, only founder can run this
-    if data is None and FOUNDER_USER_ID:
-        try:
-            if int(FOUNDER_USER_ID) != int(interaction.user.id):
-                await interaction.response.send_message("Only the founder can run this command without an event.", ephemeral=True)
-                return
-        except Exception:
-            pass
+    # If no event context, allow founder, members with Manage Roles, or core Sherpas
+    if data is None:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        is_founder = bool(member and _is_founder_member(member))
+        has_manage_roles = bool(member and getattr(member.guild_permissions, "manage_roles", False))
+        is_sherpa_non_assistant = bool(member and _is_core_sherpa(member))
+        if not (is_founder or has_manage_roles or is_sherpa_non_assistant):
+            await interaction.response.send_message(
+                "You must be the founder, a Sherpa, or have Manage Roles to run this command without an event.",
+                ephemeral=True,
+            )
+            return
 
     promoted_uid = int(user.id)
     promoted_member = guild.get_member(promoted_uid) if guild else None
