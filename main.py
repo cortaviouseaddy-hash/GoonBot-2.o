@@ -331,7 +331,9 @@ def _apply_activity_image(embed: discord.Embed, activity: str) -> Tuple[discord.
     # Known fallbacks for newer activities that may not exist in assets yet
     # Map canonicalized activity names -> local asset path (temporary placeholder)
     FALLBACK_LOCAL_IMAGES = {
-        "desert perpetual": os.path.join(os.path.dirname(__file__), "assets", "raids", "salvations_edge.jpg"),
+        "desert perpetual": os.path.join(
+            os.path.dirname(__file__), "assets", "raids", "desert_perpetual.jpg"
+        ),
     }
 
     img = _find_activity_image(activity)
