@@ -813,14 +813,22 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
     if data and not _is_promoter_or_founder(interaction, data):
         await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
         return
-    # If no event context, only founder can run this
-    if data is None and FOUNDER_USER_ID:
+    # If no event context, allow founder, members with Manage Roles, or Sherpas (not assistants)
+    if data is None:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        is_founder = False
         try:
-            if int(FOUNDER_USER_ID) != int(interaction.user.id):
-                await interaction.response.send_message("Only the founder can run this command without an event.", ephemeral=True)
-                return
+            is_founder = bool(FOUNDER_USER_ID and int(FOUNDER_USER_ID) == int(interaction.user.id))
         except Exception:
-            pass
+            is_founder = False
+        has_manage_roles = bool(member and getattr(member.guild_permissions, "manage_roles", False))
+        is_sherpa_non_assistant = bool(member and _is_sherpa(member) and not _is_sherpa_assistant(member))
+        if not (is_founder or has_manage_roles or is_sherpa_non_assistant):
+            await interaction.response.send_message(
+                "You must be the founder, a Sherpa, or have Manage Roles to run this command without an event.",
+                ephemeral=True,
+            )
+            return
 
     promoted_uid = int(user.id)
     promoted_member = guild.get_member(promoted_uid) if guild else None
