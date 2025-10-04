@@ -10,3 +10,5 @@ services:
     envVars:
       - key: DISCORD_TOKEN
         sync: false
+      - key: FOUNDER_USER_ID
+        value: "606274733750878218"
