@@ -12,3 +12,5 @@ services:
         sync: false
       - key: FOUNDER_USER_ID
         value: "606274733750878218"
+      - key: SHERPA_ASSISTANT_ROLE_ID
+        value: "1278022068591530085"
