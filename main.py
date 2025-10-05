@@ -421,6 +421,37 @@ def founder_only():
         raise app_commands.CheckFailure("You are not authorized to use this command.")
     return app_commands.check(predicate)
 
+def admin_or_sherpa_assistant():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.CheckFailure("Use this in a server.")
+        # If founder not configured, allow (matches founder_only fallback behavior)
+        if not FOUNDER_USER_ID:
+            return True
+        # Founder always allowed
+        try:
+            if int(interaction.user.id) == int(FOUNDER_USER_ID):
+                return True
+        except Exception:
+            pass
+        # Resolve member
+        member = (
+            interaction.user if isinstance(interaction.user, discord.Member)
+            else interaction.guild.get_member(interaction.user.id)
+        )
+        # Administrators allowed
+        try:
+            if member and getattr(member.guild_permissions, "administrator", False):
+                return True
+        except Exception:
+            pass
+        # Sherpa Assistants allowed
+        try:
+            return bool(member and _is_sherpa_assistant(member))
+        except Exception:
+            return False
+    return app_commands.check(predicate)
+
 def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
     try:
         uid = int(interaction.user.id)
@@ -1455,8 +1486,8 @@ async def on_message_delete(message: discord.Message):
 # /schedule
 # ---------------------------
 
-@bot.tree.command(name="schedule", description="(Founder) Create event: 2 embeds + 2 announcements, DM queue, reminders")
-@founder_only()
+@bot.tree.command(name="schedule", description="Create event: 2 embeds + 2 announcements, DM queue, reminders")
+@admin_or_sherpa_assistant()
 @app_commands.describe(
     activity="Activity name",
     datetime_str="Date and time (MM-DD HH:MM, 24h)",
