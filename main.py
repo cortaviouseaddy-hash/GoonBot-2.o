@@ -760,6 +760,13 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
 @bot.tree.command(name="promote", description="Assign Sherpa Assistant role to a chosen user and announce it")
 @app_commands.describe(user="User to promote to Sherpa Assistant")
 async def promote_cmd(interaction: discord.Interaction, user: discord.User):
+    # Acknowledge early to avoid interaction timeouts while we work
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+    except Exception:
+        # If defer fails, continue; we'll try to send a follow-up later
+        pass
     guild = interaction.guild
 
     # Try to auto-detect the relevant event when none is specified
@@ -811,23 +818,54 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
 
     # If we found an event, enforce promoter/founder permission for that event
     if data and not _is_promoter_or_founder(interaction, data):
-        await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Only the event promoter or the founder can promote for this event.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
+        except Exception:
+            pass
         return
     # If no event context, allow the command to run without founder restriction
     # This enables promoting users even when not tied to a specific event.
 
     promoted_uid = int(user.id)
-    promoted_member = guild.get_member(promoted_uid) if guild else None
+    promoted_member: Optional[discord.Member] = None
+    if guild:
+        try:
+            promoted_member = guild.get_member(promoted_uid)
+            if promoted_member is None:
+                # Fallback to API fetch if not cached
+                promoted_member = await guild.fetch_member(promoted_uid)
+        except Exception:
+            promoted_member = None
 
     assigned = False
-    if promoted_member and SHERPA_ASSISTANT_ROLE_ID:
+    assign_error: Optional[str] = None
+    if SHERPA_ASSISTANT_ROLE_ID and guild:
         try:
             role = guild.get_role(int(SHERPA_ASSISTANT_ROLE_ID))
-            if role:
-                await promoted_member.add_roles(role, reason="Assigned Sherpa Assistant via /promote")
-                assigned = True
         except Exception:
-            assigned = False
+            role = None
+        if promoted_member and role:
+            try:
+                bot_member = guild.me
+                if not bot_member or not getattr(bot_member.guild_permissions, "manage_roles", False):
+                    assign_error = "Bot lacks Manage Roles permission."
+                elif role.position >= (bot_member.top_role.position if bot_member.top_role else 0):
+                    assign_error = "Bot role must be above target role."
+                else:
+                    await promoted_member.add_roles(role, reason="Assigned Sherpa Assistant via /promote")
+                    assigned = True
+            except Exception as e:
+                assign_error = f"Failed to assign role: {e.__class__.__name__}"
+        elif not role and SHERPA_ASSISTANT_ROLE_ID:
+            assign_error = "Configured Sherpa Assistant role not found in this guild."
+        elif not promoted_member:
+            assign_error = "User is not a member of this server."
+    else:
+        if not SHERPA_ASSISTANT_ROLE_ID:
+            assign_error = "SHERPA_ASSISTANT_ROLE_ID not configured."
 
     # If we have event context, update event's sherpa lists and refresh the message
     if data is not None:
@@ -894,7 +932,7 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
 
     # DM the promoted member
     try:
-        if promoted_member:
+        if promoted_member and assigned:
             d = await promoted_member.create_dm()
             activity_name = str(data.get("activity")) if data else None
             suffix = f" for {activity_name}" if activity_name else ""
@@ -902,10 +940,17 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
     except Exception:
         pass
 
-    await interaction.response.send_message(
-        f"Promotion applied. Role assigned: {assigned}. Announced in {posted} channel(s).",
-        ephemeral=True,
-    )
+    # Final ephemeral follow-up
+    try:
+        msg = f"Promotion applied. Role assigned: {assigned}. Announced in {posted} channel(s)."
+        if not assigned and assign_error:
+            msg += f"\nNote: {assign_error}"
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 @bot.tree.command(name="add", description="Add a user to a queue or event (promoter/founder for events)")
 @app_commands.describe(activity="(Optional) activity to add to", message_id="(Optional) event message ID to add to", user="User mention or ID to add")
