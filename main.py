@@ -813,14 +813,8 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
     if data and not _is_promoter_or_founder(interaction, data):
         await interaction.response.send_message("Only the event promoter or the founder can promote for this event.", ephemeral=True)
         return
-    # If no event context, only founder can run this
-    if data is None and FOUNDER_USER_ID:
-        try:
-            if int(FOUNDER_USER_ID) != int(interaction.user.id):
-                await interaction.response.send_message("Only the founder can run this command without an event.", ephemeral=True)
-                return
-        except Exception:
-            pass
+    # If no event context, allow the command to run without founder restriction
+    # This enables promoting users even when not tied to a specific event.
 
     promoted_uid = int(user.id)
     promoted_member = guild.get_member(promoted_uid) if guild else None
