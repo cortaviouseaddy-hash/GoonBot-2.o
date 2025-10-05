@@ -689,6 +689,15 @@ async def _post_all_activity_boards(fallback_channel_id: Optional[int] = None):
 # Slash Commands
 # ---------------------------
 
+@bot.tree.command(name="ping", description="Check bot responsiveness (latency)")
+async def ping_cmd(interaction: discord.Interaction):
+    try:
+        ws_ms = int((bot.latency or 0) * 1000)
+        msg = f"Pong! WebSocket latency: {ws_ms} ms"
+    except Exception:
+        msg = "Pong!"
+    await interaction.response.send_message(msg, ephemeral=True)
+
 @bot.tree.command(name="join", description="Join an activity queue")
 @app_commands.describe(activity="Choose an activity to join")
 @app_commands.autocomplete(activity=_activity_autocomplete)
