@@ -1544,10 +1544,23 @@ async def on_message_delete(message: discord.Message):
                     await new_msg.add_reaction(emoji)
                 except Exception:
                     pass
-        # Persist rehosted image URL if present on restored embed
+        # Persist rehosted image URL if present on restored embed and convert to embed-only image
         try:
             if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
                 data["image_url"] = new_msg.embeds[0].image.url
+                # Re-render without file attachment to avoid duplicate upload preview
+                if str(data.get("type")) == "sherpa_only":
+                    restored_embed, _ = await _render_sherpa_only_embed(guild, str(data.get("activity", "Event")), data)
+                else:
+                    restored_embed, _ = await _render_event_embed(guild, str(data.get("activity", "Event")), data)
+                try:
+                    await new_msg.edit(embed=restored_embed, attachments=[])
+                except Exception:
+                    # Fallback without explicit attachments param if unsupported
+                    try:
+                        await new_msg.edit(embed=restored_embed)
+                    except Exception:
+                        pass
         except Exception:
             pass
         # Update schedule mapping to include the new message id while preserving the old for DM callbacks
@@ -1712,10 +1725,19 @@ async def schedule_cmd(
             except Exception: pass
 
         mid = ev_msg.id
-        # Persist image URL if Discord re-hosted the attachment
+        # Persist image URL if Discord re-hosted the attachment and immediately convert to embed-only image
         try:
             if ev_msg.embeds and ev_msg.embeds[0].image and ev_msg.embeds[0].image.url:
                 data["image_url"] = ev_msg.embeds[0].image.url
+                # Re-render embed with CDN URL and remove attachment to avoid duplicate file upload preview
+                embed_cdn, _ = await _render_event_embed(guild, act, data)
+                try:
+                    await ev_msg.edit(embed=embed_cdn, attachments=[])
+                except Exception:
+                    try:
+                        await ev_msg.edit(embed=embed_cdn)
+                    except Exception:
+                        pass
         except Exception:
             pass
         SCHEDULES[mid] = data
@@ -2488,10 +2510,18 @@ async def event_sherpa_cmd(
         except Exception:
             pass
 
-    # Persist image URL if Discord re-hosted the attachment
+    # Persist image URL if Discord re-hosted the attachment and convert to embed-only image
     try:
         if msg.embeds and msg.embeds[0].image and msg.embeds[0].image.url:
             data["image_url"] = msg.embeds[0].image.url
+            embed_cdn, _ = await _render_sherpa_only_embed(guild, act, data)
+            try:
+                await msg.edit(embed=embed_cdn, attachments=[])
+            except Exception:
+                try:
+                    await msg.edit(embed=embed_cdn)
+                except Exception:
+                    pass
     except Exception:
         pass
     SCHEDULES[int(msg.id)] = data
