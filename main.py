@@ -483,9 +483,6 @@ def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[s
 COUNT_FILE = os.path.join(os.path.dirname(__file__), "counts.json")
 COUNTER_LOCK = asyncio.Lock()
 
-# Lightweight confirmation/activity log (JSON Lines)
-CONFIRM_LOG_PATH = os.path.join(os.path.dirname(__file__), "confirmations.jsonl")
-
 def _read_counter() -> int:
     try:
         with open(COUNT_FILE, "r") as f:
@@ -509,90 +506,6 @@ async def _increment_counter() -> int:
         _write_counter(new_value)
         return new_value
 
-# ---------------------------
-# Event membership helpers
-# ---------------------------
-
-def _log_confirmation(mid: Optional[int], user_id: int, action: str, extra: Optional[Dict[str, object]] = None) -> None:
-    try:
-        payload: Dict[str, object] = {
-            "event_id": int(mid) if mid is not None else None,
-            "user_id": int(user_id),
-            "action": str(action),
-        }
-        if extra:
-            payload.update(extra)
-        # Append as JSON line for easy parsing
-        with open(CONFIRM_LOG_PATH, "a") as f:
-            f.write(json.dumps(payload) + "\n")
-    except Exception:
-        # Silent failure is acceptable for optional diagnostics
-        pass
-
-def _exists_in_any_event_list(data: Dict[str, object], uid: int) -> Optional[str]:
-    try:
-        participants: List[int] = data.get("players", []) or []  # type: ignore
-        backups: List[int] = data.get("backups", []) or []  # type: ignore
-        sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
-        sbackup_raw = data.get("sherpa_backup") or set()  # type: ignore
-        sherpa_backups: Set[int]
-        if isinstance(sbackup_raw, list):
-            sherpa_backups = set(int(x) for x in sbackup_raw)
-        else:
-            sherpa_backups = set(int(x) for x in sbackup_raw)
-        if uid in participants:
-            return "players"
-        if uid in backups:
-            return "backups"
-        if uid in sherpas:
-            return "sherpas"
-        if uid in sherpa_backups:
-            return "sherpa_backup"
-        return None
-    except Exception:
-        return None
-
-def _add_to_backups_if_unique(data: Dict[str, object], uid: int, *, event_id: Optional[int] = None) -> bool:
-    """Attempt to add to backups, skipping if uid exists in any list. Returns True if added."""
-    found = _exists_in_any_event_list(data, uid)
-    if found:
-        try: print(f"skip add backup: user {uid} already in {found} (event {event_id})")
-        except Exception: pass
-        return False
-    backups: List[int] = data.get("backups", []) or []  # type: ignore
-    backups.append(uid)
-    data["backups"] = backups
-    return True
-
-def _promote_to_players_or_backup(data: Dict[str, object], uid: int, *, event_id: Optional[int] = None) -> str:
-    """Promote uid to players if slot available; otherwise add to backup if unique.
-    Returns one of: 'player', 'backup', 'skipped'. Also ensures removal from backups when promoted.
-    """
-    cap = int(data.get("capacity", 0))
-    reserved = int(data.get("reserved_sherpas", 0))
-    player_slots = max(0, cap - reserved)
-    participants: List[int] = data.get("players", []) or []  # type: ignore
-    backups: List[int] = data.get("backups", []) or []  # type: ignore
-
-    # Already a participant
-    if uid in participants:
-        try: print(f"confirm/promote skip: user {uid} already a player (event {event_id})")
-        except Exception: pass
-        return "skipped"
-
-    if len(participants) < player_slots:
-        # Remove from backups if present and then add to players
-        if uid in backups:
-            backups[:] = [x for x in backups if x != uid]
-            data["backups"] = backups
-        participants.append(uid)
-        data["players"] = participants
-        return "player"
-
-    # No player slot: add to backups if not in any list
-    if _add_to_backups_if_unique(data, uid, event_id=event_id):
-        return "backup"
-    return "skipped"
 
 # ---------------------------
 # Permissions
