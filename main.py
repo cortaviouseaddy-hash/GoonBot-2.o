@@ -352,6 +352,113 @@ def _apply_activity_image(embed: discord.Embed, activity: str) -> Tuple[discord.
             file = None
     return embed, file
 
+# ---------------------------
+# Event list + logging helpers
+# ---------------------------
+
+# Append-only JSONL file for lightweight debug logs
+CONFIRM_LOG_FILE = os.path.join(os.path.dirname(__file__), "confirmations.jsonl")
+
+def _user_in_any_event_list(data: Dict[str, object], uid: int) -> Optional[str]:
+    try:
+        if uid in (data.get("players", []) or []):
+            return "players"
+        if uid in (data.get("backups", []) or []):
+            return "backups"
+        # sherpas and sherpa_backup may be list or set depending on flow
+        sherpas = data.get("sherpas") or set()
+        if uid in set(sherpas):
+            return "sherpas"
+        sbackup = data.get("sherpa_backup") or []
+        if uid in set(sbackup) or uid in list(sbackup):
+            return "sherpa_backup"
+        return None
+    except Exception:
+        return None
+
+def _remove_user_from_list(data: Dict[str, object], uid: int, key: str) -> bool:
+    try:
+        if key == "sherpas":
+            cur = data.get("sherpas") or set()
+            before = len(cur)
+            try:
+                cur.discard(uid)
+            except Exception:
+                cur = set([x for x in list(cur) if int(x) != int(uid)])
+            data["sherpas"] = cur
+            return len(cur) != before
+        lst = data.get(key) or []
+        if isinstance(lst, list):
+            new_lst = [x for x in lst if int(x) != int(uid)]
+            changed = len(new_lst) != len(lst)
+            data[key] = new_lst
+            return changed
+        else:
+            # treat as set
+            s = set(lst)
+            before = len(s)
+            s.discard(uid)
+            data[key] = s
+            return len(s) != before
+    except Exception:
+        return False
+
+def _remove_from_all_event_lists(data: Dict[str, object], uid: int) -> None:
+    for key in ("players", "backups", "sherpas", "sherpa_backup"):
+        _remove_user_from_list(data, uid, key)
+
+def _append_unique_to(data: Dict[str, object], key: str, uid: int) -> Tuple[bool, Optional[str]]:
+    """Try to append uid to the given list/set key if uid is not present
+    in ANY event list. Returns (added, skip_reason)."""
+    exists = _user_in_any_event_list(data, uid)
+    if exists and exists != key:
+        return False, f"already in {exists}"
+    try:
+        if key == "sherpas":
+            cur = data.get("sherpas") or set()
+            if uid in set(cur):
+                return False, "already in sherpas"
+            cur = set(cur)
+            cur.add(uid)
+            data["sherpas"] = cur
+            return True, None
+        cur = data.get(key)
+        if isinstance(cur, list):
+            if uid in cur:
+                return False, f"already in {key}"
+            cur.append(uid)
+            data[key] = cur
+            return True, None
+        else:
+            s = set(cur or [])
+            if uid in s:
+                return False, f"already in {key}"
+            s.add(uid)
+            data[key] = s
+            return True, None
+    except Exception as e:
+        return False, f"error: {e.__class__.__name__}"
+
+def _log_confirmation(mid: int, uid: int, action: str, result: str, reason: Optional[str] = None) -> None:
+    record = {
+        "mid": int(mid),
+        "uid": int(uid),
+        "action": action,
+        "result": result,
+        "reason": reason,
+        "ts": int(datetime.now().timestamp()),
+    }
+    try:
+        print("confirm-log:", record)
+    except Exception:
+        pass
+    try:
+        with open(CONFIRM_LOG_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        # best-effort; ignore fs errors
+        pass
+
 def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[str] = None) -> Optional[int]:
     try:
         dt = datetime.strptime(f"{date_iso} {time_part}", "%Y-%m-%d %H:%M")
@@ -376,6 +483,9 @@ def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[s
 COUNT_FILE = os.path.join(os.path.dirname(__file__), "counts.json")
 COUNTER_LOCK = asyncio.Lock()
 
+# Lightweight confirmation/activity log (JSON Lines)
+CONFIRM_LOG_PATH = os.path.join(os.path.dirname(__file__), "confirmations.jsonl")
+
 def _read_counter() -> int:
     try:
         with open(COUNT_FILE, "r") as f:
@@ -398,6 +508,91 @@ async def _increment_counter() -> int:
         new_value = current + 1
         _write_counter(new_value)
         return new_value
+
+# ---------------------------
+# Event membership helpers
+# ---------------------------
+
+def _log_confirmation(mid: Optional[int], user_id: int, action: str, extra: Optional[Dict[str, object]] = None) -> None:
+    try:
+        payload: Dict[str, object] = {
+            "event_id": int(mid) if mid is not None else None,
+            "user_id": int(user_id),
+            "action": str(action),
+        }
+        if extra:
+            payload.update(extra)
+        # Append as JSON line for easy parsing
+        with open(CONFIRM_LOG_PATH, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        # Silent failure is acceptable for optional diagnostics
+        pass
+
+def _exists_in_any_event_list(data: Dict[str, object], uid: int) -> Optional[str]:
+    try:
+        participants: List[int] = data.get("players", []) or []  # type: ignore
+        backups: List[int] = data.get("backups", []) or []  # type: ignore
+        sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
+        sbackup_raw = data.get("sherpa_backup") or set()  # type: ignore
+        sherpa_backups: Set[int]
+        if isinstance(sbackup_raw, list):
+            sherpa_backups = set(int(x) for x in sbackup_raw)
+        else:
+            sherpa_backups = set(int(x) for x in sbackup_raw)
+        if uid in participants:
+            return "players"
+        if uid in backups:
+            return "backups"
+        if uid in sherpas:
+            return "sherpas"
+        if uid in sherpa_backups:
+            return "sherpa_backup"
+        return None
+    except Exception:
+        return None
+
+def _add_to_backups_if_unique(data: Dict[str, object], uid: int, *, event_id: Optional[int] = None) -> bool:
+    """Attempt to add to backups, skipping if uid exists in any list. Returns True if added."""
+    found = _exists_in_any_event_list(data, uid)
+    if found:
+        try: print(f"skip add backup: user {uid} already in {found} (event {event_id})")
+        except Exception: pass
+        return False
+    backups: List[int] = data.get("backups", []) or []  # type: ignore
+    backups.append(uid)
+    data["backups"] = backups
+    return True
+
+def _promote_to_players_or_backup(data: Dict[str, object], uid: int, *, event_id: Optional[int] = None) -> str:
+    """Promote uid to players if slot available; otherwise add to backup if unique.
+    Returns one of: 'player', 'backup', 'skipped'. Also ensures removal from backups when promoted.
+    """
+    cap = int(data.get("capacity", 0))
+    reserved = int(data.get("reserved_sherpas", 0))
+    player_slots = max(0, cap - reserved)
+    participants: List[int] = data.get("players", []) or []  # type: ignore
+    backups: List[int] = data.get("backups", []) or []  # type: ignore
+
+    # Already a participant
+    if uid in participants:
+        try: print(f"confirm/promote skip: user {uid} already a player (event {event_id})")
+        except Exception: pass
+        return "skipped"
+
+    if len(participants) < player_slots:
+        # Remove from backups if present and then add to players
+        if uid in backups:
+            backups[:] = [x for x in backups if x != uid]
+            data["backups"] = backups
+        participants.append(uid)
+        data["players"] = participants
+        return "player"
+
+    # No player slot: add to backups if not in any list
+    if _add_to_backups_if_unique(data, uid, event_id=event_id):
+        return "backup"
+    return "skipped"
 
 # ---------------------------
 # Permissions
@@ -510,6 +705,9 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
     # Prefer encounter/preset for image search if provided
     search_text = str(data.get("encounter") or activity)
     embed_with_img, attachment = _apply_activity_image(embed, search_text)
+    # If we produced a local file attachment, prefer to not send it as an external upload.
+    # We'll set the image via attachment first, then immediately capture Discord's CDN URL and
+    # re-render without an attachment (handled by callers).
     return embed_with_img, attachment
 
 def _format_title_when(ts: Optional[int], tz_name: Optional[str]) -> str:
@@ -567,6 +765,7 @@ async def _render_sherpa_only_embed(guild: Optional[discord.Guild], activity: st
     except Exception:
         pass
     embed_with_img, attachment = _apply_activity_image(embed, activity)
+    # Same behavior as event embed regarding avoiding duplicate uploads (handled by callers).
     return embed_with_img, attachment
 
 # ---------------------------
@@ -974,8 +1173,9 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
         cap = int(data.get("capacity", 0))
         reserved = int(data.get("reserved_sherpas", 0))
         player_slots = max(0, cap - reserved)
-        if uid in participants or uid in backups:
-            await interaction.response.send_message("User already in event.", ephemeral=True)
+        where = _user_in_any_event_list(data, uid)
+        if where is not None:
+            await interaction.response.send_message(f"User already in event ({where}).", ephemeral=True)
             return
         if len(participants) < player_slots:
             participants.append(uid); status = "Player"
@@ -1120,18 +1320,25 @@ class ConfirmView(discord.ui.View):
         if not data:
             await interaction.response.send_message("Event no longer exists.", ephemeral=True); return
         participants: List[int] = data.get("players", [])  # type: ignore
-        backups: List[int] = data.get("backups", [])  # type: ignore
         cap = int(data.get("capacity", 0)); reserved = int(data.get("reserved_sherpas", 0))
         player_slots = max(0, cap - reserved)
-        if self.uid in participants:
-            await interaction.response.send_message("You're already locked in.", ephemeral=True); return
+        # Try to add to players if there is space; otherwise backups
         if len(participants) < player_slots:
-            participants.append(self.uid)
-            await interaction.response.send_message("Locked in. See you there! ✅", ephemeral=True)
+            added, reason = _append_unique_to(data, "players", self.uid)
+            if added:
+                await interaction.response.send_message("Locked in. See you there! ✅", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "confirm", "added_players")
+            else:
+                await interaction.response.send_message("You're already accounted for.", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
         else:
-            if self.uid not in backups:
-                backups.append(self.uid)
-            await interaction.response.send_message("Roster is full — added as **Backup**.", ephemeral=True)
+            added, reason = _append_unique_to(data, "backups", self.uid)
+            if added:
+                await interaction.response.send_message("Roster is full — added as **Backup**.", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "confirm", "added_backups")
+            else:
+                await interaction.response.send_message("You're already accounted for.", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
         guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
         if guild: await _update_schedule_message(guild, self.mid)
 
@@ -1148,6 +1355,7 @@ class ConfirmView(discord.ui.View):
             guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
             if guild: await _update_schedule_message(guild, self.mid)
         await interaction.response.send_message("All good. Thanks for letting us know.", ephemeral=True)
+        _log_confirmation(self.mid, self.uid, "decline", "ok")
 
 class SherpaConfirmView(discord.ui.View):
     def __init__(self, mid: int, uid: int):
@@ -1161,17 +1369,25 @@ class SherpaConfirmView(discord.ui.View):
         if not data:
             await interaction.response.send_message("Event no longer exists.", ephemeral=True); return
         sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
-        sbackup: Set[int] = data.get("sherpa_backup") or set()  # type: ignore
         reserved = int(data.get("reserved_sherpas", 0))
         if self.uid in sherpas:
             await interaction.response.send_message("You're already locked in as a Sherpa.", ephemeral=True); return
         if len(sherpas) < reserved:
-            sherpas.add(self.uid); data["sherpas"] = sherpas
-            await interaction.response.send_message("Locked in as Sherpa. Thank you! ✅", ephemeral=True)
+            added, reason = _append_unique_to(data, "sherpas", self.uid)
+            if added:
+                await interaction.response.send_message("Locked in as Sherpa. Thank you! ✅", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "sherpa_confirm", "added_sherpas")
+            else:
+                await interaction.response.send_message("You're already accounted for.", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "sherpa_confirm", "skipped", reason)
         else:
-            if self.uid not in sbackup:
-                sbackup.add(self.uid); data["sherpa_backup"] = sbackup
-            await interaction.response.send_message("All Sherpa slots are full — added as Sherpa Backup.", ephemeral=True)
+            added, reason = _append_unique_to(data, "sherpa_backup", self.uid)
+            if added:
+                await interaction.response.send_message("All Sherpa slots are full — added as Sherpa Backup.", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "sherpa_confirm", "added_sbackup")
+            else:
+                await interaction.response.send_message("You're already accounted for.", ephemeral=True)
+                _log_confirmation(self.mid, self.uid, "sherpa_confirm", "skipped", reason)
         guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
         if guild: await _update_schedule_message(guild, self.mid)
 
@@ -1233,7 +1449,11 @@ async def _update_schedule_message(guild: discord.Guild, message_id: int):
             embed, _ = await _render_sherpa_only_embed(guild, str(data["activity"]), data)  # type: ignore
         else:
             embed, _ = await _render_event_embed(guild, str(data["activity"]), data)  # type: ignore
-        await msg.edit(embed=embed)
+        # Remove any lingering attachments to avoid duplicate image cards
+        try:
+            await msg.edit(embed=embed, attachments=[])
+        except Exception:
+            await msg.edit(embed=embed)
     except Exception as e:
         print("Failed to update schedule msg:", e)
 
@@ -1274,7 +1494,14 @@ async def _scheduler_loop():
                     except Exception:
                         pass
                     # LFG announcement ONLY if channel configured: @everyone and point to event signup channel
+                    # Before announcing, pull available backups into open player slots
                     if LFG_CHAT_CHANNEL_ID:
+                        try:
+                            moved = _autofill_from_backups(data)
+                            guild2 = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+                            await _dm_promoted_users(guild2, moved, data)
+                        except Exception:
+                            pass
                         event_link = None
                         try:
                             ch = bot.get_channel(int(data.get("channel_id"))) or await bot.fetch_channel(int(data.get("channel_id")))
@@ -1579,6 +1806,12 @@ async def schedule_cmd(
         except Exception:
             pass
         SCHEDULES[mid] = data
+        # Immediately re-render using the CDN image URL and remove attachments to avoid duplicate image card
+        try:
+            if guild:
+                await _update_schedule_message(guild, int(mid))
+        except Exception:
+            pass
 
         # ---- EMBED 2: Sherpa Signup Embed (RAID_SIGN_UP_CHANNEL_ID) ----
         sherpa_alert_url = None
@@ -1947,10 +2180,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 sherpas: Set[int] = data.get("sherpas")  # type: ignore
                 backup: Set[int] = data.get("sherpa_backup")  # type: ignore
                 if emoji_str == "✅":
-                    if len(sherpas) < reserved and member.id not in sherpas:
-                        sherpas.add(member.id)
-                    else:
-                        backup.add(member.id)
+                    # Dedup across lists
+                    exists = _user_in_any_event_list(data, member.id)
+                    if exists in (None, "sherpas"):
+                        if len(sherpas) < reserved and member.id not in sherpas:
+                            sherpas.add(member.id)
+                        else:
+                            backup.add(member.id)
                     await _update_schedule_message(guild, int(mid))
                     try:
                         dm = await member.create_dm()
@@ -1966,7 +2202,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                         pass
                     return
                 elif emoji_str == "🔁":
-                    if member.id not in sherpas and member.id not in backup:
+                    if _user_in_any_event_list(data, member.id) is None:
                         backup.add(member.id)
                         await _update_schedule_message(guild, int(mid))
                     return
@@ -2122,7 +2358,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not guild: return
         participants: List[int] = data.get("players", [])  # type: ignore
         backups: List[int] = data.get("backups", [])  # type: ignore
-        if payload.user_id not in participants and payload.user_id not in backups:
+        if _user_in_any_event_list(data, payload.user_id) is None:
             backups.append(payload.user_id)
             await _update_schedule_message(guild, int(payload.message_id))
         return
@@ -2140,14 +2376,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         player_slots = max(0, cap - reserved)
 
         if not data.get("signups_open"):
-            # Before T-2h, ✅ acts as backup intent
-            if payload.user_id not in participants and payload.user_id not in backups:
+            # Before T-2h, ✅ acts as backup intent with cross-list dedupe
+            exists = _user_in_any_event_list(data, payload.user_id)
+            if exists is None:
                 backups.append(payload.user_id)
+            else:
+                try: print("skip add pre-open ✅:", payload.user_id, "already in", exists)
+                except Exception: pass
             await _update_schedule_message(guild, int(payload.message_id))
             return
 
         # After open: ✅ tries to join as player; else backup
-        if payload.user_id in participants or payload.user_id in backups:
+        if _user_in_any_event_list(data, payload.user_id) is not None:
             await _update_schedule_message(guild, int(payload.message_id)); return
         if len(participants) < player_slots:
             participants.append(payload.user_id)
@@ -2342,6 +2582,11 @@ async def event_sherpa_cmd(
     except Exception:
         pass
     SCHEDULES[int(msg.id)] = data
+    # Re-render to force embed to use CDN-hosted image and strip attachment file
+    try:
+        await _update_schedule_message(guild, int(msg.id))
+    except Exception:
+        pass
 
     # Announcement in #general-sherpa
     announce_ok = False
