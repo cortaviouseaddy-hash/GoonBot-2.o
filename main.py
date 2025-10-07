@@ -483,6 +483,10 @@ def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[s
 COUNT_FILE = os.path.join(os.path.dirname(__file__), "counts.json")
 COUNTER_LOCK = asyncio.Lock()
 
+# Persistent storage for activity queues
+QUEUES_FILE = os.path.join(os.path.dirname(__file__), "queues.json")
+QUEUES_LOCK = asyncio.Lock()
+
 def _read_counter() -> int:
     try:
         with open(COUNT_FILE, "r") as f:
@@ -505,6 +509,49 @@ async def _increment_counter() -> int:
         new_value = current + 1
         _write_counter(new_value)
         return new_value
+
+# ---------------
+# Queue persistence
+# ---------------
+def _read_queues_from_disk() -> Dict[str, List[int]]:
+    try:
+        if not os.path.isfile(QUEUES_FILE):
+            return {}
+        with open(QUEUES_FILE, "r") as f:
+            raw = json.load(f)
+        out: Dict[str, List[int]] = {}
+        for k, v in (raw or {}).items():
+            try:
+                name = str(k)
+                ids = [int(x) for x in (v or [])]
+                out[name] = ids
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+def _write_queues_to_disk(state: Dict[str, List[int]]) -> None:
+    try:
+        tmp_path = f"{QUEUES_FILE}.tmp"
+        serializable = {str(k): [int(x) for x in (v or [])] for k, v in state.items()}
+        with open(tmp_path, "w") as f:
+            json.dump(serializable, f)
+        os.replace(tmp_path, QUEUES_FILE)
+    except Exception:
+        pass
+
+async def persist_queues() -> None:
+    async with QUEUES_LOCK:
+        _write_queues_to_disk(QUEUES)
+
+async def load_queues() -> None:
+    async with QUEUES_LOCK:
+        loaded = _read_queues_from_disk()
+        if loaded:
+            # Merge into current to preserve references
+            for k, v in loaded.items():
+                QUEUES[k] = list(v)
 
 
 # ---------------------------
@@ -691,6 +738,14 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print("Slash sync failed:", e)
+    # Load queues from disk once
+    if not getattr(bot, "_queues_loaded", False):  # type: ignore[attr-defined]
+        try:
+            await load_queues()
+            bot._queues_loaded = True  # type: ignore[attr-defined]
+            print("Queues loaded from disk")
+        except Exception as e:
+            print("Queue load failed:", e)
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     print(f"Ready as {bot.user}")
@@ -823,6 +878,7 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
         await interaction.response.send_message("You can be in at most 2 different activity queues.", ephemeral=True)
         return
     _ensure_queue(act).append(uid)
+    await persist_queues()
     await interaction.response.send_message(f"Joined queue for: {act}", ephemeral=True)
     await _post_activity_board(act)
 
@@ -861,6 +917,7 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
         q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
+            await persist_queues()
             await interaction.response.send_message(f"Left queue: {act}", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -1109,6 +1166,7 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
             await interaction.response.send_message("User already in queue.", ephemeral=True)
             return
         q.append(uid)
+        await persist_queues()
         await interaction.response.send_message(f"Added user to queue: {act}", ephemeral=True)
         await _post_activity_board(act)
         return
@@ -1155,6 +1213,7 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
         q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
+            await persist_queues()
             await interaction.response.send_message("Removed user from queue.", ephemeral=True)
             await _post_activity_board(act)
             return
