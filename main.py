@@ -55,6 +55,7 @@ SHERPA_ASSISTANT_ROLE_ID      = _env_int("SHERPA_ASSISTANT_ROLE_ID")
 SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
 EVENT_HOST_AUTOJOIN           = _env_bool("EVENT_HOST_AUTOJOIN", True)
+UPDATE_CHANNEL_ID             = _env_int("UPDATE_CHANNEL_ID")
 
 # Optional local overrides via channel_ids.json (non-secret, deploy-time config)
 def _load_channel_overrides() -> None:
@@ -69,13 +70,14 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID, UPDATE_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
         lf = _to_int(data.get("LFG_CHAT_CHANNEL_ID"))
         ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
         wc = _to_int(data.get("WELCOME_CHANNEL_ID"))
+        up = _to_int(data.get("UPDATE_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
@@ -88,6 +90,8 @@ def _load_channel_overrides() -> None:
             EVENT_SIGNUP_CHANNEL_ID = ev
         if wc and not WELCOME_CHANNEL_ID:
             WELCOME_CHANNEL_ID = wc
+        if up and not UPDATE_CHANNEL_ID:
+            UPDATE_CHANNEL_ID = up
     except Exception:
         pass
 
@@ -682,6 +686,83 @@ async def _render_sherpa_only_embed(guild: Optional[discord.Guild], activity: st
     return embed_with_img, attachment
 
 # ---------------------------
+# Updates / Deployment Notices
+# ---------------------------
+
+def _get_deploy_info() -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    try:
+        commit_keys = (
+            "RENDER_GIT_COMMIT",
+            "GIT_COMMIT",
+            "SOURCE_VERSION",
+            "COMMIT",
+            "HEROKU_SLUG_COMMIT",
+        )
+        branch_keys = (
+            "RENDER_GIT_BRANCH",
+            "GIT_BRANCH",
+            "BRANCH",
+        )
+        repo_keys = (
+            "RENDER_GIT_REPO",
+            "GIT_REPOSITORY_URL",
+            "REPO",
+        )
+        for k in commit_keys:
+            v = os.getenv(k)
+            if v:
+                info["commit"] = v
+                break
+        for k in branch_keys:
+            v = os.getenv(k)
+            if v:
+                info["branch"] = v
+                break
+        for k in repo_keys:
+            v = os.getenv(k)
+            if v:
+                info["repo"] = v
+                break
+        svc = os.getenv("RENDER_SERVICE_NAME") or os.getenv("RENDER_SERVICE_ID")
+        if svc:
+            info["service"] = svc
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        info["time"] = ts
+    except Exception:
+        pass
+    return info
+
+def _build_update_embed(info: Dict[str, str]) -> discord.Embed:
+    title = "Bot updated and online ✅"
+    desc = "A new version of the bot has just started."
+    emb = discord.Embed(title=title, description=desc, color=0x2ECC71)
+    try:
+        if info.get("commit"):
+            short = info["commit"][:7]
+            emb.add_field(name="Commit", value=short, inline=True)
+        if info.get("branch"):
+            emb.add_field(name="Branch", value=info["branch"], inline=True)
+        if info.get("service"):
+            emb.add_field(name="Service", value=str(info["service"]), inline=True)
+        if info.get("time"):
+            emb.set_footer(text=f"Deployed at {info['time']}")
+    except Exception:
+        pass
+    return emb
+
+async def _announce_startup_update() -> None:
+    try:
+        if not UPDATE_CHANNEL_ID:
+            return
+        info = _get_deploy_info()
+        emb = _build_update_embed(info)
+        await _send_to_channel_id(int(UPDATE_CHANNEL_ID), embed=emb)
+    except Exception as e:
+        try: print("update announce failed:", e)
+        except Exception: pass
+
+# ---------------------------
 # Lifecycle
 # ---------------------------
 
@@ -694,6 +775,10 @@ async def on_ready():
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     print(f"Ready as {bot.user}")
+    # One-time startup update notice
+    if not getattr(bot, "_update_announced", False):
+        bot._update_announced = True  # type: ignore[attr-defined]
+        await _announce_startup_update()
 
 # ---------------------------
 # Welcome Flow (member join)
