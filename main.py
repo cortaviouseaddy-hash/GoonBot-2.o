@@ -1738,15 +1738,13 @@ async def schedule_cmd(
         if promoter_id not in participant_ids:
             participant_ids.insert(0, promoter_id)
 
-        # Merge sherpas into participant order so they consume player slots
-        merged_participants = list(participant_ids)
-        for sid in list(sherpa_ids):
-            if sid not in merged_participants:
-                merged_participants.append(sid)
-
+        # Build players/backups from non-sherpa participants only
+        # Sherpas are tracked separately in data["sherpas"] and do not appear in Players
         player_slots = max(0, cap - reserved)
         seen = set(); uniq_participants: List[int] = []
-        for uid in merged_participants:
+        for uid in participant_ids:
+            if uid in sherpa_ids:
+                continue
             if uid not in seen:
                 uniq_participants.append(uid); seen.add(uid)
         players_final = uniq_participants[:player_slots]
