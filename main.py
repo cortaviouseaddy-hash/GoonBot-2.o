@@ -69,11 +69,12 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
         lf = _to_int(data.get("LFG_CHAT_CHANNEL_ID"))
+        rq = _to_int(data.get("RAID_QUEUE_CHANNEL_ID"))
         ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
         wc = _to_int(data.get("WELCOME_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
@@ -84,6 +85,8 @@ def _load_channel_overrides() -> None:
             GENERAL_CHANNEL_ID = gc
         if lf and not LFG_CHAT_CHANNEL_ID:
             LFG_CHAT_CHANNEL_ID = lf
+        if rq and not RAID_QUEUE_CHANNEL_ID:
+            RAID_QUEUE_CHANNEL_ID = rq
         if ev and not EVENT_SIGNUP_CHANNEL_ID:
             EVENT_SIGNUP_CHANNEL_ID = ev
         if wc and not WELCOME_CHANNEL_ID:
