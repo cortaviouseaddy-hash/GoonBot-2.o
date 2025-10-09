@@ -1097,8 +1097,13 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
         except Exception:
             pass
 
-    # Build announcement embed
-    title = f"🎉 Congratulations, {user.mention}! 🎉"
+    # Build announcement embed (embed titles don't render mentions, so use a display name)
+    promoted_display = (
+        promoted_member.display_name
+        if promoted_member is not None
+        else (getattr(user, "global_name", None) or user.name)
+    )
+    title = f"🎉 Congratulations, {promoted_display}! 🎉"
     desc = (
         "✨ What it Means to be a Sherpa Assistant\n"
         "You are now part of an elite group dedicated to helping Guardians conquer Destiny’s toughest challenges.\n"
@@ -1116,6 +1121,17 @@ async def promote_cmd(interaction: discord.Interaction, user: discord.User):
         "Lead with patience, lift others up, and show what it truly means to Carry the Light."
     )
     emb = discord.Embed(title=title, description=desc, color=0xFFD700)
+    try:
+        # Prefer the member's display avatar; fall back to the user's if needed
+        avatar_url = (
+            promoted_member.display_avatar.url
+            if promoted_member is not None
+            else user.display_avatar.url
+        )
+        if avatar_url:
+            emb.set_thumbnail(url=avatar_url)
+    except Exception:
+        pass
     if data is not None:
         try:
             emb.add_field(name="Event", value=str(data.get("activity", "event")), inline=True)
