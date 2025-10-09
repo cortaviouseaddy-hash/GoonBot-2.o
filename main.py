@@ -96,6 +96,23 @@ def _load_channel_overrides() -> None:
 
 _load_channel_overrides()
 
+# ---------------------------
+# Data directory (durable storage)
+# ---------------------------
+def _ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+# Prefer explicit env var; fall back to ./data alongside this file
+DATA_DIR = (
+    os.getenv("GOONBOT_DATA_DIR")
+    or os.getenv("BOT_DATA_DIR")
+    or os.path.join(os.path.dirname(__file__), "data")
+)
+_ensure_dir(DATA_DIR)
+
 FOUNDER_USER_ID               = os.getenv("FOUNDER_USER_ID")  # str
 ALLOW_ASSISTANTS_TO_HOST      = os.getenv("ALLOW_ASSISTANTS_TO_HOST", "1").strip() not in ("0", "false", "no")
 
@@ -483,11 +500,11 @@ def _parse_date_time_to_epoch(date_iso: str, time_part: str, tz_name: Optional[s
 # Counter Utilities
 # ---------------------------
 
-COUNT_FILE = os.path.join(os.path.dirname(__file__), "counts.json")
+COUNT_FILE = os.path.join(DATA_DIR, "counts.json")
 COUNTER_LOCK = asyncio.Lock()
 
 # Persistent storage for activity queues
-QUEUES_FILE = os.path.join(os.path.dirname(__file__), "queues.json")
+QUEUES_FILE = os.path.join(DATA_DIR, "queues.json")
 QUEUES_LOCK = asyncio.Lock()
 
 def _read_counter() -> int:
@@ -518,9 +535,15 @@ async def _increment_counter() -> int:
 # ---------------
 def _read_queues_from_disk() -> Dict[str, List[int]]:
     try:
-        if not os.path.isfile(QUEUES_FILE):
-            return {}
-        with open(QUEUES_FILE, "r") as f:
+        # Prefer new data dir path; fall back to legacy file near this module
+        path = QUEUES_FILE
+        if not os.path.isfile(path):
+            legacy = os.path.join(os.path.dirname(__file__), "queues.json")
+            if os.path.isfile(legacy):
+                path = legacy
+            else:
+                return {}
+        with open(path, "r") as f:
             raw = json.load(f)
         out: Dict[str, List[int]] = {}
         for k, v in (raw or {}).items():
@@ -538,11 +561,28 @@ def _write_queues_to_disk(state: Dict[str, List[int]]) -> None:
     try:
         tmp_path = f"{QUEUES_FILE}.tmp"
         serializable = {str(k): [int(x) for x in (v or [])] for k, v in state.items()}
+        # Write atomically and fsync to reduce data loss on crashes
         with open(tmp_path, "w") as f:
             json.dump(serializable, f)
+            try:
+                f.flush(); os.fsync(f.fileno())
+            except Exception:
+                pass
         os.replace(tmp_path, QUEUES_FILE)
-    except Exception:
-        pass
+        # Best-effort fsync the directory entry
+        try:
+            dir_fd = os.open(os.path.dirname(QUEUES_FILE) or ".", os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print("Queue write failed:", e)
+        except Exception:
+            pass
 
 async def persist_queues() -> None:
     async with QUEUES_LOCK:
@@ -751,6 +791,8 @@ async def on_ready():
             print("Queue load failed:", e)
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
+    if not getattr(bot, "_autosave_task", None):
+        bot._autosave_task = bot.loop.create_task(_autosave_loop())  # type: ignore[attr-defined]
     print(f"Ready as {bot.user}")
 
 # ---------------------------
@@ -1506,6 +1548,17 @@ async def _scheduler_loop():
             print("scheduler error:", e)
         finally:
             await asyncio.sleep(60)
+
+
+async def _autosave_loop():
+    # Periodically persist queues to reduce data loss windows
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await persist_queues()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 async def _send_reminders(data: Dict[str, object], label: str):
     guild = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
