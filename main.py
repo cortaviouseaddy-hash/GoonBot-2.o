@@ -1478,13 +1478,42 @@ async def _update_schedule_message(guild: discord.Guild, message_id: int):
     try:
         ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
         msg = await ch.fetch_message(int(message_id))
+        # If we have not yet persisted a CDN image URL, try to capture it
+        # from the existing message (either the embed's image URL if it's already
+        # a CDN, or from an image attachment on the message).
+        if not data.get("image_url"):
+            try:
+                existing_cdn: Optional[str] = None
+                # Prefer the embed image URL if it is already a CDN link
+                if msg.embeds and msg.embeds[0].image and msg.embeds[0].image.url:
+                    url = str(msg.embeds[0].image.url)
+                    if not url.startswith("attachment://"):
+                        existing_cdn = url
+                # Otherwise, fall back to an image attachment URL if present
+                if not existing_cdn:
+                    for att in (msg.attachments or []):
+                        try:
+                            ctype = (att.content_type or "").lower()
+                        except Exception:
+                            ctype = ""
+                        if ctype.startswith("image"):
+                            existing_cdn = att.url
+                            break
+                if existing_cdn:
+                    data["image_url"] = existing_cdn
+            except Exception:
+                pass
         if str(data.get("type")) == "sherpa_only":
             embed, _ = await _render_sherpa_only_embed(guild, str(data["activity"]), data)  # type: ignore
         else:
             embed, _ = await _render_event_embed(guild, str(data["activity"]), data)  # type: ignore
-        # Remove any lingering attachments to avoid duplicate image cards
+        # Only remove attachments if we have a persisted CDN image URL to use.
+        # Otherwise, preserve existing attachments so the embed image doesn't disappear.
         try:
-            await msg.edit(embed=embed, attachments=[])
+            if data.get("image_url"):
+                await msg.edit(embed=embed, attachments=[])
+            else:
+                await msg.edit(embed=embed)
         except Exception:
             await msg.edit(embed=embed)
     except Exception as e:
