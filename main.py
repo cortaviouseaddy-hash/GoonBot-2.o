@@ -626,6 +626,9 @@ def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dic
             return True
         if data and "promoter_id" in data and int(data["promoter_id"]) == uid:
             return True
+        # Allow sherpa-only host to act as promoter for permissions
+        if data and "host_id" in data and int(data["host_id"]) == uid:
+            return True
     except Exception:
         pass
     return False
@@ -1283,6 +1286,141 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
 
     await interaction.response.send_message("Specify an activity or message_id to remove the user from.", ephemeral=True)
 
+@bot.tree.command(name="cancel", description="Cancel an event: deletes its embed(s) and prevents restore")
+@app_commands.describe(message_id="(Optional) event message ID to cancel")
+async def cancel_cmd(interaction: discord.Interaction, message_id: Optional[int] = None):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    # Locate target event
+    target_mid: Optional[int] = None
+    data: Optional[Dict[str, object]] = None
+    if message_id is not None:
+        try:
+            target_mid = int(message_id)
+        except Exception:
+            target_mid = None
+        if target_mid is not None:
+            data = SCHEDULES.get(target_mid)
+
+    # Auto-detect if not provided: prefer authorized events in current channel; else latest owned
+    if data is None or target_mid is None:
+        try:
+            invoker_uid = int(interaction.user.id)
+            channel_id = int(interaction.channel.id) if interaction.channel else None  # type: ignore
+
+            if channel_id is not None:
+                channel_candidates: List[Tuple[int, Dict[str, object]]] = []
+                for mid, d in list(SCHEDULES.items()):
+                    try:
+                        ch_id = int(d.get("channel_id")) if d.get("channel_id") else None  # type: ignore
+                    except Exception:
+                        ch_id = None
+                    if ch_id == channel_id:
+                        channel_candidates.append((int(mid), d))
+
+                authorized_in_channel: List[Tuple[int, Dict[str, object]]] = []
+                for mid, d in channel_candidates:
+                    try:
+                        pid = int(d.get("promoter_id")) if d.get("promoter_id") else None  # type: ignore
+                    except Exception:
+                        pid = None
+                    if pid == invoker_uid or (FOUNDER_USER_ID and invoker_uid == int(FOUNDER_USER_ID)) or (int(d.get("host_id") or 0) == invoker_uid):
+                        authorized_in_channel.append((mid, d))
+
+                if authorized_in_channel:
+                    target_mid, data = max(authorized_in_channel, key=lambda x: x[0])
+
+            if data is None:
+                owned: List[Tuple[int, Dict[str, object]]] = []
+                for mid, d in list(SCHEDULES.items()):
+                    try:
+                        pid = int(d.get("promoter_id")) if d.get("promoter_id") else None  # type: ignore
+                    except Exception:
+                        pid = None
+                    if pid == invoker_uid or (int(d.get("host_id") or 0) == invoker_uid):
+                        owned.append((int(mid), d))
+                if owned:
+                    target_mid, data = max(owned, key=lambda x: x[0])
+        except Exception:
+            data = None
+            target_mid = None
+
+    if data is None or target_mid is None:
+        await interaction.followup.send("No event found to cancel.", ephemeral=True)
+        return
+
+    # Permission check: promoter, host (for sherpa-only), or founder
+    if not _is_promoter_or_founder(interaction, data):
+        await interaction.followup.send("Only the promoter or founder can cancel this event.", ephemeral=True)
+        return
+
+    # Mark as cancelled to prevent auto-restore
+    try:
+        data["cancelled"] = True
+    except Exception:
+        pass
+
+    # Capture all message IDs that reference this data object
+    related_mids: List[int] = []
+    try:
+        for mid, d in list(SCHEDULES.items()):
+            if d is data:
+                try:
+                    related_mids.append(int(mid))
+                except Exception:
+                    pass
+    except Exception:
+        related_mids = [int(target_mid)]
+
+    # Delete linked Sherpa signup alert if present
+    alert_mid = None
+    alert_ch = None
+    try:
+        alert_mid = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None  # type: ignore
+        alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None  # type: ignore
+    except Exception:
+        alert_mid = None
+        alert_ch = None
+    if alert_mid and alert_ch:
+        try:
+            ch = bot.get_channel(alert_ch) or await bot.fetch_channel(alert_ch)
+            if ch:
+                amsg = await ch.fetch_message(alert_mid)
+                await amsg.delete()
+        except Exception:
+            pass
+
+    # Delete main embed messages in the recorded channel
+    ch_id = None
+    try:
+        ch_id = int(data.get("channel_id")) if data.get("channel_id") else None  # type: ignore
+    except Exception:
+        ch_id = None
+    if ch_id:
+        try:
+            ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+            if ch:
+                for mid in sorted(set(related_mids)):
+                    try:
+                        m = await ch.fetch_message(int(mid))
+                        await m.delete()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Remove from schedule store so scheduler/reminders stop
+    for mid in related_mids:
+        try:
+            SCHEDULES.pop(int(mid), None)
+        except Exception:
+            pass
+
+    await interaction.followup.send("Event canceled and embeds deleted.", ephemeral=True)
+
 @bot.tree.command(name="queue", description="Post the current queues (one embed per activity, or pick a specific activity)")
 @app_commands.describe(activity="(Optional) Choose an activity to show its queue only")
 @app_commands.autocomplete(activity=_activity_autocomplete)
@@ -1680,6 +1818,12 @@ async def on_message_delete(message: discord.Message):
         data = SCHEDULES.get(message.id)
         if not data:
             return
+        # If this event was explicitly cancelled, do not auto-restore
+        try:
+            if data.get("cancelled"):
+                return
+        except Exception:
+            pass
         guild = message.guild or (bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None)  # type: ignore
         if str(data.get("type")) == "sherpa_only":
             embed, f = await _render_sherpa_only_embed(guild, str(data.get("activity", "Event")), data)
