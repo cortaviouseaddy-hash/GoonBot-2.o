@@ -507,6 +507,10 @@ COUNTER_LOCK = asyncio.Lock()
 QUEUES_FILE = os.path.join(DATA_DIR, "queues.json")
 QUEUES_LOCK = asyncio.Lock()
 
+# Persistent storage for green-check marks on queue users
+CHECKED_FILE = os.path.join(DATA_DIR, "checked.json")
+CHECKED_LOCK = asyncio.Lock()
+
 def _read_counter() -> int:
     try:
         with open(COUNT_FILE, "r") as f:
@@ -595,6 +599,69 @@ async def load_queues() -> None:
             # Merge into current to preserve references
             for k, v in loaded.items():
                 QUEUES[k] = list(v)
+
+
+# ---------------
+# Checked persistence
+# ---------------
+def _read_checked_from_disk() -> Dict[str, Set[int]]:
+    try:
+        path = CHECKED_FILE
+        if not os.path.isfile(path):
+            legacy = os.path.join(os.path.dirname(__file__), "checked.json")
+            if os.path.isfile(legacy):
+                path = legacy
+            else:
+                return {}
+        with open(path, "r") as f:
+            raw = json.load(f)
+        out: Dict[str, Set[int]] = {}
+        for k, v in (raw or {}).items():
+            try:
+                name = str(k)
+                ids = {int(x) for x in (v or [])}
+                out[name] = ids
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+def _write_checked_to_disk(state: Dict[str, Set[int]]) -> None:
+    try:
+        tmp_path = f"{CHECKED_FILE}.tmp"
+        serializable = {str(k): [int(x) for x in (v or set())] for k, v in state.items()}
+        with open(tmp_path, "w") as f:
+            json.dump(serializable, f)
+            try:
+                f.flush(); os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, CHECKED_FILE)
+        try:
+            dir_fd = os.open(os.path.dirname(CHECKED_FILE) or ".", os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print("Checked write failed:", e)
+        except Exception:
+            pass
+
+async def persist_checked() -> None:
+    async with CHECKED_LOCK:
+        _write_checked_to_disk(CHECKED)
+
+async def load_checked() -> None:
+    async with CHECKED_LOCK:
+        loaded = _read_checked_from_disk()
+        if loaded:
+            for k, v in loaded.items():
+                CHECKED[k] = set(v)
 
 
 # ---------------------------
@@ -784,14 +851,15 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print("Slash sync failed:", e)
-    # Load queues from disk once
+    # Load queues/checked from disk once
     if not getattr(bot, "_queues_loaded", False):  # type: ignore[attr-defined]
         try:
             await load_queues()
+            await load_checked()
             bot._queues_loaded = True  # type: ignore[attr-defined]
-            print("Queues loaded from disk")
+            print("Queues and checked loaded from disk")
         except Exception as e:
-            print("Queue load failed:", e)
+            print("Queue/checked load failed:", e)
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     if not getattr(bot, "_autosave_task", None):
@@ -885,8 +953,11 @@ async def _post_activity_board(activity: str, fallback_channel_id: Optional[int]
     embed = discord.Embed(title=f"Queue — {activity}", color=_activity_color(activity))
     embed.add_field(name="Signed Up", value=str(len(q)), inline=True)
     if q:
+        # If any are checked, annotate legend
+        note = "\n\n✅ = scheduled participant"
         lines = [f"<@{uid}>{' ✅' if uid in checked else ''}" for uid in q]
-        embed.add_field(name="Players (in order)", value="\n".join(lines), inline=False)
+        value = "\n".join(lines) + (note if any(uid in checked for uid in q) else "")
+        embed.add_field(name="Players (in order)", value=value, inline=False)
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
     embed, attachment = _apply_activity_image(embed, activity)
@@ -1230,7 +1301,10 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
             await interaction.response.send_message("User already in queue.", ephemeral=True)
             return
         q.append(uid)
-        await persist_queues()
+        # Auto-mark newly added users via schedule/queue as checked when added to a queue via command
+        checked = _ensure_checked(act)
+        checked.add(uid)
+        await persist_queues(); await persist_checked()
         await interaction.response.send_message(f"Added user to queue: {act}", ephemeral=True)
         await _post_activity_board(act)
         return
@@ -1277,7 +1351,14 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
         q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
-            await persist_queues()
+            # Also clear green check if present
+            try:
+                check = _ensure_checked(act)
+                if uid in check:
+                    check.discard(uid)
+            except Exception:
+                pass
+            await persist_queues(); await persist_checked()
             await interaction.response.send_message("Removed user from queue.", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -1438,6 +1519,60 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
         await _post_all_activity_boards(interaction.channel_id)
         await interaction.followup.send("Queue boards posted.", ephemeral=True)
 
+
+@bot.tree.command(name="check", description="Add a green check next to a user in a queue")
+@app_commands.describe(activity="Activity name", user="User mention or ID to mark")
+@app_commands.autocomplete(activity=_activity_autocomplete)
+async def check_cmd(interaction: discord.Interaction, activity: str, user: str):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+    act, sug = _resolve_activity(activity)
+    if not act:
+        hint = (" Try: " + ", ".join(sug)) if sug else ""
+        await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
+        return
+    ids = _parse_user_ids(user, guild)
+    if not ids:
+        await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+        return
+    uid = ids[0]
+    q = QUEUES.get(act, [])
+    if uid not in q:
+        await interaction.response.send_message("User is not in that queue.", ephemeral=True)
+        return
+    _ensure_checked(act).add(uid)
+    await persist_checked()
+    await interaction.response.send_message("Marked with green check.", ephemeral=True)
+    await _post_activity_board(act)
+
+
+@bot.tree.command(name="uncheck", description="Remove the green check next to a user in a queue")
+@app_commands.describe(activity="Activity name", user="User mention or ID to unmark")
+@app_commands.autocomplete(activity=_activity_autocomplete)
+async def uncheck_cmd(interaction: discord.Interaction, activity: str, user: str):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+    act, sug = _resolve_activity(activity)
+    if not act:
+        hint = (" Try: " + ", ".join(sug)) if sug else ""
+        await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
+        return
+    ids = _parse_user_ids(user, guild)
+    if not ids:
+        await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+        return
+    uid = ids[0]
+    check = _ensure_checked(act)
+    if uid in check:
+        check.discard(uid)
+        await persist_checked()
+    await interaction.response.send_message("Removed green check (if present).", ephemeral=True)
+    await _post_activity_board(act)
+
 @bot.tree.command(name="count", description="Increment a persistent counter and show the value")
 async def count_cmd(interaction: discord.Interaction):
     new_value = await _increment_counter()
@@ -1512,6 +1647,16 @@ class ConfirmView(discord.ui.View):
                 _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
         guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
         if guild: await _update_schedule_message(guild, self.mid)
+        # Auto-mark check for participants confirmed via DM for the activity's queue
+        try:
+            act = str(data.get("activity"))
+            if act:
+                q_list = QUEUES.get(act, [])
+                if self.uid in q_list:
+                    _ensure_checked(act).add(self.uid)
+                    await persist_checked()
+        except Exception:
+            pass
 
     @discord.ui.button(label="Can't make it", style=discord.ButtonStyle.secondary, custom_id="confirm_no")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
@@ -1738,7 +1883,7 @@ async def _autosave_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            await persist_queues()
+            await persist_queues(); await persist_checked()
         except Exception:
             pass
         await asyncio.sleep(60)
@@ -1994,6 +2139,17 @@ async def schedule_cmd(
                 uniq_participants.append(uid); seen.add(uid)
         players_final = uniq_participants[:player_slots]
         backups_final = uniq_participants[player_slots:]
+
+        # Auto-mark queue users who were placed as participants by /schedule
+        try:
+            q_list = QUEUES.get(act, [])
+            checked = _ensure_checked(act)
+            for uid in players_final:
+                if uid in q_list:
+                    checked.add(uid)
+            await persist_checked()
+        except Exception:
+            pass
 
         data = {
             "guild_id": guild.id if guild else None,
@@ -2628,6 +2784,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await _update_schedule_message(guild, int(payload.message_id)); return
         if len(participants) < player_slots:
             participants.append(payload.user_id)
+            # Auto-mark check if this user came from the activity's queue
+            try:
+                act = str(data.get("activity"))
+                if act:
+                    q_list = QUEUES.get(act, [])
+                    if payload.user_id in q_list:
+                        _ensure_checked(act).add(payload.user_id)
+                        await persist_checked()
+            except Exception:
+                pass
         else:
             backups.append(payload.user_id)
         await _update_schedule_message(guild, int(payload.message_id))
