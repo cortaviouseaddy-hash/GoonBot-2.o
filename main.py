@@ -133,6 +133,8 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 SCHEDULES: Dict[int, Dict[str, object]] = {}
 QUEUES: Dict[str, List[int]] = {}
 CHECKED: Dict[str, Set[int]] = {}
+# activity -> { user_id -> cooldown_until_epoch }
+COOLDOWNS: Dict[str, Dict[int, int]] = {}
 
 # ---------------------------
 # External Helpers (project)
@@ -511,6 +513,10 @@ QUEUES_LOCK = asyncio.Lock()
 CHECKED_FILE = os.path.join(DATA_DIR, "checked.json")
 CHECKED_LOCK = asyncio.Lock()
 
+# Persistent storage for queue cooldowns (per-activity)
+COOLDOWN_FILE = os.path.join(DATA_DIR, "cooldowns.json")
+COOLDOWNS_LOCK = asyncio.Lock()
+
 def _read_counter() -> int:
     try:
         with open(COUNT_FILE, "r") as f:
@@ -662,6 +668,77 @@ async def load_checked() -> None:
         if loaded:
             for k, v in loaded.items():
                 CHECKED[k] = set(v)
+
+
+# ---------------
+# Cooldown persistence (per-activity, user -> epoch_until)
+# ---------------
+def _read_cooldowns_from_disk() -> Dict[str, Dict[int, int]]:
+    try:
+        path = COOLDOWN_FILE
+        if not os.path.isfile(path):
+            legacy = os.path.join(os.path.dirname(__file__), "cooldowns.json")
+            if os.path.isfile(legacy):
+                path = legacy
+            else:
+                return {}
+        with open(path, "r") as f:
+            raw = json.load(f)
+        out: Dict[str, Dict[int, int]] = {}
+        for act, users in (raw or {}).items():
+            try:
+                act_name = str(act)
+                m: Dict[int, int] = {}
+                for uid_str, until in (users or {}).items():
+                    try:
+                        uid = int(uid_str)
+                        m[uid] = int(until)
+                    except Exception:
+                        continue
+                out[act_name] = m
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+def _write_cooldowns_to_disk(state: Dict[str, Dict[int, int]]) -> None:
+    try:
+        tmp_path = f"{COOLDOWN_FILE}.tmp"
+        serializable: Dict[str, Dict[str, int]] = {}
+        for act, mapping in (state or {}).items():
+            serializable[str(act)] = {str(int(uid)): int(until) for uid, until in (mapping or {}).items()}
+        with open(tmp_path, "w") as f:
+            json.dump(serializable, f)
+            try:
+                f.flush(); os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, COOLDOWN_FILE)
+        try:
+            dir_fd = os.open(os.path.dirname(COOLDOWN_FILE) or ".", os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print("Cooldown write failed:", e)
+        except Exception:
+            pass
+
+async def persist_cooldowns() -> None:
+    async with COOLDOWNS_LOCK:
+        _write_cooldowns_to_disk(COOLDOWNS)
+
+async def load_cooldowns() -> None:
+    async with COOLDOWNS_LOCK:
+        loaded = _read_cooldowns_from_disk()
+        if loaded:
+            for act, mapping in loaded.items():
+                COOLDOWNS[act] = dict(mapping)
 
 
 # ---------------------------
@@ -856,6 +933,7 @@ async def on_ready():
         try:
             await load_queues()
             await load_checked()
+            await load_cooldowns()
             bot._queues_loaded = True  # type: ignore[attr-defined]
             print("Queues and checked loaded from disk")
         except Exception as e:
@@ -989,6 +1067,20 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
         await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
         return
     uid = interaction.user.id
+    # Enforce cooldown for players who just completed this activity via /schedule
+    try:
+        now = int(datetime.utcnow().timestamp())
+        cd_map = COOLDOWNS.get(act, {})
+        until = int(cd_map.get(uid, 0) or 0)
+        if until and now < until:
+            remaining = until - now
+            hrs = max(1, int((remaining + 3599) // 3600))
+            await interaction.response.send_message(
+                f"You can rejoin the {act} queue in ~{hrs} hour(s).", ephemeral=True
+            )
+            return
+    except Exception:
+        pass
     in_any = [a for a, lst in QUEUES.items() if uid in lst]
     if act in in_any:
         await interaction.response.send_message("You're already in that queue.", ephemeral=True)
@@ -1645,6 +1737,20 @@ class ConfirmView(discord.ui.View):
             if added:
                 await interaction.response.send_message("Locked in. See you there! ✅", ephemeral=True)
                 _log_confirmation(self.mid, self.uid, "confirm", "added_players")
+                # If this confirmer came from the queue, set a 24h cooldown from event end (start + 3h)
+                if is_prioritized:
+                    try:
+                        act = str(data.get("activity"))
+                        if act:
+                            start_ts = int(data.get("start_ts") or 0)
+                            # Assume event duration ~3h; cooldown starts after event end
+                            event_end = start_ts + 3 * 60 * 60 if start_ts else int(datetime.utcnow().timestamp())
+                            until = event_end + 24 * 60 * 60
+                            m = COOLDOWNS.setdefault(act, {})
+                            m[self.uid] = max(int(m.get(self.uid, 0) or 0), int(until))
+                            await persist_cooldowns()
+                    except Exception:
+                        pass
             else:
                 await interaction.response.send_message("You're already accounted for.", ephemeral=True)
                 _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
@@ -1668,6 +1774,18 @@ class ConfirmView(discord.ui.View):
                         participants.append(self.uid)
                     await interaction.response.send_message("Locked in. Your queue priority secured a slot. ✅", ephemeral=True)
                     _log_confirmation(self.mid, self.uid, "confirm", "bumped_nonqueued")
+                    # Set 24h cooldown (from event end) since this user is now a player
+                    try:
+                        act = str(data.get("activity"))
+                        if act:
+                            start_ts = int(data.get("start_ts") or 0)
+                            event_end = start_ts + 3 * 60 * 60 if start_ts else int(datetime.utcnow().timestamp())
+                            until = event_end + 24 * 60 * 60
+                            m = COOLDOWNS.setdefault(act, {})
+                            m[self.uid] = max(int(m.get(self.uid, 0) or 0), int(until))
+                            await persist_cooldowns()
+                    except Exception:
+                        pass
                 else:
                     # No one to bump; fall back to backups
                     added, reason = _append_unique_to(data, "backups", self.uid)
@@ -1792,6 +1910,29 @@ async def _dm_promoted_users(guild: Optional[discord.Guild], moved: List[int], d
             await d.send(f"You have been pulled from Backup into the roster for **{activity}** ({when_text}).")
         except Exception:
             pass
+    # Apply 24h cooldown (from event end) for promoted players that were original queue candidates
+    try:
+        if str(data.get("type")) != "sherpa_only":
+            act = str(data.get("activity") or "")
+            cand: List[int] = data.get("candidates", []) or []  # type: ignore
+            if act:
+                start_ts = int(data.get("start_ts") or 0)
+                now = int(datetime.utcnow().timestamp())
+                event_end = start_ts + 3 * 60 * 60 if start_ts else now
+                until = event_end + 24 * 60 * 60
+                m = COOLDOWNS.setdefault(act, {})
+                changed = False
+                for uid in moved:
+                    if uid in cand:
+                        prev = int(m.get(uid, 0) or 0)
+                        new_until = max(prev, until)
+                        if new_until != prev:
+                            m[uid] = new_until
+                            changed = True
+                if changed:
+                    await persist_cooldowns()
+    except Exception:
+        pass
 
 async def _update_schedule_message(guild: discord.Guild, message_id: int):
     data = SCHEDULES.get(message_id)
@@ -1924,7 +2065,7 @@ async def _autosave_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            await persist_queues(); await persist_checked()
+            await persist_queues(); await persist_checked(); await persist_cooldowns()
         except Exception:
             pass
         await asyncio.sleep(60)
@@ -2705,6 +2846,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                     sherpas.add(member.id); data["sherpas"] = sherpas
                 else:
                     sbackup.append(member.id); data["sherpa_backup"] = sbackup
+            # Sherpas are exempt from player queue cooldowns — do not set cooldowns here
             await _update_schedule_message(guild, int(payload.message_id))
             return
 
@@ -2852,6 +2994,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                     if payload.user_id in q_list:
                         _ensure_checked(act).add(payload.user_id)
                         await persist_checked()
+                # Set a 24h cooldown only if they were in the queue when scheduled
+                if act and payload.user_id in (data.get("candidates", []) or []):
+                    start_ts = int(data.get("start_ts") or 0)
+                    event_end = start_ts + 3 * 60 * 60 if start_ts else int(datetime.utcnow().timestamp())
+                    until = event_end + 24 * 60 * 60
+                    m = COOLDOWNS.setdefault(act, {})
+                    m[payload.user_id] = max(int(m.get(payload.user_id, 0) or 0), int(until))
+                    await persist_cooldowns()
             except Exception:
                 pass
         else:
