@@ -1502,6 +1502,12 @@ async def cancel_cmd(interaction: discord.Interaction, message_id: Optional[int]
 
     await interaction.followup.send("Event canceled and embeds deleted.", ephemeral=True)
 
+@bot.tree.command(name="delete_schedule", description="Delete /schedule embed(s) (alias of /cancel)")
+@app_commands.describe(message_id="(Optional) event message ID to delete")
+async def delete_schedule_cmd(interaction: discord.Interaction, message_id: Optional[int] = None):
+    # Delegate to cancel_cmd to ensure embeds are deleted and auto-restore is bypassed
+    await cancel_cmd(interaction, message_id)
+
 @bot.tree.command(name="queue", description="Post the current queues (one embed per activity, or pick a specific activity)")
 @app_commands.describe(activity="(Optional) Choose an activity to show its queue only")
 @app_commands.autocomplete(activity=_activity_autocomplete)
