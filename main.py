@@ -1958,10 +1958,17 @@ async def _update_schedule_message(guild: discord.Guild, message_id: int):
                 if not existing_cdn:
                     for att in (msg.attachments or []):
                         try:
-                            ctype = (att.content_type or "").lower()
+                            ctype = (getattr(att, "content_type", None) or "").lower()
+                            filename = str(getattr(att, "filename", "") or "")
+                            ext = os.path.splitext(filename)[1].lower()
+                            is_image = (
+                                (ctype.startswith("image"))
+                                or bool(getattr(att, "height", None))
+                                or ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                            )
                         except Exception:
-                            ctype = ""
-                        if ctype.startswith("image"):
+                            is_image = False
+                        if is_image:
                             existing_cdn = att.url
                             break
                 if existing_cdn:
@@ -2725,6 +2732,24 @@ async def event_cmd(
 
     mid = ev_msg.id
     SCHEDULES[mid] = data
+
+    # Try to persist a CDN-hosted image URL immediately so subsequent edits don't drop the image
+    try:
+        if ev_msg.embeds and ev_msg.embeds[0].image and ev_msg.embeds[0].image.url:
+            url = str(ev_msg.embeds[0].image.url)
+            if not url.startswith("attachment://"):
+                data["image_url"] = url
+                # Re-render without attachment to avoid duplicate preview card
+                embed_cdn, _ = await _render_event_embed(guild, act, data)
+                try:
+                    await ev_msg.edit(embed=embed_cdn, attachments=[])
+                except Exception:
+                    try:
+                        await ev_msg.edit(embed=embed_cdn)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
     # LFG announcement
     try:
