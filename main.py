@@ -826,7 +826,7 @@ async def on_member_join(member: discord.Member):
                     value=(
                         "• /join — choose an activity to enter its queue (max 2)\n"
                         "• /queue — view current queues or a specific activity\n"
-                        "• /schedule — founder-only: creates the event post you can react to"
+                        "• /schedule — founder-only: creates the event post and prioritizes queued players"
                     ),
                     inline=False,
                 )
@@ -858,7 +858,7 @@ async def on_member_join(member: discord.Member):
                 "Commands:\n"
                 "• /join — choose an activity to enter its queue (max 2)\n"
                 "• /queue — view current queues or a specific activity\n"
-                "• /schedule — founder-only: creates an event post you can react to\n\n"
+                "• /schedule — founder-only: creates an event post and prioritizes queued players\n\n"
                 "What to look for:\n"
                 "• Event posts: 📝 adds you as backup; ✅ tries to join when signups open; ❌ leaves\n"
                 "• DMs for confirmations and reminders (2h/30m/start); you can reply here with questions"
@@ -1491,8 +1491,13 @@ class ConfirmView(discord.ui.View):
         if not data:
             await interaction.response.send_message("Event no longer exists.", ephemeral=True); return
         participants: List[int] = data.get("players", [])  # type: ignore
+        backups: List[int] = data.get("backups", [])  # type: ignore
         cap = int(data.get("capacity", 0)); reserved = int(data.get("reserved_sherpas", 0))
         player_slots = max(0, cap - reserved)
+        # Queue prioritization: users who were in the queue when scheduled are prioritized
+        candidates: List[int] = data.get("candidates", []) or []  # type: ignore
+        promoter_id: Optional[int] = data.get("promoter_id")  # type: ignore
+        is_prioritized = self.uid in candidates
         # Try to add to players if there is space; otherwise backups
         if len(participants) < player_slots:
             added, reason = _append_unique_to(data, "players", self.uid)
@@ -1503,13 +1508,42 @@ class ConfirmView(discord.ui.View):
                 await interaction.response.send_message("You're already accounted for.", ephemeral=True)
                 _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
         else:
-            added, reason = _append_unique_to(data, "backups", self.uid)
-            if added:
-                await interaction.response.send_message("Roster is full — added as **Backup**.", ephemeral=True)
-                _log_confirmation(self.mid, self.uid, "confirm", "added_backups")
+            # If roster is full but the confirmer is prioritized (queued), try to bump a non-queued participant
+            if is_prioritized:
+                # Find a participant who is NOT in the queued candidate list and is not the promoter
+                bumpable_indices: List[int] = [
+                    idx for idx, uid in enumerate(list(participants))
+                    if uid not in candidates and (promoter_id is None or uid != int(promoter_id)) and uid != self.uid
+                ]
+                if bumpable_indices:
+                    # Prefer bumping the last bumpable to minimize disruption of earlier ordering
+                    bump_idx = bumpable_indices[-1]
+                    bumped_uid = participants.pop(bump_idx)
+                    # Place bumped user into backups if not already there
+                    if bumped_uid not in backups:
+                        backups.append(bumped_uid)
+                    # Add the prioritized confirmer into players
+                    if self.uid not in participants:
+                        participants.append(self.uid)
+                    await interaction.response.send_message("Locked in. Your queue priority secured a slot. ✅", ephemeral=True)
+                    _log_confirmation(self.mid, self.uid, "confirm", "bumped_nonqueued")
+                else:
+                    # No one to bump; fall back to backups
+                    added, reason = _append_unique_to(data, "backups", self.uid)
+                    if added:
+                        await interaction.response.send_message("Roster is full — added as **Backup**.", ephemeral=True)
+                        _log_confirmation(self.mid, self.uid, "confirm", "added_backups")
+                    else:
+                        await interaction.response.send_message("You're already accounted for.", ephemeral=True)
+                        _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
             else:
-                await interaction.response.send_message("You're already accounted for.", ephemeral=True)
-                _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
+                added, reason = _append_unique_to(data, "backups", self.uid)
+                if added:
+                    await interaction.response.send_message("Roster is full — added as **Backup**.", ephemeral=True)
+                    _log_confirmation(self.mid, self.uid, "confirm", "added_backups")
+                else:
+                    await interaction.response.send_message("You're already accounted for.", ephemeral=True)
+                    _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
         guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
         if guild: await _update_schedule_message(guild, self.mid)
 
@@ -1992,6 +2026,20 @@ async def schedule_cmd(
                 continue
             if uid not in seen:
                 uniq_participants.append(uid); seen.add(uid)
+        # Reorder to prioritize queued users for participant slots while keeping promoter first
+        try:
+            queue_set = set(candidates)
+        except Exception:
+            queue_set = set()
+        if promoter_id in uniq_participants:
+            rest = [u for u in uniq_participants if u != promoter_id]
+            prioritized = [promoter_id]
+        else:
+            rest = list(uniq_participants)
+            prioritized = []
+        prioritized.extend([u for u in rest if u in queue_set])
+        prioritized.extend([u for u in rest if u not in queue_set])
+        uniq_participants = prioritized
         players_final = uniq_participants[:player_slots]
         backups_final = uniq_participants[player_slots:]
 
