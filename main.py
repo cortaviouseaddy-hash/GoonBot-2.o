@@ -1403,16 +1403,16 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
 
     await interaction.response.send_message("Specify an activity or message_id to add the user to.", ephemeral=True)
 
-@bot.tree.command(name="remove", description="Remove a user from a queue or event (founder only)")
+@bot.tree.command(name="remove", description="Remove user(s) from a queue or event (founder only)")
 @founder_only()
-@app_commands.describe(activity="(Optional) activity to remove from", message_id="(Optional) event message ID", user="User mention or ID to remove")
+@app_commands.describe(activity="(Optional) activity to remove from", message_id="(Optional) event message ID", user="User mention(s) or ID(s) to remove (space/comma-separated)")
 async def remove_cmd(interaction: discord.Interaction, user: str, activity: Optional[str] = None, message_id: Optional[int] = None):
     guild = interaction.guild
     uid_list = _parse_user_ids(user, guild) if guild else []
     if not uid_list:
-        await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+        await interaction.response.send_message("Couldn't resolve any users.", ephemeral=True)
         return
-    uid = uid_list[0]
+    uid_set = set(uid_list)
     if message_id:
         data = SCHEDULES.get(message_id)
         if not data:
@@ -1423,16 +1423,21 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
             return
         participants: List[int] = data.get("players", [])  # type: ignore
         backups: List[int] = data.get("backups", [])  # type: ignore
-        removed = False
-        if uid in participants:
-            participants[:] = [x for x in participants if x != uid]
-            _autofill_from_backups(data); removed = True
-        if uid in backups:
-            backups[:] = [x for x in backups if x != uid]
-            removed = True
-        if removed and guild:
+        prev_players = len(participants)
+        prev_backups = len(backups)
+        # Remove from event lists
+        participants[:] = [x for x in participants if x not in uid_set]
+        backups[:] = [x for x in backups if x not in uid_set]
+        removed_any = (len(participants) < prev_players) or (len(backups) < prev_backups)
+        # Autofill if players were removed
+        if len(participants) < prev_players:
+            _autofill_from_backups(data)
+        if removed_any and guild:
             await _update_schedule_message(guild, message_id)  # type: ignore
-        await interaction.response.send_message("Removed user from event." if removed else "User not in that event.", ephemeral=True)
+        await interaction.response.send_message(
+            "Removed selected user(s) from event." if removed_any else "None of the specified users are in that event.",
+            ephemeral=True,
+        )
         return
 
     if activity:
@@ -1441,23 +1446,28 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
             await interaction.response.send_message("Unknown activity.", ephemeral=True)
             return
         q = QUEUES.get(act, [])
-        if uid in q:
-            q[:] = [x for x in q if x != uid]
-            # Also clear green check if present
-            try:
-                check = _ensure_checked(act)
+        before = len(q)
+        if before:
+            q[:] = [x for x in q if x not in uid_set]
+        after = len(q)
+        removed_any = after < before
+        # Also clear green checks if present
+        try:
+            check = _ensure_checked(act)
+            for uid in uid_set:
                 if uid in check:
                     check.discard(uid)
-            except Exception:
-                pass
+        except Exception:
+            pass
+        if removed_any:
             await persist_queues(); await persist_checked()
-            await interaction.response.send_message("Removed user from queue.", ephemeral=True)
+            await interaction.response.send_message("Removed selected user(s) from queue.", ephemeral=True)
             await _post_activity_board(act)
             return
-        await interaction.response.send_message("User not in that queue.", ephemeral=True)
+        await interaction.response.send_message("None of the specified users are in that queue.", ephemeral=True)
         return
 
-    await interaction.response.send_message("Specify an activity or message_id to remove the user from.", ephemeral=True)
+    await interaction.response.send_message("Specify an activity or message_id to remove users from.", ephemeral=True)
 
 @bot.tree.command(name="cancel", description="Cancel an event: deletes its embed(s) and prevents restore")
 @app_commands.describe(message_id="(Optional) event message ID to cancel")
