@@ -197,9 +197,39 @@ def _ensure_checked(activity: str) -> Set[int]:
     return CHECKED.setdefault(activity, set())
 
 def _cap_for_activity(activity: str) -> int:
-    a = (activity or "").lower()
-    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation")): return 6
-    if any(k in a for k in ("dungeon", "pit", "crypt", "deep", "spire")): return 3
+    """Return player capacity based on presets, with sensible fallbacks.
+
+    Guarantees:
+    - Activities listed under `raids` in presets have capacity 6
+    - Activities listed under `dungeons` in presets have capacity 3
+    """
+    act = activity or ""
+
+    # Primary: exact membership in presets
+    try:
+        if act in (PRESETS.get("raids") or []):
+            return 6
+        if act in (PRESETS.get("dungeons") or []):
+            return 3
+
+        # Secondary: normalized text match (strip emojis/symbols/case)
+        norm = _normalize_activity_text(act)
+        raid_norms = {_normalize_activity_text(a) for a in (PRESETS.get("raids") or [])}
+        dungeon_norms = {_normalize_activity_text(a) for a in (PRESETS.get("dungeons") or [])}
+        if norm in raid_norms:
+            return 6
+        if norm in dungeon_norms:
+            return 3
+    except Exception:
+        # If presets are missing or malformed, fall through to heuristics
+        pass
+
+    # Heuristic fallback by keywords (kept broad, errs toward raid=6)
+    a = act.lower()
+    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare", "edge", "desert")):
+        return 6
+    if any(k in a for k in ("dungeon", "pit", "spire", "deep", "watcher", "throne", "prophecy", "grasp", "duality", "ghost", "warlord", "ruin", "sunder", "doctrine", "vesper", "host", "avarice")):
+        return 3
     return 6
 
 def _is_sherpa(member: discord.Member) -> bool:
@@ -796,7 +826,6 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
 
     if not is_user_event:
         embed.add_field(name="When", value=when or "TBD", inline=False)
-        embed.add_field(name="Capacity", value=str(cap), inline=True)
 
     promoter_id = data.get("promoter_id")
     if promoter_id:
@@ -822,6 +851,16 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
     players: List[int] = data.get("players", []) or []  # type: ignore
     backups: List[int] = data.get("backups", []) or []  # type: ignore
 
+    # Display team occupancy counting Players + Sherpas + (Host if not listed)
+    if not is_user_event:
+        promoter_id = int(data.get("promoter_id")) if data.get("promoter_id") else None  # type: ignore
+        players_set = set(int(p) for p in players)
+        sherpas_set = set(int(s) for s in sherpas)
+        team_count = len(players_set) + len(sherpas_set)
+        if promoter_id is not None and promoter_id not in players_set and promoter_id not in sherpas_set:
+            team_count += 1
+        embed.add_field(name="Capacity", value=f"{team_count}/{cap}", inline=True)
+
     if not is_user_event:
         if sherpas:
             embed.add_field(name="Sherpas", value=", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10]), inline=False)
@@ -833,7 +872,12 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
             lines = [f"{i+1}. <@{uid}>" for i, uid in enumerate(players)]
             embed.add_field(name=f"Participants ({len(players)}/{cap})", value="\n".join(lines), inline=False)
         else:
-            embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
+            # Count Sherpas and Host toward Players total, but list only Players here
+            promoter_id = int(data.get("promoter_id")) if data.get("promoter_id") else None  # type: ignore
+            effective_total = len(players) + len(sherpas)
+            if promoter_id is not None and promoter_id not in players_set and promoter_id not in sherpas_set:
+                effective_total += 1
+            embed.add_field(name=f"Players ({effective_total})", value="\n".join(f"<@{p}>" for p in players), inline=False)
     if backups:
         if is_user_event:
             embed.add_field(name=f"Backup ({len(backups)})", value="\n".join(f"– <@{b}>" for b in backups), inline=False)
