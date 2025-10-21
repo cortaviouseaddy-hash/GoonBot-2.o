@@ -197,9 +197,39 @@ def _ensure_checked(activity: str) -> Set[int]:
     return CHECKED.setdefault(activity, set())
 
 def _cap_for_activity(activity: str) -> int:
-    a = (activity or "").lower()
-    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation")): return 6
-    if any(k in a for k in ("dungeon", "pit", "crypt", "deep", "spire")): return 3
+    """Return player capacity based on presets, with sensible fallbacks.
+
+    Guarantees:
+    - Activities listed under `raids` in presets have capacity 6
+    - Activities listed under `dungeons` in presets have capacity 3
+    """
+    act = activity or ""
+
+    # Primary: exact membership in presets
+    try:
+        if act in (PRESETS.get("raids") or []):
+            return 6
+        if act in (PRESETS.get("dungeons") or []):
+            return 3
+
+        # Secondary: normalized text match (strip emojis/symbols/case)
+        norm = _normalize_activity_text(act)
+        raid_norms = {_normalize_activity_text(a) for a in (PRESETS.get("raids") or [])}
+        dungeon_norms = {_normalize_activity_text(a) for a in (PRESETS.get("dungeons") or [])}
+        if norm in raid_norms:
+            return 6
+        if norm in dungeon_norms:
+            return 3
+    except Exception:
+        # If presets are missing or malformed, fall through to heuristics
+        pass
+
+    # Heuristic fallback by keywords (kept broad, errs toward raid=6)
+    a = act.lower()
+    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare", "edge", "desert")):
+        return 6
+    if any(k in a for k in ("dungeon", "pit", "spire", "deep", "watcher", "throne", "prophecy", "grasp", "duality", "ghost", "warlord", "ruin", "sunder", "doctrine", "vesper", "host", "avarice")):
+        return 3
     return 6
 
 def _is_sherpa(member: discord.Member) -> bool:
