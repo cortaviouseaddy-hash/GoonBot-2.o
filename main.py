@@ -2363,7 +2363,14 @@ async def schedule_cmd(
             await interaction.followup.send("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True); return
 
         start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
-        when_text = f"<t:{start_ts}:F> ({timezone})" if start_ts else "TBD"
+        # If time parsing fails, cancel scheduling rather than posting with TBD
+        if not start_ts:
+            await interaction.followup.send(
+                "Could not parse the date/time. Scheduling canceled. Use MM-DD HH:MM (24h).",
+                ephemeral=True,
+            )
+            return
+        when_text = f"<t:{start_ts}:F> ({timezone})"
 
         guild = interaction.guild
         sherpa_ids = set(_parse_user_ids(sherpas or "", guild)) if sherpas else set()
