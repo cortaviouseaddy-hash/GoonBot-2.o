@@ -2121,6 +2121,22 @@ async def _scheduler_loop():
                         await _send_reminders(data, label)
                         data[key] = True
 
+                # While signups are open, continuously pull from backups into any open player slots
+                # until the event starts. This ensures that users who react with 📝 (backup)
+                # during the open window are promoted automatically when space exists.
+                try:
+                    if str(data.get("type")) != "sherpa_only" and data.get("signups_open") and now < start_ts:
+                        participants: List[int] = data.get("players", [])  # type: ignore
+                        if len(participants) < player_slots:
+                            moved = _autofill_from_backups(data)
+                            if moved:
+                                guild3 = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+                                await _dm_promoted_users(guild3, moved, data)
+                                if guild3:
+                                    await _update_schedule_message(guild3, int(mid))
+                except Exception:
+                    pass
+
         except Exception as e:
             print("scheduler error:", e)
         finally:
