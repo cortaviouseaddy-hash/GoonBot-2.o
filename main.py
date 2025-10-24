@@ -2069,6 +2069,9 @@ async def _scheduler_loop():
                         moved = _autofill_from_backups(data)
                         guild = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
                         await _dm_promoted_users(guild, moved, data)
+                        if guild:
+                            # Reflect any promotions on the event embed immediately
+                            await _update_schedule_message(guild, int(mid))
                     except Exception:
                         pass
                     # Add ✅, 📝, ❌ to main event post
@@ -2088,6 +2091,9 @@ async def _scheduler_loop():
                             moved = _autofill_from_backups(data)
                             guild2 = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
                             await _dm_promoted_users(guild2, moved, data)
+                            if guild2:
+                                # Update embed to show latest roster after any promotions
+                                await _update_schedule_message(guild2, int(mid))
                         except Exception:
                             pass
                         event_link = None
