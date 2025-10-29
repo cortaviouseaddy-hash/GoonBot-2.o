@@ -1451,6 +1451,7 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
 @bot.tree.command(name="remove", description="Remove user(s) from a queue or event (founder only)")
 @founder_only()
 @app_commands.describe(activity="(Optional) activity to remove from", message_id="(Optional) event message ID", user="User mention(s) or ID(s) to remove (space/comma-separated)")
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def remove_cmd(interaction: discord.Interaction, user: str, activity: Optional[str] = None, message_id: Optional[int] = None):
     guild = interaction.guild
     uid_list = _parse_user_ids(user, guild) if guild else []
