@@ -1141,6 +1141,11 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
 @app_commands.describe(activity="(Optional) activity name to leave", message_id="(Optional) event message ID to leave")
 @app_commands.autocomplete(activity=_activity_autocomplete)
 async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = None, message_id: Optional[int] = None):
+    # Refresh queues from disk to ensure we use the latest queue file state
+    try:
+        await load_queues()
+    except Exception:
+        pass
     uid = interaction.user.id
     changed = False
     if message_id:
