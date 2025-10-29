@@ -11,6 +11,7 @@
 import os
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta
 import datetime as datetime_module
 from typing import Dict, List, Optional, Set, Tuple
@@ -1755,6 +1756,11 @@ async def delete_schedule_cmd(interaction: discord.Interaction, message_id: Opti
 @app_commands.autocomplete(activity=_activity_autocomplete)
 async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = None):
     await interaction.response.defer(ephemeral=True)
+    # Ensure the most recent on-disk state is used, especially with multiple instances
+    try:
+        await load_queues()
+    except Exception:
+        pass
     if activity:
         act, sug = _resolve_activity(activity)
         if not act:
@@ -1776,6 +1782,11 @@ async def check_cmd(interaction: discord.Interaction, activity: str, user: str):
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
+    # Refresh queues to avoid stale membership checks
+    try:
+        await load_queues()
+    except Exception:
+        pass
     act, sug = _resolve_activity(activity)
     if not act:
         hint = (" Try: " + ", ".join(sug)) if sug else ""
@@ -1804,6 +1815,11 @@ async def uncheck_cmd(interaction: discord.Interaction, activity: str, user: str
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
         return
+    # Refresh queues to avoid stale membership checks
+    try:
+        await load_queues()
+    except Exception:
+        pass
     act, sug = _resolve_activity(activity)
     if not act:
         hint = (" Try: " + ", ".join(sug)) if sug else ""
@@ -1840,23 +1856,126 @@ async def ping_cmd(interaction: discord.Interaction):
 # ---------------------------
 
 def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
+    """Parse a free-form list of users into user IDs.
+
+    Supports:
+    - Mentions like <@123> or <@!123>
+    - Raw numeric IDs
+    - Quoted names with spaces ("First Last")
+    - Comma/semicolon separated names
+    - Unique exact/partial matches on display_name/global_name/username (case-insensitive)
+    """
     if not text or not guild:
         return []
-    parts = [p.strip() for p in text.replace(",", " ").split() if p.strip()]
-    out: List[int] = []
-    for p in parts:
-        if p.isdigit():
-            out.append(int(p)); continue
-        if p.startswith("<@") and p.endswith(">"):
-            num = "".join(ch for ch in p if ch.isdigit())
-            if num: out.append(int(num)); continue
-        m = discord.utils.find(lambda m: m.display_name.lower() == p.lower() or m.name.lower() == p.lower(), guild.members)
-        if m: out.append(m.id)
-    seen = set(); uniq: List[int] = []
-    for uid in out:
+
+    resolved_ids: List[int] = []
+
+    # 1) Direct mentions
+    for m in re.findall(r"<@!?([0-9]{5,25})>", text):
+        try:
+            resolved_ids.append(int(m))
+        except Exception:
+            pass
+
+    # 2) Bare numeric IDs
+    for m in re.findall(r"(?<![<@!#])\b([0-9]{15,25})\b", text):
+        try:
+            uid = int(m)
+            if uid not in resolved_ids:
+                resolved_ids.append(uid)
+        except Exception:
+            pass
+
+    # Helper normalization for names
+    def _norm(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        base = " ".join(str(s).strip().lower().split())
+        return base
+
+    # Build lightweight member snapshots once
+    members: List[Tuple[int, str, str, str]] = []  # (id, display_name, global_name, username)
+    try:
+        for mem in list(guild.members or []):
+            dn = getattr(mem, "display_name", "") or ""
+            gn = getattr(mem, "global_name", "") or ""
+            un = getattr(mem, "name", "") or ""
+            members.append((int(mem.id), _norm(dn), _norm(gn), _norm(un)))
+    except Exception:
+        members = []
+
+    # 3) Extract quoted names to preserve spaces
+    remaining = text
+    for quoted in re.findall(r"\"([^\"\n]+)\"|'([^'\n]+)'", text):
+        # regex returns tuples; pick the first non-empty capture
+        name = next((p for p in quoted if p), None)
+        if not name:
+            continue
+        key = _norm(name)
+        matches_exact = [mid for (mid, dn, gn, un) in members if key in (dn, gn, un)]
+        if len(matches_exact) == 1:
+            if matches_exact[0] not in resolved_ids:
+                resolved_ids.append(matches_exact[0])
+        else:
+            # Unique partial
+            matches_partial = [mid for (mid, dn, gn, un) in members if key and (key in dn or key in gn or key in un)]
+            if len(matches_partial) == 1 and matches_partial[0] not in resolved_ids:
+                resolved_ids.append(matches_partial[0])
+        # Remove this quoted chunk from remaining to avoid double-processing
+        try:
+            remaining = remaining.replace(f'"{name}"', ' ')
+            remaining = remaining.replace(f"'{name}'", ' ')
+        except Exception:
+            pass
+
+    # 4) Split the rest by commas/semicolons/newlines; keep internal spaces (already removed quotes)
+    chunks = [c.strip() for c in re.split(r"[\n;,]+", remaining) if c.strip()]
+    # Further break chunks that are only whitespace-separated lists of mentions/ids/names
+    tokens: List[str] = []
+    for c in chunks:
+        # If it contains a mention, keep it as a whole token so it matches the regex above
+        if re.search(r"<@!?[0-9]{5,25}>", c):
+            tokens.append(c)
+        else:
+            tokens.extend([t for t in c.split() if t])
+
+    # Try to resolve tokens that weren't captured already
+    for tok in tokens:
+        # Skip if already parsed via mention/ID
+        if re.fullmatch(r"<@!?[0-9]{5,25}>", tok):
+            continue
+        if tok.isdigit():
+            try:
+                uid = int(tok)
+                if uid not in resolved_ids:
+                    resolved_ids.append(uid)
+            except Exception:
+                pass
+            continue
+        # Normalize token, strip leading @ and surrounding punctuation
+        key = _norm(re.sub(r"^[^A-Za-z0-9@]+|[^A-Za-z0-9]+$", "", tok.lstrip("@")))
+        if not key:
+            continue
+        # Exact match across known names
+        matches_exact = [mid for (mid, dn, gn, un) in members if key in (dn, gn, un)]
+        if len(matches_exact) == 1:
+            if matches_exact[0] not in resolved_ids:
+                resolved_ids.append(matches_exact[0])
+            continue
+        # Unique partial match
+        matches_partial = [mid for (mid, dn, gn, un) in members if key and (key in dn or key in gn or key in un)]
+        if len(matches_partial) == 1:
+            if matches_partial[0] not in resolved_ids:
+                resolved_ids.append(matches_partial[0])
+
+    # Deduplicate preserving order
+    seen: Set[int] = set()
+    unique_ids: List[int] = []
+    for uid in resolved_ids:
         if uid not in seen:
-            uniq.append(uid); seen.add(uid)
-    return uniq
+            unique_ids.append(uid)
+            seen.add(uid)
+    return unique_ids
 
 # ---------------------------
 # DM Confirm Views
