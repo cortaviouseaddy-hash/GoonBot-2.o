@@ -1509,6 +1509,11 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
 @app_commands.describe(activity="(Optional) activity to remove from", message_id="(Optional) event message ID", user="User mention(s) or ID(s) to remove (space/comma-separated)")
 @app_commands.autocomplete(activity=_activity_autocomplete)
 async def remove_cmd(interaction: discord.Interaction, user: str, activity: Optional[str] = None, message_id: Optional[int] = None):
+    # Ensure we are operating on the latest queue state (important with multiple bot instances)
+    try:
+        await load_queues()
+    except Exception:
+        pass
     guild = interaction.guild
     uid_list = _parse_user_ids(user, guild) if guild else []
     if not uid_list:
