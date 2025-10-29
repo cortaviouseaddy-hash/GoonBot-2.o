@@ -1139,6 +1139,7 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
 
 @bot.tree.command(name="leave", description="Leave an activity queue or an event by message ID")
 @app_commands.describe(activity="(Optional) activity name to leave", message_id="(Optional) event message ID to leave")
+@app_commands.autocomplete(activity=_activity_autocomplete)
 async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = None, message_id: Optional[int] = None):
     uid = interaction.user.id
     changed = False
