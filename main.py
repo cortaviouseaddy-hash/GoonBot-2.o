@@ -1178,6 +1178,57 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
             await _post_activity_board(act)
             return
         else:
+            # Fallback: user is not in the queue; try to leave an active event for this activity
+            try:
+                candidates: List[Tuple[int, Dict[str, object]]] = []
+                for mid, d in list(SCHEDULES.items()):
+                    try:
+                        if str(d.get("activity") or "") != str(act):
+                            continue
+                        players: List[int] = d.get("players", [])  # type: ignore
+                        backups: List[int] = d.get("backups", [])  # type: ignore
+                        if uid in players or uid in backups:
+                            candidates.append((int(mid), d))
+                    except Exception:
+                        continue
+                target: Optional[Tuple[int, Dict[str, object]]] = None
+                if candidates:
+                    # Prefer an event in the current channel; otherwise pick the most recent
+                    try:
+                        ch_id = int(interaction.channel.id) if interaction.channel else None  # type: ignore
+                    except Exception:
+                        ch_id = None
+                    channel_matches: List[Tuple[int, Dict[str, object]]] = []
+                    for mid, d in candidates:
+                        try:
+                            ev_ch = int(d.get("channel_id")) if d.get("channel_id") else None  # type: ignore
+                        except Exception:
+                            ev_ch = None
+                        if ch_id and ev_ch == ch_id:
+                            channel_matches.append((mid, d))
+                    target = max(channel_matches or candidates, key=lambda x: x[0])
+                if target:
+                    t_mid, t_data = target
+                    participants: List[int] = t_data.get("players", [])  # type: ignore
+                    backups: List[int] = t_data.get("backups", [])  # type: ignore
+                    did_change = False
+                    if uid in participants:
+                        participants[:] = [x for x in participants if x != uid]
+                        moved = _autofill_from_backups(t_data)
+                        did_change = True
+                        guild = interaction.client.get_guild(int(t_data.get("guild_id"))) if t_data.get("guild_id") else None  # type: ignore
+                        await _dm_promoted_users(guild, moved, t_data)
+                    if uid in backups:
+                        backups[:] = [x for x in backups if x != uid]
+                        did_change = True
+                    if did_change:
+                        guild = interaction.client.get_guild(int(t_data.get("guild_id"))) if t_data.get("guild_id") else None  # type: ignore
+                        if guild:
+                            await _update_schedule_message(guild, int(t_mid))
+                        await interaction.response.send_message(f"Left the event: {act}", ephemeral=True)
+                        return
+            except Exception:
+                pass
             await interaction.response.send_message("You are not in that queue.", ephemeral=True)
             return
     await interaction.response.send_message("Specify an activity or a message_id to leave.", ephemeral=True)
