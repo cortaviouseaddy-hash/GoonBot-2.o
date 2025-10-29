@@ -1574,7 +1574,40 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
         await interaction.response.send_message("None of the specified users are in that queue.", ephemeral=True)
         return
 
-    await interaction.response.send_message("Specify an activity or message_id to remove users from.", ephemeral=True)
+    # No specific activity or message provided — remove the user(s) from ALL activity queues
+    changed_acts: List[str] = []
+    try:
+        for act in list(QUEUES.keys()):
+            q = QUEUES.get(act, [])
+            if not q:
+                continue
+            before_len = len(q)
+            # Remove any matching user IDs from this activity's queue
+            q[:] = [x for x in q if x not in uid_set]
+            if len(q) < before_len:
+                changed_acts.append(act)
+                # Also clear green-check marks for removed users in this activity
+                try:
+                    chk = _ensure_checked(act)
+                    for uid in uid_set:
+                        if uid in chk:
+                            chk.discard(uid)
+                except Exception:
+                    pass
+    except Exception:
+        changed_acts = []
+
+    if changed_acts:
+        await persist_queues(); await persist_checked()
+        await interaction.response.send_message(
+            f"Removed selected user(s) from queues: {', '.join(changed_acts)}.", ephemeral=True
+        )
+        # Update activity boards for all modified activities
+        for act in changed_acts:
+            await _post_activity_board(act)
+        return
+
+    await interaction.response.send_message("None of the specified users are in any queues.", ephemeral=True)
 
 @bot.tree.command(name="cancel", description="Cancel an event: deletes its embed(s) and prevents restore")
 @app_commands.describe(message_id="(Optional) event message ID to cancel")
