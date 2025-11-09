@@ -873,12 +873,9 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
             lines = [f"{i+1}. <@{uid}>" for i, uid in enumerate(players)]
             embed.add_field(name=f"Participants ({len(players)}/{cap})", value="\n".join(lines), inline=False)
         else:
-            # Count Sherpas and Host toward Players total, but list only Players here
-            promoter_id = int(data.get("promoter_id")) if data.get("promoter_id") else None  # type: ignore
-            effective_total = len(players) + len(sherpas)
-            if promoter_id is not None and promoter_id not in players_set and promoter_id not in sherpas_set:
-                effective_total += 1
-            embed.add_field(name=f"Players ({effective_total})", value="\n".join(f"<@{p}>" for p in players), inline=False)
+            # Show only the number of listed Players here to avoid confusion.
+            # Overall occupancy (Players + Sherpas + Host-if-not-listed) is shown in the Capacity field above.
+            embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
     if backups:
         if is_user_event:
             embed.add_field(name=f"Backup ({len(backups)})", value="\n".join(f"– <@{b}>" for b in backups), inline=False)
