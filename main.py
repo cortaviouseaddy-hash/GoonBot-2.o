@@ -1997,6 +1997,8 @@ class ConfirmView(discord.ui.View):
         candidates: List[int] = data.get("candidates", []) or []  # type: ignore
         promoter_id: Optional[int] = data.get("promoter_id")  # type: ignore
         is_prioritized = self.uid in candidates
+        # Players that were pre-slotted at schedule time cannot be bumped
+        locked_players: Set[int] = set(data.get("locked_players") or [])  # type: ignore
         # Try to add to players if there is space; otherwise backups
         if len(participants) < player_slots:
             added, reason = _append_unique_to(data, "players", self.uid)
@@ -2026,7 +2028,7 @@ class ConfirmView(discord.ui.View):
                 # Find a participant who is NOT in the queued candidate list and is not the promoter
                 bumpable_indices: List[int] = [
                     idx for idx, uid in enumerate(list(participants))
-                    if uid not in candidates and (promoter_id is None or uid != int(promoter_id)) and uid != self.uid
+                    if uid not in candidates and (promoter_id is None or uid != int(promoter_id)) and uid != self.uid and uid not in locked_players
                 ]
                 if bumpable_indices:
                     # Prefer bumping the last bumpable to minimize disruption of earlier ordering
@@ -2640,6 +2642,8 @@ async def schedule_cmd(
             "sherpa_backup": set(),
             "candidates": candidates,
             "players": players_final,
+            # Players pre-slotted at creation time are protected from queue bumping
+            "locked_players": set(players_final),
             "backups": backups_final,
             "promoter_id": promoter_id,
             "signups_open": False,
