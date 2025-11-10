@@ -3311,22 +3311,26 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         await _update_schedule_message(guild, int(payload.message_id))
         return
 
-    # ❌ on main event message → leave players/backups
+    # ❌ on main event message → prompt manual removal instead of auto-removing
     if str(payload.emoji) == "❌":
         data = SCHEDULES.get(payload.message_id)
-        if not data: return
+        if not data:
+            return
+        # Sherpa-only events are handled by the block above; this branch is for standard events.
+        if str(data.get("type")) == "sherpa_only":
+            return
         guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-        if not guild: return
-        participants: List[int] = data.get("players", [])  # type: ignore
-        backups: List[int] = data.get("backups", [])  # type: ignore
-        removed = False
-        if payload.user_id in participants:
-            participants[:] = [x for x in participants if x != payload.user_id]; removed = True
-            moved = _autofill_from_backups(data)
-            await _dm_promoted_users(guild, moved, data)
-        if payload.user_id in backups:
-            backups[:] = [x for x in backups if x != payload.user_id]; removed = True
-        if removed: await _update_schedule_message(guild, int(payload.message_id))
+        if guild:
+            member = guild.get_member(payload.user_id)
+            if member:
+                try:
+                    dm = await member.create_dm()
+                    await dm.send(
+                        "Queue spots are managed by the event staff. "
+                        "Please contact the promoter or use the /leave command if you need to step out."
+                    )
+                except Exception:
+                    pass
         return
 
 @bot.event
@@ -3371,18 +3375,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
                 return
 
     if str(payload.emoji) == "✅":
-        if data.get("signups_open"):
-            participants: List[int] = data.get("players", [])  # type: ignore
-            if payload.user_id in participants:
-                participants[:] = [x for x in participants if x != payload.user_id]
-                moved = _autofill_from_backups(data)
-                await _dm_promoted_users(guild, moved, data)
-                await _update_schedule_message(guild, int(payload.message_id))
-        else:
-            backups: List[int] = data.get("backups", [])  # type: ignore
-            if payload.user_id in backups:
-                backups[:] = [x for x in backups if x != payload.user_id]
-                await _update_schedule_message(guild, int(payload.message_id))
+        # Manual oversight: do not auto-remove members when ✅ is removed on standard events.
         return
 
 # ---------------------------
