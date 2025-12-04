@@ -56,6 +56,7 @@ SHERPA_ASSISTANT_ROLE_ID      = _env_int("SHERPA_ASSISTANT_ROLE_ID")
 SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
 EVENT_HOST_AUTOJOIN           = _env_bool("EVENT_HOST_AUTOJOIN", True)
+BUILD_OF_THE_WEEK_CHANNEL_ID  = _env_int("BUILD_OF_THE_WEEK_CHANNEL_ID")  # Build submissions channel
 
 # Optional local overrides via channel_ids.json (non-secret, deploy-time config)
 def _load_channel_overrides() -> None:
@@ -70,7 +71,7 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID, BUILD_OF_THE_WEEK_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
@@ -78,6 +79,7 @@ def _load_channel_overrides() -> None:
         rq = _to_int(data.get("RAID_QUEUE_CHANNEL_ID"))
         ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
         wc = _to_int(data.get("WELCOME_CHANNEL_ID"))
+        bw = _to_int(data.get("BUILD_OF_THE_WEEK_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
@@ -92,6 +94,8 @@ def _load_channel_overrides() -> None:
             EVENT_SIGNUP_CHANNEL_ID = ev
         if wc and not WELCOME_CHANNEL_ID:
             WELCOME_CHANNEL_ID = wc
+        if bw and not BUILD_OF_THE_WEEK_CHANNEL_ID:
+            BUILD_OF_THE_WEEK_CHANNEL_ID = bw
     except Exception:
         pass
 
@@ -772,6 +776,123 @@ async def load_cooldowns() -> None:
                 COOLDOWNS[act] = dict(mapping)
 
 
+# ---------------
+# Build of the Week persistence
+# ---------------
+BUILDS_FILE = os.path.join(DATA_DIR, "builds.json")
+BUILDS_LOCK = asyncio.Lock()
+
+# In-memory cache for builds data
+BUILDS_DATA: Dict[str, object] = {"builds": [], "winners": [], "current_week_start": None}
+
+def _get_current_week_start() -> str:
+    """Return the Monday of the current week as YYYY-MM-DD string."""
+    today = datetime.now()
+    days_since_monday = today.weekday()  # Monday=0
+    monday = today - timedelta(days=days_since_monday)
+    return monday.strftime("%Y-%m-%d")
+
+def _read_builds_from_disk() -> Dict[str, object]:
+    try:
+        if not os.path.isfile(BUILDS_FILE):
+            return {"builds": [], "winners": [], "current_week_start": None}
+        with open(BUILDS_FILE, "r") as f:
+            data = json.load(f)
+        # Ensure required keys exist
+        if "builds" not in data:
+            data["builds"] = []
+        if "winners" not in data:
+            data["winners"] = []
+        if "current_week_start" not in data:
+            data["current_week_start"] = None
+        return data
+    except Exception:
+        return {"builds": [], "winners": [], "current_week_start": None}
+
+def _write_builds_to_disk(data: Dict[str, object]) -> None:
+    try:
+        tmp_path = f"{BUILDS_FILE}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, BUILDS_FILE)
+        try:
+            dir_fd = os.open(os.path.dirname(BUILDS_FILE) or ".", os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print("Builds write failed:", e)
+        except Exception:
+            pass
+
+async def load_builds() -> None:
+    global BUILDS_DATA
+    async with BUILDS_LOCK:
+        BUILDS_DATA = _read_builds_from_disk()
+
+async def persist_builds() -> None:
+    async with BUILDS_LOCK:
+        _write_builds_to_disk(BUILDS_DATA)
+
+async def add_build(build: Dict[str, object]) -> None:
+    """Add a new build submission to storage."""
+    global BUILDS_DATA
+    async with BUILDS_LOCK:
+        # Reload from disk to ensure we have latest data
+        BUILDS_DATA = _read_builds_from_disk()
+        builds_list = BUILDS_DATA.get("builds", [])
+        if not isinstance(builds_list, list):
+            builds_list = []
+        builds_list.append(build)
+        BUILDS_DATA["builds"] = builds_list
+        _write_builds_to_disk(BUILDS_DATA)
+
+async def get_builds_for_week(week_start: Optional[str] = None) -> List[Dict[str, object]]:
+    """Get all builds for a specific week (defaults to current week)."""
+    async with BUILDS_LOCK:
+        BUILDS_DATA_LOCAL = _read_builds_from_disk()
+        if week_start is None:
+            week_start = _get_current_week_start()
+        builds_list = BUILDS_DATA_LOCAL.get("builds", [])
+        if not isinstance(builds_list, list):
+            return []
+        return [b for b in builds_list if b.get("week_of") == week_start]
+
+async def add_winner(winner: Dict[str, object]) -> None:
+    """Add a winner record to storage."""
+    global BUILDS_DATA
+    async with BUILDS_LOCK:
+        BUILDS_DATA = _read_builds_from_disk()
+        winners_list = BUILDS_DATA.get("winners", [])
+        if not isinstance(winners_list, list):
+            winners_list = []
+        winners_list.append(winner)
+        BUILDS_DATA["winners"] = winners_list
+        _write_builds_to_disk(BUILDS_DATA)
+
+# Load Destiny 2 data for build command
+def _load_destiny_data() -> Dict[str, object]:
+    try:
+        path = os.path.join(os.path.dirname(__file__), "destiny_data.json")
+        if not os.path.isfile(path):
+            return {}
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+DESTINY_DATA = _load_destiny_data()
+
+
 # ---------------------------
 # Permissions
 # ---------------------------
@@ -976,10 +1097,11 @@ async def on_ready():
             await load_queues()
             await load_checked()
             await load_cooldowns()
+            await load_builds()
             bot._queues_loaded = True  # type: ignore[attr-defined]
-            print("Queues and checked loaded from disk")
+            print("Queues, checked, and builds loaded from disk")
         except Exception as e:
-            print("Queue/checked load failed:", e)
+            print("Queue/checked/builds load failed:", e)
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     if not getattr(bot, "_autosave_task", None):
@@ -3544,6 +3666,438 @@ async def event_sherpa_cmd(
         f"Posted Sherpa signup in <#{int(channel_id)}> with {capacity} slot(s). " + ("Announced in #general-sherpa." if announce_ok else ""),
         ephemeral=True,
     )
+
+# ---------------------------
+# Build of the Week Commands
+# ---------------------------
+
+def _subclass_color(subclass: str) -> int:
+    """Return embed color based on Destiny 2 subclass."""
+    colors = {
+        "Arc": 0x7FECFF,
+        "Solar": 0xFF6F00,
+        "Void": 0x8B00FF,
+        "Stasis": 0x4FC3F7,
+        "Strand": 0x00E676,
+        "Prismatic": 0xFFD700,
+    }
+    return colors.get(subclass, 0x5865F2)
+
+# Dynamic autocomplete for aspects based on class and subclass
+async def _aspect_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    # Try to get class and subclass from the interaction namespace
+    guardian_class = getattr(interaction.namespace, "guardian_class", None)
+    subclass = getattr(interaction.namespace, "subclass", None)
+    
+    aspects: List[str] = []
+    if guardian_class and subclass:
+        class_aspects = DESTINY_DATA.get("aspects", {}).get(guardian_class, {})
+        aspects = class_aspects.get(subclass, [])
+    
+    if not aspects:
+        # Fallback: show all aspects for selected class, or all aspects
+        if guardian_class:
+            class_aspects = DESTINY_DATA.get("aspects", {}).get(guardian_class, {})
+            for sub_aspects in class_aspects.values():
+                aspects.extend(sub_aspects)
+        else:
+            for class_data in DESTINY_DATA.get("aspects", {}).values():
+                for sub_aspects in class_data.values():
+                    aspects.extend(sub_aspects)
+        aspects = list(set(aspects))  # Remove duplicates
+    
+    cur = (current or "").lower()
+    out: List[app_commands.Choice[str]] = []
+    for aspect in sorted(aspects):
+        if not cur or cur in aspect.lower():
+            out.append(app_commands.Choice(name=aspect, value=aspect))
+            if len(out) >= 25:
+                break
+    return out
+
+# Dynamic autocomplete for fragments based on subclass
+async def _fragment_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    subclass = getattr(interaction.namespace, "subclass", None)
+    
+    fragments: List[str] = []
+    if subclass:
+        fragments = DESTINY_DATA.get("fragments", {}).get(subclass, [])
+    
+    if not fragments:
+        # Fallback: show all fragments
+        for frag_list in DESTINY_DATA.get("fragments", {}).values():
+            fragments.extend(frag_list)
+        fragments = list(set(fragments))
+    
+    cur = (current or "").lower()
+    out: List[app_commands.Choice[str]] = []
+    for fragment in sorted(fragments):
+        if not cur or cur in fragment.lower():
+            out.append(app_commands.Choice(name=fragment, value=fragment))
+            if len(out) >= 25:
+                break
+    return out
+
+# Autocomplete for activities
+async def _build_activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    activities = DESTINY_DATA.get("activities", [])
+    cur = (current or "").lower()
+    out: List[app_commands.Choice[str]] = []
+    for act in activities:
+        if not cur or cur in act.lower():
+            out.append(app_commands.Choice(name=act, value=act))
+            if len(out) >= 25:
+                break
+    return out
+
+
+@bot.tree.command(name="build", description="Submit a Destiny 2 build for Build of the Week")
+@app_commands.describe(
+    activity="What activity is this build for?",
+    guardian_class="Your Guardian's class",
+    subclass="Your subclass element",
+    exotic_armor="Your exotic armor piece",
+    kinetic_weapon="Your kinetic weapon",
+    energy_weapon="Your energy weapon",
+    heavy_weapon="Your heavy/power weapon",
+    aspects="Your equipped aspects (comma-separated if multiple)",
+    fragments="Your equipped fragments (comma-separated if multiple)",
+    mods="Your armor mods",
+    artifact_perks="(Optional) Seasonal artifact perks",
+    dim_link="(Optional) DIM loadout link",
+    description="Describe your build and how it works"
+)
+@app_commands.choices(
+    guardian_class=[
+        app_commands.Choice(name="Hunter", value="Hunter"),
+        app_commands.Choice(name="Titan", value="Titan"),
+        app_commands.Choice(name="Warlock", value="Warlock"),
+    ],
+    subclass=[
+        app_commands.Choice(name="Arc", value="Arc"),
+        app_commands.Choice(name="Solar", value="Solar"),
+        app_commands.Choice(name="Void", value="Void"),
+        app_commands.Choice(name="Stasis", value="Stasis"),
+        app_commands.Choice(name="Strand", value="Strand"),
+        app_commands.Choice(name="Prismatic", value="Prismatic"),
+    ]
+)
+@app_commands.autocomplete(
+    activity=_build_activity_autocomplete,
+    aspects=_aspect_autocomplete,
+    fragments=_fragment_autocomplete
+)
+async def build_cmd(
+    interaction: discord.Interaction,
+    activity: str,
+    guardian_class: str,
+    subclass: str,
+    exotic_armor: str,
+    kinetic_weapon: str,
+    energy_weapon: str,
+    heavy_weapon: str,
+    aspects: str,
+    fragments: str,
+    mods: str,
+    description: str,
+    artifact_perks: Optional[str] = None,
+    dim_link: Optional[str] = None
+):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Validate build of the week channel is configured
+    if not BUILD_OF_THE_WEEK_CHANNEL_ID:
+        await interaction.followup.send(
+            "Build of the Week channel is not configured. Please set BUILD_OF_THE_WEEK_CHANNEL_ID.",
+            ephemeral=True
+        )
+        return
+    
+    # Get the target channel
+    channel = bot.get_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
+        except Exception:
+            pass
+    
+    if not channel:
+        await interaction.followup.send(
+            "Could not find the Build of the Week channel. Please check configuration.",
+            ephemeral=True
+        )
+        return
+    
+    # Get current week
+    week_start = _get_current_week_start()
+    
+    # Build the embed
+    embed = discord.Embed(
+        title="🔨 BUILD SUBMISSION",
+        color=_subclass_color(subclass)
+    )
+    
+    # Submitter info
+    user = interaction.user
+    username = f"{user.name}#{user.discriminator}" if user.discriminator and user.discriminator != "0" else user.name
+    embed.add_field(name="👤 Submitted by", value=f"<@{user.id}>", inline=False)
+    
+    # Activity and Class info
+    embed.add_field(name="🎯 Activity", value=activity, inline=True)
+    embed.add_field(name="🧙 Class", value=guardian_class, inline=True)
+    embed.add_field(name="⚡ Subclass", value=subclass, inline=True)
+    
+    # Exotic armor
+    embed.add_field(name="🛡️ Exotic Armor", value=exotic_armor, inline=False)
+    
+    # Weapons section
+    embed.add_field(name="🔫 Kinetic", value=kinetic_weapon, inline=True)
+    embed.add_field(name="⚡ Energy", value=energy_weapon, inline=True)
+    embed.add_field(name="💥 Heavy", value=heavy_weapon, inline=True)
+    
+    # Abilities section
+    embed.add_field(name="🔷 Aspects", value=aspects, inline=False)
+    embed.add_field(name="🔹 Fragments", value=fragments, inline=False)
+    
+    # Mods
+    embed.add_field(name="🧩 Mods", value=mods, inline=False)
+    
+    # Optional fields
+    if artifact_perks:
+        embed.add_field(name="🏺 Artifact Perks", value=artifact_perks, inline=False)
+    
+    if dim_link:
+        embed.add_field(name="🔗 DIM Link", value=dim_link, inline=False)
+    
+    # Description
+    embed.add_field(name="📝 Description", value=description, inline=False)
+    
+    # Footer with week info
+    embed.set_footer(text=f"Vote with 👍 if you like this build! • Week of {week_start}")
+    
+    # Add user avatar as thumbnail
+    try:
+        if user.avatar:
+            embed.set_thumbnail(url=user.avatar.url)
+    except Exception:
+        pass
+    
+    # Post the embed
+    try:
+        msg = await channel.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to post build: {e}", ephemeral=True)
+        return
+    
+    # Add thumbs up reaction for voting
+    try:
+        await msg.add_reaction("👍")
+    except Exception:
+        pass
+    
+    # Store the build data
+    build_data = {
+        "id": str(msg.id),
+        "message_id": msg.id,
+        "channel_id": channel.id,
+        "user_id": user.id,
+        "username": username,
+        "submitted_at": int(datetime.now().timestamp()),
+        "week_of": week_start,
+        "activity": activity,
+        "guardian_class": guardian_class,
+        "subclass": subclass,
+        "exotic_armor": exotic_armor,
+        "kinetic_weapon": kinetic_weapon,
+        "energy_weapon": energy_weapon,
+        "heavy_weapon": heavy_weapon,
+        "aspects": aspects,
+        "fragments": fragments,
+        "mods": mods,
+        "artifact_perks": artifact_perks,
+        "dim_link": dim_link,
+        "description": description,
+    }
+    
+    await add_build(build_data)
+    
+    # Confirm to user
+    await interaction.followup.send(
+        f"✅ Your build has been submitted! Check it out in <#{channel.id}>.\n"
+        f"📊 Community members can now vote with 👍 on your build.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="buildwinner", description="(Admin) Announce the Build of the Week winner")
+@founder_only()
+@app_commands.describe(
+    announce="Post winner announcement in channel (default: True)"
+)
+async def buildwinner_cmd(
+    interaction: discord.Interaction,
+    announce: Optional[bool] = True
+):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Validate channel is configured
+    if not BUILD_OF_THE_WEEK_CHANNEL_ID:
+        await interaction.followup.send(
+            "Build of the Week channel is not configured. Please set BUILD_OF_THE_WEEK_CHANNEL_ID.",
+            ephemeral=True
+        )
+        return
+    
+    # Get channel
+    channel = bot.get_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
+        except Exception:
+            pass
+    
+    if not channel:
+        await interaction.followup.send(
+            "Could not find the Build of the Week channel.",
+            ephemeral=True
+        )
+        return
+    
+    # Get builds for current week
+    week_start = _get_current_week_start()
+    builds = await get_builds_for_week(week_start)
+    
+    if not builds:
+        await interaction.followup.send(
+            f"No builds have been submitted for the week of {week_start}.",
+            ephemeral=True
+        )
+        return
+    
+    # Count votes for each build
+    build_votes: List[Tuple[Dict[str, object], int]] = []
+    
+    for build in builds:
+        message_id = build.get("message_id")
+        if not message_id:
+            continue
+        
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            vote_count = 0
+            
+            # Find the thumbs up reaction
+            for reaction in msg.reactions:
+                if str(reaction.emoji) == "👍":
+                    # Subtract 1 for the bot's own reaction
+                    vote_count = reaction.count - 1
+                    break
+            
+            build_votes.append((build, max(0, vote_count)))
+        except discord.NotFound:
+            # Message was deleted
+            continue
+        except Exception as e:
+            print(f"Error fetching build message {message_id}: {e}")
+            continue
+    
+    if not build_votes:
+        await interaction.followup.send(
+            "Could not find any valid build submissions to count votes.",
+            ephemeral=True
+        )
+        return
+    
+    # Sort by vote count (descending), then by submission time (ascending for tiebreaker)
+    build_votes.sort(key=lambda x: (-x[1], x[0].get("submitted_at", 0)))
+    
+    # Get winner
+    winner_build, winner_votes = build_votes[0]
+    winner_user_id = winner_build.get("user_id")
+    winner_class = winner_build.get("guardian_class", "Unknown")
+    winner_subclass = winner_build.get("subclass", "Unknown")
+    winner_activity = winner_build.get("activity", "Unknown")
+    winner_message_id = winner_build.get("message_id")
+    
+    # Build results summary for admin
+    summary_lines = ["**Vote Results:**"]
+    for i, (build, votes) in enumerate(build_votes[:10], 1):
+        user_id = build.get("user_id")
+        activity = build.get("activity", "Unknown")
+        medal = "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"{i}."))
+        summary_lines.append(f"{medal} <@{user_id}> — {activity} — **{votes}** votes")
+    
+    summary = "\n".join(summary_lines)
+    
+    # Announce winner if requested
+    if announce:
+        # Create winner announcement embed
+        winner_embed = discord.Embed(
+            title="🏆 BUILD OF THE WEEK WINNER! 🏆",
+            color=0xFFD700  # Gold
+        )
+        
+        winner_embed.add_field(
+            name="🎉 Congratulations!",
+            value=f"<@{winner_user_id}>",
+            inline=False
+        )
+        
+        winner_embed.add_field(
+            name="🔨 Winning Build",
+            value=f"**{winner_class} {winner_subclass}** for **{winner_activity}**",
+            inline=False
+        )
+        
+        winner_embed.add_field(
+            name="📊 Votes",
+            value=f"**{winner_votes}** votes",
+            inline=True
+        )
+        
+        # Link to winning build
+        if winner_message_id:
+            try:
+                jump_url = f"https://discord.com/channels/{interaction.guild_id}/{BUILD_OF_THE_WEEK_CHANNEL_ID}/{winner_message_id}"
+                winner_embed.add_field(
+                    name="🔗 View Build",
+                    value=f"[Jump to Build]({jump_url})",
+                    inline=True
+                )
+            except Exception:
+                pass
+        
+        # Week info in footer
+        week_end = datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=6)
+        week_end_str = week_end.strftime("%Y-%m-%d")
+        winner_embed.set_footer(text=f"Week of {week_start} to {week_end_str}")
+        
+        try:
+            await channel.send(embed=winner_embed)
+        except Exception as e:
+            await interaction.followup.send(
+                f"Failed to post winner announcement: {e}\n\n{summary}",
+                ephemeral=True
+            )
+            return
+        
+        # Store winner record
+        winner_record = {
+            "week_of": week_start,
+            "build_id": winner_build.get("id"),
+            "message_id": winner_message_id,
+            "user_id": winner_user_id,
+            "vote_count": winner_votes,
+            "announced_at": int(datetime.now().timestamp()),
+        }
+        await add_winner(winner_record)
+    
+    # Send summary to admin
+    await interaction.followup.send(
+        f"✅ Build of the Week winner determined!\n\n{summary}",
+        ephemeral=True
+    )
+
 
 # ---------------------------
 # Error handler
