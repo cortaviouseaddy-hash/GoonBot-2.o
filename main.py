@@ -879,6 +879,30 @@ async def add_winner(winner: Dict[str, object]) -> None:
         BUILDS_DATA["winners"] = winners_list
         _write_builds_to_disk(BUILDS_DATA)
 
+async def delete_build(message_id: int) -> Optional[Dict[str, object]]:
+    """Delete a build from storage by message ID. Returns the deleted build or None."""
+    global BUILDS_DATA
+    async with BUILDS_LOCK:
+        BUILDS_DATA = _read_builds_from_disk()
+        builds_list = BUILDS_DATA.get("builds", [])
+        if not isinstance(builds_list, list):
+            return None
+        
+        # Find and remove the build
+        deleted_build = None
+        new_builds = []
+        for build in builds_list:
+            if build.get("message_id") == message_id:
+                deleted_build = build
+            else:
+                new_builds.append(build)
+        
+        if deleted_build:
+            BUILDS_DATA["builds"] = new_builds
+            _write_builds_to_disk(BUILDS_DATA)
+        
+        return deleted_build
+
 # Load Destiny 2 data for build command
 def _load_destiny_data() -> Dict[str, object]:
     try:
@@ -4097,6 +4121,97 @@ async def buildwinner_cmd(
         f"✅ Build of the Week winner determined!\n\n{summary}",
         ephemeral=True
     )
+
+
+@bot.tree.command(name="deletebuild", description="(Admin) Delete a build submission")
+@founder_only()
+@app_commands.describe(
+    message_id="The message ID of the build to delete"
+)
+async def deletebuild_cmd(
+    interaction: discord.Interaction,
+    message_id: str
+):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Parse message ID
+    try:
+        msg_id = int(message_id.strip())
+    except ValueError:
+        await interaction.followup.send(
+            "Invalid message ID. Please provide a valid numeric message ID.",
+            ephemeral=True
+        )
+        return
+    
+    # Validate channel is configured
+    if not BUILD_OF_THE_WEEK_CHANNEL_ID:
+        await interaction.followup.send(
+            "Build of the Week channel is not configured.",
+            ephemeral=True
+        )
+        return
+    
+    # Get channel
+    channel = bot.get_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
+        except Exception:
+            pass
+    
+    if not channel:
+        await interaction.followup.send(
+            "Could not find the Build of the Week channel.",
+            ephemeral=True
+        )
+        return
+    
+    # Try to delete the message from Discord
+    message_deleted = False
+    try:
+        msg = await channel.fetch_message(msg_id)
+        await msg.delete()
+        message_deleted = True
+    except discord.NotFound:
+        pass  # Message already deleted, continue to remove from storage
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Bot lacks permission to delete messages in that channel.",
+            ephemeral=True
+        )
+        return
+    except Exception as e:
+        await interaction.followup.send(
+            f"Error deleting message: {e}",
+            ephemeral=True
+        )
+        return
+    
+    # Remove from storage
+    deleted_build = await delete_build(msg_id)
+    
+    if deleted_build:
+        user_id = deleted_build.get("user_id")
+        activity = deleted_build.get("activity", "Unknown")
+        guardian_class = deleted_build.get("guardian_class", "Unknown")
+        await interaction.followup.send(
+            f"✅ Build deleted!\n"
+            f"**Submitter:** <@{user_id}>\n"
+            f"**Build:** {guardian_class} — {activity}\n"
+            f"**Message:** {'Deleted from channel' if message_deleted else 'Already removed from channel'}",
+            ephemeral=True
+        )
+    elif message_deleted:
+        await interaction.followup.send(
+            f"✅ Message deleted from channel, but no matching build was found in storage.",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            f"No build found with message ID `{msg_id}`.",
+            ephemeral=True
+        )
 
 
 # ---------------------------
