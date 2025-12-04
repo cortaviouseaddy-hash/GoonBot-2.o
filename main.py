@@ -903,6 +903,30 @@ async def delete_build(message_id: int) -> Optional[Dict[str, object]]:
         
         return deleted_build
 
+async def delete_build_by_thread(thread_id: int) -> Optional[Dict[str, object]]:
+    """Delete a build from storage by thread ID. Returns the deleted build or None."""
+    global BUILDS_DATA
+    async with BUILDS_LOCK:
+        BUILDS_DATA = _read_builds_from_disk()
+        builds_list = BUILDS_DATA.get("builds", [])
+        if not isinstance(builds_list, list):
+            return None
+        
+        # Find and remove the build by thread_id
+        deleted_build = None
+        new_builds = []
+        for build in builds_list:
+            if build.get("thread_id") == thread_id:
+                deleted_build = build
+            else:
+                new_builds.append(build)
+        
+        if deleted_build:
+            BUILDS_DATA["builds"] = new_builds
+            _write_builds_to_disk(BUILDS_DATA)
+        
+        return deleted_build
+
 # Load Destiny 2 data for build command
 def _load_destiny_data() -> Dict[str, object]:
     try:
@@ -3787,9 +3811,10 @@ async def _build_activity_autocomplete(interaction: discord.Interaction, current
     aspects="Your equipped aspects (comma-separated if multiple)",
     fragments="Your equipped fragments (comma-separated if multiple)",
     mods="Your armor mods",
+    description="Describe your build and how it works",
+    image="(Optional) Screenshot of your build",
     artifact_perks="(Optional) Seasonal artifact perks",
-    dim_link="(Optional) DIM loadout link",
-    description="Describe your build and how it works"
+    dim_link="(Optional) DIM loadout link"
 )
 @app_commands.choices(
     guardian_class=[
@@ -3824,6 +3849,7 @@ async def build_cmd(
     fragments: str,
     mods: str,
     description: str,
+    image: Optional[discord.Attachment] = None,
     artifact_perks: Optional[str] = None,
     dim_link: Optional[str] = None
 ):
@@ -3837,7 +3863,7 @@ async def build_cmd(
         )
         return
     
-    # Get the target channel
+    # Get the target channel (forum)
     channel = bot.get_channel(BUILD_OF_THE_WEEK_CHANNEL_ID)
     if not channel:
         try:
@@ -3855,15 +3881,16 @@ async def build_cmd(
     # Get current week
     week_start = _get_current_week_start()
     
-    # Build the embed
-    embed = discord.Embed(
-        title="🔨 BUILD SUBMISSION",
-        color=_subclass_color(subclass)
-    )
-    
     # Submitter info
     user = interaction.user
     username = f"{user.name}#{user.discriminator}" if user.discriminator and user.discriminator != "0" else user.name
+    
+    # Build the embed
+    embed = discord.Embed(
+        title="🔨 BUILD DETAILS",
+        color=_subclass_color(subclass)
+    )
+    
     embed.add_field(name="👤 Submitted by", value=f"<@{user.id}>", inline=False)
     
     # Activity and Class info
@@ -3906,51 +3933,143 @@ async def build_cmd(
     except Exception:
         pass
     
-    # Post the embed
-    try:
-        msg = await channel.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"Failed to post build: {e}", ephemeral=True)
-        return
+    # Prepare the image file if provided
+    file_to_send = None
+    if image:
+        try:
+            # Validate it's an image
+            if image.content_type and image.content_type.startswith("image/"):
+                file_to_send = await image.to_file()
+                # Set the image in embed
+                embed.set_image(url=f"attachment://{image.filename}")
+            else:
+                await interaction.followup.send(
+                    "The attached file is not a valid image. Please attach a PNG, JPG, or GIF.",
+                    ephemeral=True
+                )
+                return
+        except Exception as e:
+            await interaction.followup.send(f"Failed to process image: {e}", ephemeral=True)
+            return
     
-    # Add thumbs up reaction for voting
-    try:
-        await msg.add_reaction("👍")
-    except Exception:
-        pass
+    # Create forum thread title
+    thread_title = f"{guardian_class} {subclass} - {activity} | {user.display_name}"
+    # Discord limits thread names to 100 characters
+    if len(thread_title) > 100:
+        thread_title = thread_title[:97] + "..."
     
-    # Store the build data
-    build_data = {
-        "id": str(msg.id),
-        "message_id": msg.id,
-        "channel_id": channel.id,
-        "user_id": user.id,
-        "username": username,
-        "submitted_at": int(datetime.now().timestamp()),
-        "week_of": week_start,
-        "activity": activity,
-        "guardian_class": guardian_class,
-        "subclass": subclass,
-        "exotic_armor": exotic_armor,
-        "kinetic_weapon": kinetic_weapon,
-        "energy_weapon": energy_weapon,
-        "heavy_weapon": heavy_weapon,
-        "aspects": aspects,
-        "fragments": fragments,
-        "mods": mods,
-        "artifact_perks": artifact_perks,
-        "dim_link": dim_link,
-        "description": description,
-    }
+    # Check if channel is a forum
+    if isinstance(channel, discord.ForumChannel):
+        # Create a forum post (thread)
+        try:
+            if file_to_send:
+                thread_with_message = await channel.create_thread(
+                    name=thread_title,
+                    embed=embed,
+                    file=file_to_send
+                )
+            else:
+                thread_with_message = await channel.create_thread(
+                    name=thread_title,
+                    embed=embed
+                )
+            thread = thread_with_message.thread
+            msg = thread_with_message.message
+        except Exception as e:
+            await interaction.followup.send(f"Failed to create forum post: {e}", ephemeral=True)
+            return
+        
+        # Add thumbs up reaction for voting
+        try:
+            await msg.add_reaction("👍")
+        except Exception:
+            pass
+        
+        # Store the build data
+        build_data = {
+            "id": str(thread.id),
+            "message_id": msg.id,
+            "thread_id": thread.id,
+            "channel_id": channel.id,
+            "user_id": user.id,
+            "username": username,
+            "submitted_at": int(datetime.now().timestamp()),
+            "week_of": week_start,
+            "activity": activity,
+            "guardian_class": guardian_class,
+            "subclass": subclass,
+            "exotic_armor": exotic_armor,
+            "kinetic_weapon": kinetic_weapon,
+            "energy_weapon": energy_weapon,
+            "heavy_weapon": heavy_weapon,
+            "aspects": aspects,
+            "fragments": fragments,
+            "mods": mods,
+            "artifact_perks": artifact_perks,
+            "dim_link": dim_link,
+            "description": description,
+            "has_image": image is not None,
+        }
+        
+        await add_build(build_data)
+        
+        # Confirm to user
+        await interaction.followup.send(
+            f"✅ Your build has been submitted! Check it out here: {thread.jump_url}\n"
+            f"📊 Community members can now vote with 👍 on your build.",
+            ephemeral=True
+        )
     
-    await add_build(build_data)
-    
-    # Confirm to user
-    await interaction.followup.send(
-        f"✅ Your build has been submitted! Check it out in <#{channel.id}>.\n"
-        f"📊 Community members can now vote with 👍 on your build.",
-        ephemeral=True
-    )
+    else:
+        # Fallback for regular text channel
+        try:
+            if file_to_send:
+                msg = await channel.send(embed=embed, file=file_to_send)
+            else:
+                msg = await channel.send(embed=embed)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to post build: {e}", ephemeral=True)
+            return
+        
+        # Add thumbs up reaction for voting
+        try:
+            await msg.add_reaction("👍")
+        except Exception:
+            pass
+        
+        # Store the build data
+        build_data = {
+            "id": str(msg.id),
+            "message_id": msg.id,
+            "channel_id": channel.id,
+            "user_id": user.id,
+            "username": username,
+            "submitted_at": int(datetime.now().timestamp()),
+            "week_of": week_start,
+            "activity": activity,
+            "guardian_class": guardian_class,
+            "subclass": subclass,
+            "exotic_armor": exotic_armor,
+            "kinetic_weapon": kinetic_weapon,
+            "energy_weapon": energy_weapon,
+            "heavy_weapon": heavy_weapon,
+            "aspects": aspects,
+            "fragments": fragments,
+            "mods": mods,
+            "artifact_perks": artifact_perks,
+            "dim_link": dim_link,
+            "description": description,
+            "has_image": image is not None,
+        }
+        
+        await add_build(build_data)
+        
+        # Confirm to user
+        await interaction.followup.send(
+            f"✅ Your build has been submitted! Check it out in <#{channel.id}>.\n"
+            f"📊 Community members can now vote with 👍 on your build.",
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name="buildwinner", description="(Admin) Announce the Build of the Week winner")
@@ -4000,14 +4119,34 @@ async def buildwinner_cmd(
     
     # Count votes for each build
     build_votes: List[Tuple[Dict[str, object], int]] = []
+    is_forum = isinstance(channel, discord.ForumChannel)
     
     for build in builds:
         message_id = build.get("message_id")
+        thread_id = build.get("thread_id")
         if not message_id:
             continue
         
         try:
-            msg = await channel.fetch_message(int(message_id))
+            msg = None
+            
+            if is_forum and thread_id:
+                # For forum channels, fetch the thread first, then the message
+                try:
+                    thread = channel.get_thread(int(thread_id))
+                    if not thread:
+                        thread = await bot.fetch_channel(int(thread_id))
+                    if thread:
+                        msg = await thread.fetch_message(int(message_id))
+                except Exception:
+                    pass
+            else:
+                # Regular text channel
+                msg = await channel.fetch_message(int(message_id))
+            
+            if not msg:
+                continue
+                
             vote_count = 0
             
             # Find the thumbs up reaction
@@ -4042,6 +4181,7 @@ async def buildwinner_cmd(
     winner_subclass = winner_build.get("subclass", "Unknown")
     winner_activity = winner_build.get("activity", "Unknown")
     winner_message_id = winner_build.get("message_id")
+    winner_thread_id = winner_build.get("thread_id")
     
     # Build results summary for admin
     summary_lines = ["**Vote Results:**"]
@@ -4079,10 +4219,11 @@ async def buildwinner_cmd(
             inline=True
         )
         
-        # Link to winning build
-        if winner_message_id:
+        # Link to winning build - use thread URL for forum posts
+        link_id = winner_thread_id if winner_thread_id else winner_message_id
+        if link_id:
             try:
-                jump_url = f"https://discord.com/channels/{interaction.guild_id}/{BUILD_OF_THE_WEEK_CHANNEL_ID}/{winner_message_id}"
+                jump_url = f"https://discord.com/channels/{interaction.guild_id}/{BUILD_OF_THE_WEEK_CHANNEL_ID}/{link_id}"
                 winner_embed.add_field(
                     name="🔗 View Build",
                     value=f"[Jump to Build]({jump_url})",
@@ -4126,20 +4267,20 @@ async def buildwinner_cmd(
 @bot.tree.command(name="deletebuild", description="(Admin) Delete a build submission")
 @founder_only()
 @app_commands.describe(
-    message_id="The message ID of the build to delete"
+    thread_or_message_id="The thread ID (for forum) or message ID of the build to delete"
 )
 async def deletebuild_cmd(
     interaction: discord.Interaction,
-    message_id: str
+    thread_or_message_id: str
 ):
     await interaction.response.defer(ephemeral=True)
     
-    # Parse message ID
+    # Parse ID
     try:
-        msg_id = int(message_id.strip())
+        target_id = int(thread_or_message_id.strip())
     except ValueError:
         await interaction.followup.send(
-            "Invalid message ID. Please provide a valid numeric message ID.",
+            "Invalid ID. Please provide a valid numeric thread or message ID.",
             ephemeral=True
         )
         return
@@ -4167,29 +4308,75 @@ async def deletebuild_cmd(
         )
         return
     
-    # Try to delete the message from Discord
+    # Try to delete - handle both forum threads and regular messages
     message_deleted = False
-    try:
-        msg = await channel.fetch_message(msg_id)
-        await msg.delete()
-        message_deleted = True
-    except discord.NotFound:
-        pass  # Message already deleted, continue to remove from storage
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "Bot lacks permission to delete messages in that channel.",
-            ephemeral=True
-        )
-        return
-    except Exception as e:
-        await interaction.followup.send(
-            f"Error deleting message: {e}",
-            ephemeral=True
-        )
-        return
+    thread_deleted = False
     
-    # Remove from storage
-    deleted_build = await delete_build(msg_id)
+    # First, try to find and delete as a forum thread
+    if isinstance(channel, discord.ForumChannel):
+        try:
+            thread = channel.get_thread(target_id)
+            if not thread:
+                thread = await bot.fetch_channel(target_id)
+            if thread and isinstance(thread, discord.Thread):
+                await thread.delete()
+                thread_deleted = True
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Bot lacks permission to delete threads in that channel.",
+                ephemeral=True
+            )
+            return
+        except Exception:
+            pass  # Try message deletion as fallback
+    
+    # If not a thread or thread deletion failed, try as a message
+    if not thread_deleted:
+        try:
+            # For forum channels, we need to search in threads
+            if isinstance(channel, discord.ForumChannel):
+                # Try to find the message in archived or active threads
+                msg = None
+                async for thread in channel.archived_threads():
+                    try:
+                        msg = await thread.fetch_message(target_id)
+                        await msg.delete()
+                        message_deleted = True
+                        break
+                    except discord.NotFound:
+                        continue
+                if not message_deleted:
+                    for thread in channel.threads:
+                        try:
+                            msg = await thread.fetch_message(target_id)
+                            await msg.delete()
+                            message_deleted = True
+                            break
+                        except discord.NotFound:
+                            continue
+            else:
+                msg = await channel.fetch_message(target_id)
+                await msg.delete()
+                message_deleted = True
+        except discord.NotFound:
+            pass  # Message already deleted, continue to remove from storage
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Bot lacks permission to delete messages in that channel.",
+                ephemeral=True
+            )
+            return
+        except Exception as e:
+            # Continue to try removing from storage
+            pass
+    
+    # Remove from storage - try both thread_id and message_id
+    deleted_build = await delete_build(target_id)
+    if not deleted_build:
+        # Also try looking up by thread_id in the build data
+        deleted_build = await delete_build_by_thread(target_id)
     
     if deleted_build:
         user_id = deleted_build.get("user_id")
