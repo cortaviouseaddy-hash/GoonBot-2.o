@@ -941,6 +941,37 @@ def _load_destiny_data() -> Dict[str, object]:
 DESTINY_DATA = _load_destiny_data()
 
 
+def _normalize_choice(value: str, options: List[str]) -> Optional[str]:
+    """Return the canonical option matching the user-provided value."""
+    if not value:
+        return None
+    cleaned = value.strip().lower()
+    for option in options:
+        if option.lower() == cleaned:
+            return option
+    return None
+
+
+def _get_aspect_slot_count(aspect_name: str, subclass: str) -> Optional[int]:
+    slots_data = DESTINY_DATA.get("aspect_slots", {})
+    default_slots = slots_data.get("default", {})
+    prism_slots = slots_data.get("prismatic_overrides", {})
+    if subclass == "Prismatic":
+        return prism_slots.get(aspect_name, default_slots.get(aspect_name))
+    return default_slots.get(aspect_name)
+
+
+def _split_csv_list(raw_value: str) -> List[str]:
+    if not raw_value:
+        return []
+    parts: List[str] = []
+    for chunk in raw_value.replace("\n", ",").split(","):
+        cleaned = chunk.strip()
+        if cleaned:
+            parts.append(cleaned)
+    return parts
+
+
 # ---------------------------
 # Permissions
 # ---------------------------
@@ -3808,9 +3839,10 @@ async def _build_activity_autocomplete(interaction: discord.Interaction, current
     kinetic_weapon="Your kinetic weapon",
     energy_weapon="Your energy weapon",
     heavy_weapon="Your heavy/power weapon",
-    aspects="Your equipped aspects (comma-separated if multiple)",
-    fragments="Your equipped fragments (comma-separated if multiple)",
-    mods="Your armor mods",
+    aspect_one="First equipped aspect",
+    aspect_two="Second equipped aspect",
+    fragments="Your equipped fragments (comma-separated)",
+    mods="Your armor mods (comma-separated, up to 25)",
     description="Describe your build and how it works",
     image="(Optional) Screenshot of your build",
     artifact_perks="(Optional) Seasonal artifact perks",
@@ -3833,7 +3865,8 @@ async def _build_activity_autocomplete(interaction: discord.Interaction, current
 )
 @app_commands.autocomplete(
     activity=_build_activity_autocomplete,
-    aspects=_aspect_autocomplete,
+    aspect_one=_aspect_autocomplete,
+    aspect_two=_aspect_autocomplete,
     fragments=_fragment_autocomplete
 )
 async def build_cmd(
@@ -3845,7 +3878,8 @@ async def build_cmd(
     kinetic_weapon: str,
     energy_weapon: str,
     heavy_weapon: str,
-    aspects: str,
+    aspect_one: str,
+    aspect_two: str,
     fragments: str,
     mods: str,
     description: str,
@@ -3884,6 +3918,90 @@ async def build_cmd(
     # Submitter info
     user = interaction.user
     username = f"{user.name}#{user.discriminator}" if user.discriminator and user.discriminator != "0" else user.name
+
+    # Validate aspect selections
+    class_aspects = DESTINY_DATA.get("aspects", {}).get(guardian_class, {})
+    available_aspects = class_aspects.get(subclass, [])
+    if not available_aspects:
+        await interaction.followup.send(
+            f"Unable to find any aspects for {guardian_class} {subclass}. Please double-check your selection.",
+            ephemeral=True,
+        )
+        return
+
+    normalized_aspect_one = _normalize_choice(aspect_one, available_aspects)
+    normalized_aspect_two = _normalize_choice(aspect_two, available_aspects)
+    if not normalized_aspect_one or not normalized_aspect_two:
+        await interaction.followup.send(
+            "One or both aspects are invalid for this subclass. Please pick from the autocomplete list.",
+            ephemeral=True,
+        )
+        return
+
+    if normalized_aspect_one == normalized_aspect_two:
+        await interaction.followup.send(
+            "Please select two different aspects.",
+            ephemeral=True,
+        )
+        return
+
+    slot_one = _get_aspect_slot_count(normalized_aspect_one, subclass)
+    slot_two = _get_aspect_slot_count(normalized_aspect_two, subclass)
+    if slot_one is None or slot_two is None:
+        await interaction.followup.send(
+            "I couldn't determine the fragment slots for one of those aspects. Please let an admin know so the data can be updated.",
+            ephemeral=True,
+        )
+        return
+
+    subclass_slot_cap = 6 if subclass == "Prismatic" else 4
+    fragment_slot_budget = min(slot_one + slot_two, subclass_slot_cap)
+
+    # Validate fragments
+    fragment_pool = DESTINY_DATA.get("fragments", {}).get(subclass, [])
+    if not fragment_pool:
+        await interaction.followup.send(
+            f"Unable to find any fragments for the {subclass} subclass.",
+            ephemeral=True,
+        )
+        return
+
+    fragment_inputs = _split_csv_list(fragments)
+    if not fragment_inputs:
+        await interaction.followup.send(
+            "Please provide at least one fragment (comma-separated).",
+            ephemeral=True,
+        )
+        return
+
+    normalized_fragments: List[str] = []
+    seen_fragments: Set[str] = set()
+    for frag_name in fragment_inputs:
+        normalized = _normalize_choice(frag_name, fragment_pool)
+        if not normalized:
+            await interaction.followup.send(
+                f"`{frag_name}` is not a valid fragment for {subclass}. Please use the suggestions shown while typing.",
+                ephemeral=True,
+            )
+            return
+        if normalized in seen_fragments:
+            await interaction.followup.send(
+                f"You listed `{normalized}` more than once. Fragments must be unique.",
+                ephemeral=True,
+            )
+            return
+        seen_fragments.add(normalized)
+        normalized_fragments.append(normalized)
+
+    if len(normalized_fragments) > fragment_slot_budget:
+        await interaction.followup.send(
+            f"You selected {len(normalized_fragments)} fragments but your aspects only provide {fragment_slot_budget} slot(s).",
+            ephemeral=True,
+        )
+        return
+
+    aspects_text = ", ".join([normalized_aspect_one, normalized_aspect_two])
+    fragments_text = ", ".join(normalized_fragments)
     
     # Build the embed
     embed = discord.Embed(
@@ -3907,11 +4025,19 @@ async def build_cmd(
     embed.add_field(name="💥 Heavy", value=heavy_weapon, inline=True)
     
     # Abilities section
-    embed.add_field(name="🔷 Aspects", value=aspects, inline=False)
-    embed.add_field(name="🔹 Fragments", value=fragments, inline=False)
+    embed.add_field(name="🔷 Aspects", value=aspects_text, inline=False)
+    embed.add_field(name="🔹 Fragments", value=fragments_text, inline=False)
     
     # Mods
-    embed.add_field(name="🧩 Mods", value=mods, inline=False)
+    mods_entries = _split_csv_list(mods)
+    if mods_entries and len(mods_entries) > 25:
+        await interaction.followup.send(
+            "Please limit your mods list to 25 entries.",
+            ephemeral=True,
+        )
+        return
+    mods_text = ", ".join(mods_entries) if mods_entries else mods
+    embed.add_field(name="🧩 Mods", value=mods_text, inline=False)
     
     # Optional fields
     if artifact_perks:
@@ -4002,9 +4128,9 @@ async def build_cmd(
             "kinetic_weapon": kinetic_weapon,
             "energy_weapon": energy_weapon,
             "heavy_weapon": heavy_weapon,
-            "aspects": aspects,
-            "fragments": fragments,
-            "mods": mods,
+            "aspects": aspects_text,
+            "fragments": fragments_text,
+            "mods": mods_text,
             "artifact_perks": artifact_perks,
             "dim_link": dim_link,
             "description": description,
@@ -4053,9 +4179,9 @@ async def build_cmd(
             "kinetic_weapon": kinetic_weapon,
             "energy_weapon": energy_weapon,
             "heavy_weapon": heavy_weapon,
-            "aspects": aspects,
-            "fragments": fragments,
-            "mods": mods,
+            "aspects": aspects_text,
+            "fragments": fragments_text,
+            "mods": mods_text,
             "artifact_perks": artifact_perks,
             "dim_link": dim_link,
             "description": description,
