@@ -22,7 +22,7 @@
     },
     "Warlock": {
       "Arc": ["Arc Soul", "Electrostatic Mind", "Lightning Surge"],
-      "Solar": ["Heat Rises", "Icarus Dash", "Touch of Flame"],
+      "Solar": ["Heat Rises", "Icarus Dash", "Touch of Flame", "Hellion"],
       "Void": ["Chaos Accelerant", "Child of the Old Gods", "Feed the Void"],
       "Stasis": ["Bleak Watcher", "Frostpulse", "Glacial Harvest", "Iceflare Bolts"],
       "Strand": ["Weaver's Call", "Mindspun Invocation", "The Wanderer", "Weavewalk"],
