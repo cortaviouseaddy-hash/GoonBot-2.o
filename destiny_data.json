@@ -9,7 +9,7 @@
       "Solar": ["Knock 'Em Down", "On Your Mark", "Gunpowder Gamble"],
       "Void": ["Stylish Executioner", "Vanishing Step", "Trapper's Ambush"],
       "Stasis": ["Grim Harvest", "Touch of Winter", "Winter's Shroud", "Shatterdive"],
-      "Strand": ["Ensnaring Slam", "Threaded Specter", "Widow's Silk"],
+      "Strand": ["Ensnaring Slam", "Threaded Specter", "Widow's Silk", "Whirling Maelstrom"],
       "Prismatic": ["Stylish Executioner", "Gunpowder Gamble", "Winter's Shroud", "Threaded Specter", "Ascension"]
     },
     "Titan": {
@@ -17,15 +17,15 @@
       "Solar": ["Sol Invictus", "Roaring Flames", "Consecration"],
       "Void": ["Bastion", "Controlled Demolition", "Offensive Bulwark"],
       "Stasis": ["Tectonic Harvest", "Howl of the Storm", "Diamond Lance", "Cryoclasm"],
-      "Strand": ["Into the Fray", "Flechette Storm", "Drengr's Lash"],
+      "Strand": ["Into the Fray", "Flechette Storm", "Drengr's Lash", "Banner of War"],
       "Prismatic": ["Consecration", "Knockout", "Diamond Lance", "Drengr's Lash", "Unbreakable"]
     },
     "Warlock": {
       "Arc": ["Arc Soul", "Electrostatic Mind", "Lightning Surge"],
-      "Solar": ["Heat Rises", "Icarus Dash", "Touch of Flame"],
+      "Solar": ["Heat Rises", "Icarus Dash", "Touch of Flame", "Hellion"],
       "Void": ["Chaos Accelerant", "Child of the Old Gods", "Feed the Void"],
       "Stasis": ["Bleak Watcher", "Frostpulse", "Glacial Harvest", "Iceflare Bolts"],
-      "Strand": ["Weaver's Call", "Mindspun Invocation", "The Wanderer"],
+      "Strand": ["Weaver's Call", "Mindspun Invocation", "The Wanderer", "Weavewalk"],
       "Prismatic": ["Feed the Void", "Hellion", "Bleak Watcher", "Weaver's Call", "Song of Flame"]
     }
   },
