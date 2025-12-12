@@ -792,6 +792,25 @@ def _get_current_week_start() -> str:
     monday = today - timedelta(days=days_since_monday)
     return monday.strftime("%Y-%m-%d")
 
+def _week_start_for_date(d: datetime) -> str:
+    """Return the Monday of the given date's week as YYYY-MM-DD string."""
+    days_since_monday = d.weekday()  # Monday=0
+    monday = d - timedelta(days=days_since_monday)
+    return monday.strftime("%Y-%m-%d")
+
+def _parse_week_start_from_input(date_str: Optional[str]) -> Optional[str]:
+    """
+    Parse a user-provided date (YYYY-MM-DD) and return the Monday of that week.
+    Returns None if date_str is not provided or invalid.
+    """
+    if not date_str:
+        return None
+    try:
+        d = datetime.strptime(str(date_str).strip(), "%Y-%m-%d")
+    except Exception:
+        return None
+    return _week_start_for_date(d)
+
 def _read_builds_from_disk() -> Dict[str, object]:
     try:
         if not os.path.isfile(BUILDS_FILE):
@@ -4201,11 +4220,13 @@ async def build_cmd(
 @bot.tree.command(name="buildwinner", description="(Admin) Announce the Build of the Week winner")
 @founder_only()
 @app_commands.describe(
-    announce="Post winner announcement in channel (default: True)"
+    announce="Post winner announcement in channel (default: True)",
+    week="(Optional) Any date in the target week (YYYY-MM-DD). Default: current week"
 )
 async def buildwinner_cmd(
     interaction: discord.Interaction,
-    announce: Optional[bool] = True
+    announce: Optional[bool] = True,
+    week: Optional[str] = None
 ):
     await interaction.response.defer(ephemeral=True)
     
@@ -4232,8 +4253,17 @@ async def buildwinner_cmd(
         )
         return
     
-    # Get builds for current week
-    week_start = _get_current_week_start()
+    # Determine which week to evaluate (defaults to current week)
+    parsed_week_start = _parse_week_start_from_input(week)
+    if week and not parsed_week_start:
+        await interaction.followup.send(
+            "Invalid week/date. Please use YYYY-MM-DD (example: 2025-12-08).",
+            ephemeral=True
+        )
+        return
+    week_start = parsed_week_start or _get_current_week_start()
+
+    # Get builds for selected week
     builds = await get_builds_for_week(week_start)
     
     if not builds:
