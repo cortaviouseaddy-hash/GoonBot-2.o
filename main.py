@@ -4371,12 +4371,21 @@ async def buildwinner_cmd(
             color=0xFFD700  # Gold
         )
 
-        announcement_text = (
-            f"🎉 Congratulations <@{winner_user_id}>! "
-            f"Your build **{winner_build_title}** won **Build of the Week** with **{winner_votes}** votes! 🏆"
-        )
-        general_announcement_text = f"@everyone {announcement_text}"
         winner_allowed_mentions = discord.AllowedMentions(everyone=True, users=True, roles=False)
+
+        # Human-readable announcement content (requested template)
+        # Note: @everyone is only prefixed for the GENERAL channel post.
+        announcement_text = (
+            "🏆 BUILD OF THE WEEK WINNER 🏆\n"
+            f"Congratulations to <@{winner_user_id}> on taking Build of the Week!\n"
+            f"Your build **{winner_build_title}** earned the most votes and stood out from the rest — well deserved 👏\n\n"
+            "🎁 What you won:\n"
+            "• $10 per video explaining your build\n"
+            "• Your build featured in Monday’s raid\n"
+            "• A dedicated video will be made breaking down your build\n\n"
+            "We’ll reach out with details on the video and raid feature.\n"
+            "Big respect to everyone who submitted — new week, new builds 🔥"
+        )
         
         winner_embed.add_field(
             name="🎉 Congratulations!",
@@ -4414,6 +4423,9 @@ async def buildwinner_cmd(
             jump_url = None
 
         if jump_url:
+            announcement_text = f"{announcement_text}\n\n🔗 View the winning build: {jump_url}"
+
+        if jump_url:
             try:
                 winner_embed.add_field(
                     name="🔗 View Build",
@@ -4449,7 +4461,7 @@ async def buildwinner_cmd(
             if GENERAL_CHANNEL_ID and int(GENERAL_CHANNEL_ID) != int(BUILD_OF_THE_WEEK_CHANNEL_ID):
                 await _send_to_channel_id(
                     int(GENERAL_CHANNEL_ID),
-                    content=general_announcement_text,
+                    content=f"@everyone\n\n{announcement_text}",
                     embed=winner_embed,
                     allowed_mentions=winner_allowed_mentions,
                 )
