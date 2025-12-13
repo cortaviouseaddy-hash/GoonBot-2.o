@@ -4102,6 +4102,7 @@ async def build_cmd(
     # Discord limits thread names to 100 characters
     if len(thread_title) > 100:
         thread_title = thread_title[:97] + "..."
+    build_title = thread_title
     
     # Check if channel is a forum
     if isinstance(channel, discord.ForumChannel):
@@ -4138,6 +4139,7 @@ async def build_cmd(
             "channel_id": channel.id,
             "user_id": user.id,
             "username": username,
+            "build_title": build_title,
             "submitted_at": int(datetime.now().timestamp()),
             "week_of": week_start,
             "activity": activity,
@@ -4189,6 +4191,7 @@ async def build_cmd(
             "channel_id": channel.id,
             "user_id": user.id,
             "username": username,
+            "build_title": build_title,
             "submitted_at": int(datetime.now().timestamp()),
             "week_of": week_start,
             "activity": activity,
@@ -4338,6 +4341,10 @@ async def buildwinner_cmd(
     winner_activity = winner_build.get("activity", "Unknown")
     winner_message_id = winner_build.get("message_id")
     winner_thread_id = winner_build.get("thread_id")
+    winner_build_title = winner_build.get("build_title")
+    if not winner_build_title:
+        # Back-compat for older stored builds
+        winner_build_title = f"{winner_class} {winner_subclass} - {winner_activity}"
     
     # Build results summary for admin
     summary_lines = ["**Vote Results:**"]
@@ -4356,10 +4363,21 @@ async def buildwinner_cmd(
             title="🏆 BUILD OF THE WEEK WINNER! 🏆",
             color=0xFFD700  # Gold
         )
+
+        announcement_text = (
+            f"🎉 Congratulations <@{winner_user_id}>! "
+            f"Your build **{winner_build_title}** won **Build of the Week** with **{winner_votes}** votes! 🏆"
+        )
         
         winner_embed.add_field(
             name="🎉 Congratulations!",
             value=f"<@{winner_user_id}>",
+            inline=False
+        )
+
+        winner_embed.add_field(
+            name="🏷️ Build Title",
+            value=f"**{winner_build_title}**",
             inline=False
         )
         
@@ -4375,11 +4393,19 @@ async def buildwinner_cmd(
             inline=True
         )
         
-        # Link to winning build - use thread URL for forum posts
-        link_id = winner_thread_id if winner_thread_id else winner_message_id
-        if link_id:
+        # Link to winning build
+        # For forum posts: channel_id should be the thread id, and message_id should be the starter message id.
+        jump_url = None
+        try:
+            if interaction.guild_id and winner_thread_id and winner_message_id:
+                jump_url = f"https://discord.com/channels/{interaction.guild_id}/{int(winner_thread_id)}/{int(winner_message_id)}"
+            elif interaction.guild_id and BUILD_OF_THE_WEEK_CHANNEL_ID and winner_message_id:
+                jump_url = f"https://discord.com/channels/{interaction.guild_id}/{int(BUILD_OF_THE_WEEK_CHANNEL_ID)}/{int(winner_message_id)}"
+        except Exception:
+            jump_url = None
+
+        if jump_url:
             try:
-                jump_url = f"https://discord.com/channels/{interaction.guild_id}/{BUILD_OF_THE_WEEK_CHANNEL_ID}/{link_id}"
                 winner_embed.add_field(
                     name="🔗 View Build",
                     value=f"[Jump to Build]({jump_url})",
@@ -4394,13 +4420,27 @@ async def buildwinner_cmd(
         winner_embed.set_footer(text=f"Week of {week_start} to {week_end_str}")
         
         try:
-            await channel.send(embed=winner_embed)
+            # Post in the Build of the Week channel (forum => create a new post)
+            if isinstance(channel, discord.ForumChannel):
+                post_name = f"🏆 Winner — Week of {week_start}"
+                if len(post_name) > 100:
+                    post_name = post_name[:97] + "..."
+                await channel.create_thread(name=post_name, content=announcement_text, embed=winner_embed)
+            else:
+                await channel.send(content=announcement_text, embed=winner_embed)
         except Exception as e:
             await interaction.followup.send(
                 f"Failed to post winner announcement: {e}\n\n{summary}",
                 ephemeral=True
             )
             return
+
+        # Also announce in #general (if configured and different from the BoTW channel)
+        try:
+            if GENERAL_CHANNEL_ID and int(GENERAL_CHANNEL_ID) != int(BUILD_OF_THE_WEEK_CHANNEL_ID):
+                await _send_to_channel_id(int(GENERAL_CHANNEL_ID), content=announcement_text, embed=winner_embed)
+        except Exception:
+            pass
         
         # Store winner record
         winner_record = {
