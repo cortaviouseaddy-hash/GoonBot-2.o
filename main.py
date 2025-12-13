@@ -4467,6 +4467,35 @@ async def buildwinner_cmd(
                 )
         except Exception:
             pass
+
+        # DM the winner with the announcement (no @everyone)
+        dm_sent = False
+        dm_error = None
+        try:
+            winner_user = None
+            try:
+                if interaction.guild:
+                    winner_user = interaction.guild.get_member(int(winner_user_id))
+            except Exception:
+                winner_user = None
+
+            if not winner_user:
+                try:
+                    winner_user = bot.get_user(int(winner_user_id))
+                except Exception:
+                    winner_user = None
+
+            if not winner_user:
+                try:
+                    winner_user = await bot.fetch_user(int(winner_user_id))
+                except Exception:
+                    winner_user = None
+
+            if winner_user:
+                await winner_user.send(content=announcement_text, embed=winner_embed)
+                dm_sent = True
+        except Exception as e:
+            dm_error = str(e)
         
         # Store winner record
         winner_record = {
@@ -4480,8 +4509,19 @@ async def buildwinner_cmd(
         await add_winner(winner_record)
     
     # Send summary to admin
+    dm_note = ""
+    try:
+        if announce:
+            if dm_sent:
+                dm_note = "\n\n📩 Winner was also DM’d."
+            elif dm_error:
+                dm_note = f"\n\n⚠️ Could not DM winner: {dm_error}"
+            else:
+                dm_note = "\n\n⚠️ Could not DM winner (unknown reason)."
+    except Exception:
+        dm_note = ""
     await interaction.followup.send(
-        f"✅ Build of the Week winner determined!\n\n{summary}",
+        f"✅ Build of the Week winner determined!\n\n{summary}{dm_note}",
         ephemeral=True
     )
 
