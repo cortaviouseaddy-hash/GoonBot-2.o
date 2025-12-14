@@ -805,18 +805,175 @@ def _week_start_for_date(d: datetime) -> str:
     monday = d - timedelta(days=days_since_monday)
     return monday.strftime("%Y-%m-%d")
 
-def _parse_week_start_from_input(date_str: Optional[str]) -> Optional[str]:
+def _parse_date_input_any(date_str: Optional[str]) -> Optional[datetime]:
     """
-    Parse a user-provided date (YYYY-MM-DD) and return the Monday of that week.
-    Returns None if date_str is not provided or invalid.
+    Parse a user-provided date in a few common formats.
+
+    Supported:
+    - YYYY-MM-DD (preferred)
+    - YYYY/M/D
+    - M-D-YYYY
+    - M/D/YYYY
     """
     if not date_str:
         return None
-    try:
-        d = datetime.strptime(str(date_str).strip(), "%Y-%m-%d")
-    except Exception:
+    s = str(date_str).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m-%d-%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    # Allow single-digit month/day without zero padding in the same formats.
+    # (datetime.strptime already handles single digits for %m/%d on most platforms,
+    # but this is a safe fallback for edge cases like "12-8-2025".)
+    m = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})\s*$", s)
+    if m:
+        try:
+            mm = int(m.group(1)); dd = int(m.group(2)); yy = int(m.group(3))
+            return datetime(yy, mm, dd)
+        except Exception:
+            return None
+    return None
+
+def _parse_week_start_from_input(date_str: Optional[str]) -> Optional[str]:
+    """
+    Parse a user-provided date and return the Monday of that week as YYYY-MM-DD.
+    Returns None if date_str is not provided or invalid.
+    """
+    d = _parse_date_input_any(date_str)
+    if not d:
         return None
     return _week_start_for_date(d)
+
+def _week_bounds_utc(week_start: str) -> Tuple[datetime, datetime]:
+    """Return [start, end) bounds in UTC for the given week_start (YYYY-MM-DD)."""
+    start = datetime.strptime(str(week_start).strip(), "%Y-%m-%d").replace(tzinfo=datetime_module.timezone.utc)
+    end = start + timedelta(days=7)
+    return start, end
+
+async def _fetch_thread_starter_message(thread: discord.Thread) -> Optional[discord.Message]:
+    """
+    Best-effort fetch of the starter message for a forum thread.
+    """
+    # Fast path that sometimes works for forum posts
+    try:
+        return await thread.fetch_message(int(thread.id))
+    except Exception:
+        pass
+    # Fallback: oldest message in the thread
+    try:
+        async for m in thread.history(limit=1, oldest_first=True):
+            return m
+    except Exception:
+        return None
+
+def _extract_week_of_from_embed(embed: discord.Embed) -> Optional[str]:
+    try:
+        footer = getattr(embed, "footer", None)
+        text = getattr(footer, "text", None) if footer else None
+        if not text:
+            return None
+        m = re.search(r"\bWeek of\s+(\d{4}-\d{2}-\d{2})\b", str(text))
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def _extract_user_id_from_embed(embed: discord.Embed) -> Optional[int]:
+    try:
+        for f in (embed.fields or []):
+            name = str(getattr(f, "name", "") or "")
+            if "submitted by" in name.lower():
+                val = str(getattr(f, "value", "") or "")
+                m = re.search(r"<@!?(\d+)>", val)
+                if m:
+                    return int(m.group(1))
+        return None
+    except Exception:
+        return None
+
+def _extract_activity_from_embed(embed: discord.Embed) -> Optional[str]:
+    try:
+        for f in (embed.fields or []):
+            name = str(getattr(f, "name", "") or "")
+            if "activity" in name.lower():
+                v = str(getattr(f, "value", "") or "").strip()
+                return v or None
+        return None
+    except Exception:
+        return None
+
+async def _scan_builds_in_forum_for_week(channel: discord.ForumChannel, week_start: str) -> List[Dict[str, object]]:
+    """
+    Scan a forum channel for build posts for the specified week.
+    Uses the build embed footer ("Week of YYYY-MM-DD") when available, otherwise falls back to thread.created_at bounds.
+    """
+    start_dt, end_dt = _week_bounds_utc(week_start)
+    threads: List[discord.Thread] = []
+    try:
+        threads.extend(list(channel.threads or []))
+    except Exception:
+        pass
+    # Include archived threads (recent weeks may already be archived)
+    try:
+        async for t in channel.archived_threads(limit=200):
+            try:
+                threads.append(t)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Deduplicate by thread id
+    dedup: Dict[int, discord.Thread] = {}
+    for t in threads:
+        try:
+            dedup[int(t.id)] = t
+        except Exception:
+            continue
+
+    builds: List[Dict[str, object]] = []
+    for thread in dedup.values():
+        created_at = getattr(thread, "created_at", None)
+        if created_at and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=datetime_module.timezone.utc)
+        in_range = bool(created_at and (start_dt <= created_at < end_dt))
+        # If the thread is clearly out of range, skip fetching unless we need to rely on the embed footer.
+        # (Fetching every starter message can be slow in big forums.)
+        if not in_range:
+            continue
+
+        starter = await _fetch_thread_starter_message(thread)
+        if not starter:
+            continue
+        embed = None
+        try:
+            embed = starter.embeds[0] if starter.embeds else None
+        except Exception:
+            embed = None
+
+        embed_week = _extract_week_of_from_embed(embed) if embed else None
+        # If the embed declares a week, trust it (it is how /build tags submissions).
+        if embed_week and embed_week != week_start:
+            continue
+        # If no embed week, only keep it if created_at is within the week bounds (already checked).
+
+        user_id = _extract_user_id_from_embed(embed) if embed else None
+        activity = _extract_activity_from_embed(embed) if embed else None
+        builds.append(
+            {
+                "id": str(thread.id),
+                "message_id": int(getattr(starter, "id", 0) or 0),
+                "thread_id": int(thread.id),
+                "channel_id": int(channel.id),
+                "user_id": int(user_id) if user_id else None,
+                "build_title": str(getattr(thread, "name", "") or ""),
+                "submitted_at": int(starter.created_at.timestamp()) if getattr(starter, "created_at", None) else 0,
+                "week_of": week_start,
+                "activity": activity or "Unknown",
+            }
+        )
+    return builds
 
 def _read_builds_from_disk() -> Dict[str, object]:
     try:
@@ -4267,14 +4424,39 @@ async def buildwinner_cmd(
     parsed_week_start = _parse_week_start_from_input(week)
     if week and not parsed_week_start:
         await interaction.followup.send(
-            "Invalid week/date. Please use YYYY-MM-DD (example: 2025-12-08).",
+            "Invalid week/date. Try `YYYY-MM-DD` (example: 2025-12-08) or `M-D-YYYY` / `M/D/YYYY` (example: 12-8-2025).",
             ephemeral=True
         )
         return
     week_start = parsed_week_start or _get_current_week_start()
 
-    # Get builds for selected week
-    builds = await get_builds_for_week(week_start)
+    # Get builds for selected week (persistent storage), and also scan the forum if applicable.
+    # This prevents "no builds found" when posts exist but were not persisted (or were posted manually).
+    builds: List[Dict[str, object]] = []
+    try:
+        builds = await get_builds_for_week(week_start)
+    except Exception:
+        builds = []
+
+    try:
+        if isinstance(channel, discord.ForumChannel):
+            scanned = await _scan_builds_in_forum_for_week(channel, week_start)
+            if scanned:
+                # Merge + dedupe (prefer persisted entries when available)
+                by_key: Dict[Tuple[Optional[int], Optional[int]], Dict[str, object]] = {}
+                for b in scanned:
+                    try:
+                        by_key[(b.get("thread_id"), b.get("message_id"))] = b
+                    except Exception:
+                        continue
+                for b in (builds or []):
+                    try:
+                        by_key[(b.get("thread_id"), b.get("message_id"))] = b
+                    except Exception:
+                        continue
+                builds = list(by_key.values())
+    except Exception:
+        pass
     
     if not builds:
         await interaction.followup.send(
@@ -4305,7 +4487,13 @@ async def buildwinner_cmd(
                     if thread:
                         msg = await thread.fetch_message(int(message_id))
                 except Exception:
-                    pass
+                    msg = None
+                    # Fallback: try to resolve the starter message robustly
+                    try:
+                        if thread and isinstance(thread, discord.Thread):
+                            msg = await _fetch_thread_starter_message(thread)
+                    except Exception:
+                        msg = None
             else:
                 # Regular text channel
                 msg = await channel.fetch_message(int(message_id))
@@ -4318,8 +4506,11 @@ async def buildwinner_cmd(
             # Find the thumbs up reaction
             for reaction in msg.reactions:
                 if str(reaction.emoji) == "👍":
-                    # Subtract 1 for the bot's own reaction
-                    vote_count = reaction.count - 1
+                    # Subtract 1 if the bot reacted.
+                    try:
+                        vote_count = int(reaction.count) - (1 if getattr(reaction, "me", False) else 0)
+                    except Exception:
+                        vote_count = max(0, int(getattr(reaction, "count", 0) or 0))
                     break
             
             build_votes.append((build, max(0, vote_count)))
