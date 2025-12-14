@@ -812,11 +812,159 @@ def _parse_week_start_from_input(date_str: Optional[str]) -> Optional[str]:
     """
     if not date_str:
         return None
+    raw = str(date_str).strip()
+    # Accept a few common date formats (admins often type "12-8-2025")
+    for fmt in ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%m-%d-%y", "%m/%d/%y"):
+        try:
+            d = datetime.strptime(raw, fmt)
+            return _week_start_for_date(d)
+        except Exception:
+            continue
+    return None
+    return _week_start_for_date(d)
+
+
+def _week_range_utc(week_start: str) -> Tuple[datetime_module.datetime, datetime_module.datetime]:
+    """Return [start, end) for the given YYYY-MM-DD week_start in UTC."""
+    start = datetime_module.datetime.strptime(week_start, "%Y-%m-%d").replace(tzinfo=datetime_module.timezone.utc)
+    end = start + timedelta(days=7)
+    return start, end
+
+
+def _parse_user_id_from_mention(text: object) -> Optional[int]:
     try:
-        d = datetime.strptime(str(date_str).strip(), "%Y-%m-%d")
+        m = re.search(r"<@!?(\\d+)>", str(text or ""))
+        return int(m.group(1)) if m else None
     except Exception:
         return None
-    return _week_start_for_date(d)
+
+
+def _extract_build_info_from_embed(emb: discord.Embed) -> Dict[str, object]:
+    """
+    Extract the minimal fields we need from a /build embed.
+    Returns keys: user_id, activity, guardian_class, subclass.
+    """
+    out: Dict[str, object] = {}
+    try:
+        fields = getattr(emb, "fields", []) or []
+        for f in fields:
+            name = (getattr(f, "name", "") or "").strip().lower()
+            value = getattr(f, "value", None)
+            if "submitted by" in name and "user_id" not in out:
+                uid = _parse_user_id_from_mention(value)
+                if uid:
+                    out["user_id"] = uid
+            elif "activity" in name and "activity" not in out:
+                out["activity"] = str(value or "").strip() or "Unknown"
+            elif "class" in name and "guardian_class" not in out:
+                out["guardian_class"] = str(value or "").strip() or "Unknown"
+            elif "subclass" in name and "subclass" not in out:
+                out["subclass"] = str(value or "").strip() or "Unknown"
+    except Exception:
+        pass
+    return out
+
+
+async def _collect_builds_from_channel(channel: discord.abc.GuildChannel, week_start: str) -> List[Dict[str, object]]:
+    """
+    Fallback: reconstruct builds from the Build-of-the-Week channel itself.
+    This is used when local storage is missing (common on ephemeral hosts).
+    """
+    start, end = _week_range_utc(week_start)
+    builds: List[Dict[str, object]] = []
+
+    def _in_week(dt: Optional[datetime_module.datetime]) -> bool:
+        try:
+            if not dt:
+                return False
+            # created_at is timezone-aware UTC
+            return start <= dt < end
+        except Exception:
+            return False
+
+    async def _try_add_from_message(msg: discord.Message, *, thread_id: Optional[int] = None) -> None:
+        try:
+            if not msg:
+                return
+            emb = (msg.embeds[0] if msg.embeds else None)
+            if not emb:
+                return
+            # Identify our /build submissions by embed title
+            if (getattr(emb, "title", "") or "").strip() != "🔨 BUILD DETAILS":
+                return
+            info = _extract_build_info_from_embed(emb)
+            user_id = info.get("user_id")
+            if not user_id:
+                return
+            builds.append(
+                {
+                    "id": str(thread_id or msg.id),
+                    "message_id": msg.id,
+                    "thread_id": thread_id,
+                    "channel_id": getattr(channel, "id", None),
+                    "user_id": int(user_id),
+                    "week_of": week_start,
+                    "activity": info.get("activity", "Unknown"),
+                    "guardian_class": info.get("guardian_class", "Unknown"),
+                    "subclass": info.get("subclass", "Unknown"),
+                    "build_title": (getattr(msg.channel, "name", None) if isinstance(msg.channel, discord.Thread) else None)
+                    or (getattr(channel, "name", None))
+                    or "Build Submission",
+                }
+            )
+        except Exception:
+            return
+
+    # Forum: scan threads (active + archived) and pull starter message
+    if isinstance(channel, discord.ForumChannel):
+        seen_thread_ids: Set[int] = set()
+
+        async def _scan_thread(th: discord.Thread) -> None:
+            try:
+                if not th or th.id in seen_thread_ids:
+                    return
+                seen_thread_ids.add(th.id)
+                if not _in_week(getattr(th, "created_at", None)):
+                    return
+                # Grab the first message in the thread (starter post)
+                first_msg = None
+                try:
+                    async for m in th.history(limit=1, oldest_first=True):
+                        first_msg = m
+                        break
+                except Exception:
+                    first_msg = None
+                if first_msg:
+                    await _try_add_from_message(first_msg, thread_id=int(th.id))
+            except Exception:
+                return
+
+        # Active threads
+        try:
+            for th in getattr(channel, "threads", []) or []:
+                await _scan_thread(th)
+        except Exception:
+            pass
+
+        # Archived threads
+        try:
+            async for th in channel.archived_threads(limit=100):
+                await _scan_thread(th)
+        except Exception:
+            # Some discord.py versions differ here; ignore and proceed with what we have.
+            pass
+
+        return builds
+
+    # Non-forum text channel: scan messages in-week and pick /build embeds
+    try:
+        if isinstance(channel, discord.TextChannel):
+            async for msg in channel.history(limit=500, after=start, before=end, oldest_first=True):
+                await _try_add_from_message(msg, thread_id=None)
+    except Exception:
+        pass
+
+    return builds
 
 def _read_builds_from_disk() -> Dict[str, object]:
     try:
@@ -4277,8 +4425,17 @@ async def buildwinner_cmd(
     builds = await get_builds_for_week(week_start)
     
     if not builds:
+        # Fallback for ephemeral storage: reconstruct from the channel itself
+        try:
+            builds = await _collect_builds_from_channel(channel, week_start)
+        except Exception:
+            builds = []
+
+    if not builds:
         await interaction.followup.send(
-            f"No builds have been submitted for the week of {week_start}.",
+            f"No builds were found for the week of {week_start}.\n"
+            f"If you submitted builds on a Sunday, they count toward the previous week (Monday start).\n"
+            f"You can pass a date like `2025-12-08` or `12-8-2025` to select the right week.",
             ephemeral=True
         )
         return
