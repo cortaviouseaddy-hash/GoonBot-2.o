@@ -239,15 +239,40 @@ def _cap_for_activity(activity: str) -> int:
 
 def _is_sherpa(member: discord.Member) -> bool:
     try:
-        return any(r.name.lower().startswith("sherpa") for r in member.roles)
+        # Prefer explicit role id when configured; fall back to name matching.
+        # IMPORTANT: avoid treating "Sherpa Assistant" as a full Sherpa role.
+        if SHERPA_ROLE_ID:
+            try:
+                rid = int(SHERPA_ROLE_ID)
+                if any(r.id == rid for r in member.roles):
+                    return True
+            except Exception:
+                pass
+        for r in member.roles:
+            name = (r.name or "").lower().strip()
+            if name.startswith("sherpa") and "assistant" not in name:
+                return True
+        return False
     except Exception:
         return False
 
 def _is_sherpa_assistant(member: discord.Member) -> bool:
     try:
+        # If a role id is configured but stale/wrong, still fall back to name matching
+        # so assistants aren't blocked from signup.
         if SHERPA_ASSISTANT_ROLE_ID:
-            return any(r.id == int(SHERPA_ASSISTANT_ROLE_ID) for r in member.roles)
-        return any(r.name.lower() == "sherpa assistant" for r in member.roles)
+            try:
+                rid = int(SHERPA_ASSISTANT_ROLE_ID)
+                if any(r.id == rid for r in member.roles):
+                    return True
+            except Exception:
+                pass
+        for r in member.roles:
+            name = (r.name or "").lower().strip()
+            # Be permissive (servers vary: "Sherpa Assistant", "Sherpa Assistants", etc.)
+            if "sherpa" in name and "assistant" in name:
+                return True
+        return False
     except Exception:
         return False
 
@@ -1484,8 +1509,9 @@ async def _post_all_activity_boards(fallback_channel_id: Optional[int] = None):
 @app_commands.autocomplete(activity=_activity_autocomplete)
 async def join_cmd(interaction: discord.Interaction, activity: str):
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if member and _is_sherpa(member):
-        await interaction.response.send_message("Sherpa Assistants cannot join queues.", ephemeral=True)
+    # Queue is for players; Sherpas and Assistants should use Sherpa signup posts instead.
+    if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
+        await interaction.response.send_message("Sherpas and Sherpa Assistants cannot join queues.", ephemeral=True)
         return
     act, sug = _resolve_activity(activity)
     if not act:
@@ -3520,7 +3546,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not member:
             return
         # Only Sherpas can join/backup/leave
-        if not _is_sherpa(member):
+        if not (_is_sherpa(member) or _is_sherpa_assistant(member)):
             return
         sherpas: Set[int] = data.get("sherpas") or set()  # type: ignore
         sbackup: List[int] = data.get("sherpa_backup") or []  # type: ignore
@@ -3600,7 +3626,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
             if guild:
                 member = guild.get_member(payload.user_id)
-                if member and _is_sherpa(member):
+                if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
                     channel = bot.get_channel(payload.channel_id) if payload.channel_id else None
                     if channel:
                         try:
