@@ -3482,9 +3482,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 member = guild.get_member(payload.user_id)
                 if not member or not _is_sherpa_assistant(member):
                     return
-                reserved = int(data.get("reserved_sherpas", 0))
-                sherpas: Set[int] = data.get("sherpas")  # type: ignore
-                backup: Set[int] = data.get("sherpa_backup")  # type: ignore
+                # Normalize to sets (defensive: avoids list/set mismatches and keeps counts correct)
+                reserved = int(data.get("reserved_sherpas", 0) or 0)
+                try:
+                    sherpas: Set[int] = set(int(x) for x in (data.get("sherpas") or []))  # type: ignore[arg-type]
+                except Exception:
+                    sherpas = set()
+                try:
+                    backup: Set[int] = set(int(x) for x in (data.get("sherpa_backup") or []))  # type: ignore[arg-type]
+                except Exception:
+                    backup = set()
                 if emoji_str == "✅":
                     # Dedup across lists
                     exists = _user_in_any_event_list(data, member.id)
@@ -3493,6 +3500,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                             sherpas.add(member.id)
                         else:
                             backup.add(member.id)
+                        data["sherpas"] = sherpas
+                        data["sherpa_backup"] = backup
                     await _update_schedule_message(guild, int(mid))
                     try:
                         dm = await member.create_dm()
@@ -3510,6 +3519,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 elif emoji_str == "🔁":
                     if _user_in_any_event_list(data, member.id) is None:
                         backup.add(member.id)
+                        data["sherpa_backup"] = backup
                         await _update_schedule_message(guild, int(mid))
                     return
             else:
