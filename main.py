@@ -3000,6 +3000,10 @@ async def schedule_cmd(
         sherpa_ids = set(_parse_user_ids(sherpas or "", guild)) if sherpas else set()
         participant_ids = _parse_user_ids(participants or "", guild) if participants else []
 
+        # Pre-slotted sherpas count toward reserved slots.
+        # We announce only if there are open Sherpa slots remaining.
+        open_sherpa_slots = max(0, int(reserved) - len(set(int(x) for x in sherpa_ids)))
+
         promoter_id = interaction.user.id
         if promoter_id not in participant_ids:
             participant_ids.insert(0, promoter_id)
@@ -3107,12 +3111,20 @@ async def schedule_cmd(
         sherpa_signup_fallback = None
         if RAID_SIGN_UP_CHANNEL_ID:
             try:
+                if open_sherpa_slots > 0:
+                    sherpa_desc = (
+                        f"{open_sherpa_slots} open Sherpa slot(s) (of {reserved} reserved).\n"
+                        f"React ✅ on **this** post to claim your Sherpa slot.\n"
+                        f"Or react 🔁 to be **Sherpa Backup**."
+                    )
+                else:
+                    sherpa_desc = (
+                        "All reserved Sherpa slots are already filled.\n"
+                        "React 🔁 to be **Sherpa Backup** (or ✅ to be added as backup)."
+                    )
                 sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Signup — {act}",
-                    description=(
-                        f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
-                        f"Or react 🔁 to be **Sherpa Backup**."
-                    ),
+                    description=sherpa_desc,
                     color=_activity_color(act),
                 )
                 sherpa_embed.add_field(name="When", value=when_text, inline=True)
@@ -3140,12 +3152,20 @@ async def schedule_cmd(
         # fallback: if RAID_SIGN_UP_CHANNEL_ID missing or failed, try posting in the event channel
         if not posted_sherpa_signup:
             try:
+                if open_sherpa_slots > 0:
+                    sherpa_desc = (
+                        f"{open_sherpa_slots} open Sherpa slot(s) (of {reserved} reserved).\n"
+                        f"React ✅ on **this** post to claim your Sherpa slot.\n"
+                        f"Or react 🔁 to be **Sherpa Backup**."
+                    )
+                else:
+                    sherpa_desc = (
+                        "All reserved Sherpa slots are already filled.\n"
+                        "React 🔁 to be **Sherpa Backup** (or ✅ to be added as backup)."
+                    )
                 sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Signup — {act}",
-                    description=(
-                        f"{reserved} reserved Sherpa slot(s). React ✅ on **this** post to claim your Sherpa slot.\n"
-                        f"Or react 🔁 to be **Sherpa Backup**."
-                    ),
+                    description=sherpa_desc,
                     color=_activity_color(act),
                 )
                 sherpa_embed.add_field(name="When", value=when_text, inline=True)
@@ -3172,15 +3192,16 @@ async def schedule_cmd(
         # ---- ANNOUNCEMENT 1: General Sherpa ping (GENERAL_SHERPA_CHANNEL_ID) ----
         posted_general_announce = False
         general_announce_fallback = None
-        if GENERAL_SHERPA_CHANNEL_ID:
+        announce_skipped_full = (open_sherpa_slots <= 0)
+        if (not announce_skipped_full) and GENERAL_SHERPA_CHANNEL_ID:
             try:
                 ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
                 gen_embed = discord.Embed(
                     title=f"Sherpa Signup — {act}",
                     description=(
                         f"{when_text}\n"
-                        f"Please use the **Sherpa signup post** to claim your slot (✅). "
-                        f"Extras become **Sherpa Backup**."
+                        f"Open Sherpa slots: **{open_sherpa_slots}** (of {reserved} reserved)\n"
+                        f"Please use the **Sherpa signup post** to claim your slot (✅). Extras become **Sherpa Backup**."
                     ),
                     color=_activity_color(act),
                 )
@@ -3199,15 +3220,15 @@ async def schedule_cmd(
                 try: print("General Sherpa announcement failed:", e)
                 except Exception: pass
         # fallback: if GENERAL_SHERPA_CHANNEL_ID missing or failed, try GENERAL_CHANNEL_ID
-        if not posted_general_announce and GENERAL_CHANNEL_ID:
+        if (not announce_skipped_full) and (not posted_general_announce) and GENERAL_CHANNEL_ID:
             try:
                 ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
                 gen_embed = discord.Embed(
                     title=f"Sherpa Signup — {act}",
                     description=(
                         f"{when_text}\n"
-                        f"Please use the **Sherpa signup post** to claim your slot (✅). "
-                        f"Extras become **Sherpa Backup**."
+                        f"Open Sherpa slots: **{open_sherpa_slots}** (of {reserved} reserved)\n"
+                        f"Please use the **Sherpa signup post** to claim your slot (✅). Extras become **Sherpa Backup**."
                     ),
                     color=_activity_color(act),
                 )
@@ -3284,7 +3305,12 @@ async def schedule_cmd(
             f"Scheduled **{act}**.",
             f"DMed {sent} queued player(s), notified {p_sent} pre-slotted participant(s).",
             f"Sherpa signup posted: {'Yes' if posted_sherpa_signup else 'No'}" + (f" (fallback in <#{sherpa_signup_fallback}>)" if sherpa_signup_fallback else ""),
-            f"General-sherpa announcement: {'Yes' if posted_general_announce else 'No'}" + (f" (fallback in <#{general_announce_fallback}>)" if general_announce_fallback else ""),
+            (
+                "General-sherpa announcement: Skipped (Sherpa slots already filled)."
+                if announce_skipped_full
+                else f"General-sherpa announcement: {'Yes' if posted_general_announce else 'No'}"
+                + (f" (fallback in <#{general_announce_fallback}>)" if general_announce_fallback else "")
+            ),
         ]
         await interaction.followup.send("\n".join(status_lines), ephemeral=True)
 
