@@ -12,6 +12,8 @@ import os
 import asyncio
 import json
 import re
+import time
+import functools
 from datetime import datetime, timedelta
 import datetime as datetime_module
 from typing import Dict, List, Optional, Set, Tuple
@@ -19,6 +21,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import discord
 from discord import app_commands
 from discord.ext import commands
+import requests
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -58,6 +61,22 @@ EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID",
 EVENT_HOST_AUTOJOIN           = _env_bool("EVENT_HOST_AUTOJOIN", True)
 BUILD_OF_THE_WEEK_CHANNEL_ID  = _env_int("BUILD_OF_THE_WEEK_CHANNEL_ID")  # Build submissions channel
 
+# ---------------------------
+# Stream Notification (Twitch/TikTok)
+# ---------------------------
+STREAM_ANNOUNCE_CHANNEL_ID    = _env_int("STREAM_ANNOUNCE_CHANNEL_ID")
+STREAM_ANNOUNCE_EVERYONE      = _env_bool("STREAM_ANNOUNCE_EVERYONE", True)
+STREAM_POLL_SECONDS           = max(15, int(os.getenv("STREAM_POLL_SECONDS", "60") or "60"))
+STREAM_ANNOUNCE_COOLDOWN_SEC  = max(0, int(os.getenv("STREAM_ANNOUNCE_COOLDOWN_SECONDS", "600") or "600"))
+
+ENABLE_TWITCH_NOTIFY          = _env_bool("ENABLE_TWITCH_NOTIFY", True)
+TWITCH_USER_LOGIN             = (os.getenv("TWITCH_USER_LOGIN") or "").strip()
+TWITCH_CLIENT_ID              = (os.getenv("TWITCH_CLIENT_ID") or "").strip()
+TWITCH_CLIENT_SECRET          = (os.getenv("TWITCH_CLIENT_SECRET") or "").strip()
+
+ENABLE_TIKTOK_NOTIFY          = _env_bool("ENABLE_TIKTOK_NOTIFY", True)
+TIKTOK_USERNAME               = (os.getenv("TIKTOK_USERNAME") or "").strip().lstrip("@")
+
 # Optional local overrides via channel_ids.json (non-secret, deploy-time config)
 def _load_channel_overrides() -> None:
     try:
@@ -71,7 +90,7 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID, BUILD_OF_THE_WEEK_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID, BUILD_OF_THE_WEEK_CHANNEL_ID, STREAM_ANNOUNCE_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
@@ -80,6 +99,7 @@ def _load_channel_overrides() -> None:
         ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
         wc = _to_int(data.get("WELCOME_CHANNEL_ID"))
         bw = _to_int(data.get("BUILD_OF_THE_WEEK_CHANNEL_ID"))
+        sc = _to_int(data.get("STREAM_ANNOUNCE_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
@@ -96,6 +116,8 @@ def _load_channel_overrides() -> None:
             WELCOME_CHANNEL_ID = wc
         if bw and not BUILD_OF_THE_WEEK_CHANNEL_ID:
             BUILD_OF_THE_WEEK_CHANNEL_ID = bw
+        if sc and not STREAM_ANNOUNCE_CHANNEL_ID:
+            STREAM_ANNOUNCE_CHANNEL_ID = sc
     except Exception:
         pass
 
@@ -337,6 +359,235 @@ async def _send_to_channel_id(
         try: print("_send_to_channel_id error:", channel_id, e)
         except Exception: pass
         return None
+
+# ---------------------------
+# Stream Notifications
+# ---------------------------
+
+def _stream_state_path() -> str:
+    return os.path.join(DATA_DIR, "stream_state.json")
+
+def _load_stream_state() -> Dict[str, object]:
+    try:
+        p = _stream_state_path()
+        if not os.path.isfile(p):
+            return {}
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_stream_state(state: Dict[str, object]) -> None:
+    try:
+        p = _stream_state_path()
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+async def _http_json(method: str, url: str, *, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, str]] = None, data: Optional[Dict[str, str]] = None, timeout: int = 15) -> Optional[dict]:
+    try:
+        fn = requests.get if method.upper() == "GET" else requests.post
+        call = functools.partial(fn, url, headers=headers, params=params, data=data, timeout=timeout)
+        resp = await asyncio.to_thread(call)
+        if not resp or resp.status_code >= 400:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+async def _http_text(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: int = 15) -> Optional[str]:
+    try:
+        call = functools.partial(requests.get, url, headers=headers, timeout=timeout)
+        resp = await asyncio.to_thread(call)
+        if not resp or resp.status_code >= 400:
+            return None
+        return resp.text
+    except Exception:
+        return None
+
+_TWITCH_TOKEN: Optional[str] = None
+_TWITCH_TOKEN_EXPIRES_AT: float = 0.0
+
+async def _twitch_get_app_token() -> Optional[str]:
+    global _TWITCH_TOKEN, _TWITCH_TOKEN_EXPIRES_AT
+    try:
+        now = time.time()
+        if _TWITCH_TOKEN and now < (_TWITCH_TOKEN_EXPIRES_AT - 30):
+            return _TWITCH_TOKEN
+        if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET):
+            return None
+        j = await _http_json(
+            "POST",
+            "https://id.twitch.tv/oauth2/token",
+            data={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+            timeout=15,
+        )
+        if not j:
+            return None
+        token = j.get("access_token")
+        expires_in = j.get("expires_in")
+        if not token:
+            return None
+        _TWITCH_TOKEN = str(token)
+        try:
+            _TWITCH_TOKEN_EXPIRES_AT = time.time() + int(expires_in or 0)
+        except Exception:
+            _TWITCH_TOKEN_EXPIRES_AT = time.time() + 3600
+        return _TWITCH_TOKEN
+    except Exception:
+        return None
+
+async def _twitch_fetch_stream(user_login: str) -> Optional[Dict[str, str]]:
+    try:
+        login = (user_login or "").strip()
+        if not login:
+            return None
+        token = await _twitch_get_app_token()
+        if not token:
+            return None
+        j = await _http_json(
+            "GET",
+            "https://api.twitch.tv/helix/streams",
+            headers={
+                "Client-ID": TWITCH_CLIENT_ID,
+                "Authorization": f"Bearer {token}",
+            },
+            params={"user_login": login},
+            timeout=15,
+        )
+        if not j or not isinstance(j.get("data"), list) or not j["data"]:
+            return None
+        stream = j["data"][0] or {}
+        sid = str(stream.get("id") or "")
+        title = str(stream.get("title") or "")
+        game = str(stream.get("game_name") or "")
+        started_at = str(stream.get("started_at") or "")
+        return {"id": sid, "title": title, "game_name": game, "started_at": started_at, "user_login": login}
+    except Exception:
+        return None
+
+async def _tiktok_is_live(username: str) -> Optional[Dict[str, str]]:
+    """
+    Best-effort TikTok LIVE detection by scraping public pages.
+    TikTok changes markup frequently; expect occasional false negatives.
+    """
+    try:
+        u = (username or "").strip().lstrip("@")
+        if not u:
+            return None
+        url = f"https://www.tiktok.com/@{u}/live"
+        text = await _http_text(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15,
+        )
+        if not text:
+            return {"is_live": "false", "url": url}
+
+        # Common signals seen in embedded JSON (varies over time)
+        is_live = ('"isLive":true' in text) or ('"status":2' in text) or ('"liveRoom"' in text)
+        room_id = None
+        for pat in (r'"roomId"\s*:\s*"(\d+)"', r'"roomId"\s*:\s*(\d+)', r'"room_id"\s*:\s*"(\d+)"', r'"room_id"\s*:\s*(\d+)'):
+            m = re.search(pat, text)
+            if m:
+                room_id = m.group(1)
+                break
+        return {"is_live": "true" if is_live else "false", "room_id": str(room_id or ""), "url": url, "username": u}
+    except Exception:
+        return None
+
+def _stream_allowed_mentions() -> Optional[discord.AllowedMentions]:
+    if not STREAM_ANNOUNCE_EVERYONE:
+        return discord.AllowedMentions.none()
+    return discord.AllowedMentions(everyone=True, roles=False, users=False, replied_user=False)
+
+async def _announce_stream(platform: str, url: str, *, title: Optional[str] = None, game: Optional[str] = None) -> None:
+    try:
+        ch_id = STREAM_ANNOUNCE_CHANNEL_ID or GENERAL_CHANNEL_ID
+        if not ch_id:
+            return
+        mention = "@everyone " if STREAM_ANNOUNCE_EVERYONE else ""
+        bits: List[str] = [f"{mention}{platform} is LIVE!", url]
+        if title:
+            bits.append(f"**{title}**")
+        if game:
+            bits.append(f"Playing: {game}")
+        content = "\n".join([b for b in bits if b])
+        await _send_to_channel_id(int(ch_id), content=content, allowed_mentions=_stream_allowed_mentions())
+    except Exception:
+        pass
+
+async def _stream_notifier_loop() -> None:
+    state = _load_stream_state()
+    # Normalize defaults
+    last = state.get("last") if isinstance(state.get("last"), dict) else {}
+    if not isinstance(last, dict):
+        last = {}
+    state["last"] = last
+
+    while not bot.is_closed():
+        try:
+            now = time.time()
+
+            # Twitch
+            if ENABLE_TWITCH_NOTIFY and TWITCH_USER_LOGIN:
+                stream = await _twitch_fetch_stream(TWITCH_USER_LOGIN)
+                was_live = str(last.get("twitch_is_live") or "false") == "true"
+                is_live = bool(stream)
+                stream_id = (stream or {}).get("id") if isinstance(stream, dict) else ""
+
+                if is_live and (not was_live or (stream_id and str(last.get("twitch_stream_id") or "") != str(stream_id))):
+                    last_announce = float(last.get("twitch_last_announce_ts") or 0)
+                    if (now - last_announce) >= STREAM_ANNOUNCE_COOLDOWN_SEC:
+                        await _announce_stream(
+                            "Twitch",
+                            f"https://twitch.tv/{TWITCH_USER_LOGIN}",
+                            title=(stream or {}).get("title"),
+                            game=(stream or {}).get("game_name"),
+                        )
+                        last["twitch_last_announce_ts"] = now
+
+                last["twitch_is_live"] = "true" if is_live else "false"
+                if stream_id:
+                    last["twitch_stream_id"] = str(stream_id)
+
+            # TikTok
+            if ENABLE_TIKTOK_NOTIFY and TIKTOK_USERNAME:
+                info = await _tiktok_is_live(TIKTOK_USERNAME)
+                was_live = str(last.get("tiktok_is_live") or "false") == "true"
+                is_live = (info or {}).get("is_live") == "true"
+                room_id = (info or {}).get("room_id") if isinstance(info, dict) else ""
+                url = (info or {}).get("url") if isinstance(info, dict) else f"https://www.tiktok.com/@{TIKTOK_USERNAME}/live"
+
+                if is_live and (not was_live or (room_id and str(last.get("tiktok_room_id") or "") != str(room_id))):
+                    last_announce = float(last.get("tiktok_last_announce_ts") or 0)
+                    if (now - last_announce) >= STREAM_ANNOUNCE_COOLDOWN_SEC:
+                        await _announce_stream("TikTok", str(url or ""))
+                        last["tiktok_last_announce_ts"] = now
+
+                last["tiktok_is_live"] = "true" if is_live else "false"
+                if room_id:
+                    last["tiktok_room_id"] = str(room_id)
+
+            _save_stream_state(state)
+        except Exception:
+            pass
+
+        try:
+            await asyncio.sleep(STREAM_POLL_SECONDS)
+        except Exception:
+            await asyncio.sleep(60)
 
 def _can_send_in_channel(guild: Optional[discord.Guild], channel: object) -> bool:
     try:
@@ -1393,6 +1644,8 @@ async def on_ready():
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     if not getattr(bot, "_autosave_task", None):
         bot._autosave_task = bot.loop.create_task(_autosave_loop())  # type: ignore[attr-defined]
+    if not getattr(bot, "_stream_task", None):
+        bot._stream_task = bot.loop.create_task(_stream_notifier_loop())  # type: ignore[attr-defined]
     print(f"Ready as {bot.user}")
 
 # ---------------------------
