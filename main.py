@@ -2403,6 +2403,10 @@ class ConfirmView(discord.ui.View):
         backups: List[int] = data.get("backups", [])  # type: ignore
         cap = int(data.get("capacity", 0)); reserved = int(data.get("reserved_sherpas", 0))
         player_slots = max(0, cap - reserved)
+        # Late-join cutoff: within 2 hours of start, queued users cannot bump a full roster
+        start_ts = int(data.get("start_ts") or 0)
+        now_ts = int(datetime.utcnow().timestamp())
+        late_full_window = bool(start_ts) and now_ts >= start_ts - 2 * 60 * 60
         # Queue prioritization: users who were in the queue when scheduled are prioritized
         candidates: List[int] = data.get("candidates", []) or []  # type: ignore
         promoter_id: Optional[int] = data.get("promoter_id")  # type: ignore
@@ -2435,6 +2439,13 @@ class ConfirmView(discord.ui.View):
         else:
             # If roster is full but the confirmer is prioritized (queued), try to bump a non-queued participant
             if is_prioritized:
+                if late_full_window:
+                    await interaction.response.send_message(
+                        "Sorry, the roster is full and we're within 2 hours of start. You're still in the queue.",
+                        ephemeral=True,
+                    )
+                    _log_confirmation(self.mid, self.uid, "confirm", "late_full")
+                    return
                 # Find a participant who is NOT in the queued candidate list and is not the promoter
                 bumpable_indices: List[int] = [
                     idx for idx, uid in enumerate(list(participants))
