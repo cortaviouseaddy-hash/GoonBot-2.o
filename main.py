@@ -2441,7 +2441,9 @@ class ConfirmView(discord.ui.View):
             if is_prioritized:
                 if late_full_window:
                     await interaction.response.send_message(
-                        "Sorry, the roster is full and we're within 2 hours of start. You're still in the queue.",
+                        "I'm so sorry—you were too late for this one. "
+                        "If the roster is full, we lock it 2 hours before start so no more bumps happen. "
+                        "You're still in the queue though, and you can try again for the next run.",
                         ephemeral=True,
                     )
                     _log_confirmation(self.mid, self.uid, "confirm", "late_full")
