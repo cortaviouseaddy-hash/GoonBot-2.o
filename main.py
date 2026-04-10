@@ -2017,6 +2017,59 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
 
     await interaction.response.send_message("None of the specified users are in any queues.", ephemeral=True)
 
+@bot.tree.command(name="clearqueue", description="Clear one queue or all queues (founder only)")
+@founder_only()
+@app_commands.describe(activity="(Optional) activity to clear. Leave blank to clear all queues")
+@app_commands.autocomplete(activity=_activity_autocomplete)
+async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    # Refresh queue state from disk first to avoid stale clears in multi-instance setups
+    try:
+        await load_queues()
+        await load_checked()
+    except Exception:
+        pass
+
+    if activity:
+        act, sug = _resolve_activity(activity, list(ALL_ACTIVITIES) + list(QUEUES.keys()))
+        if not act:
+            hint = (" Try: " + ", ".join(sug)) if sug else ""
+            await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
+            return
+
+        queue_was_nonempty = bool(QUEUES.get(act))
+        checked_was_nonempty = bool(CHECKED.get(act))
+        _ensure_queue(act).clear()
+        _ensure_checked(act).clear()
+        await persist_queues(); await persist_checked()
+        await _post_activity_board(act)
+        if queue_was_nonempty or checked_was_nonempty:
+            await interaction.followup.send(f"Cleared queue: {act}.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Queue already empty: {act}.", ephemeral=True)
+        return
+
+    changed_acts: List[str] = []
+    all_acts = set(ALL_ACTIVITIES) | set(QUEUES.keys()) | set(CHECKED.keys())
+    for act in all_acts:
+        queue_was_nonempty = bool(QUEUES.get(act))
+        checked_was_nonempty = bool(CHECKED.get(act))
+        _ensure_queue(act).clear()
+        _ensure_checked(act).clear()
+        if queue_was_nonempty or checked_was_nonempty:
+            changed_acts.append(act)
+
+    await persist_queues(); await persist_checked()
+    for act in changed_acts:
+        await _post_activity_board(act)
+    if changed_acts:
+        await interaction.followup.send(
+            f"Cleared all queues ({len(changed_acts)} updated): {', '.join(sorted(changed_acts))}.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send("All queues are already empty.", ephemeral=True)
+
 @bot.tree.command(name="cancel", description="Cancel an event: deletes its embed(s) and prevents restore")
 @app_commands.describe(message_id="(Optional) event message ID to cancel")
 async def cancel_cmd(interaction: discord.Interaction, message_id: Optional[int] = None):
