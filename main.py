@@ -138,6 +138,8 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 SCHEDULES: Dict[int, Dict[str, object]] = {}
 QUEUES: Dict[str, List[int]] = {}
 CHECKED: Dict[str, Set[int]] = {}
+# activity -> users who requested catty/weapon run while queued
+CATTY_RUNS: Dict[str, Set[int]] = {}
 # activity -> { user_id -> cooldown_until_epoch }
 COOLDOWNS: Dict[str, Dict[int, int]] = {}
 
@@ -200,6 +202,9 @@ def _ensure_queue(activity: str) -> List[int]:
 
 def _ensure_checked(activity: str) -> Set[int]:
     return CHECKED.setdefault(activity, set())
+
+def _ensure_catty(activity: str) -> Set[int]:
+    return CATTY_RUNS.setdefault(activity, set())
 
 def _cap_for_activity(activity: str) -> int:
     """Return player capacity based on presets, with sensible fallbacks.
@@ -313,6 +318,25 @@ def _activity_color(activity: str) -> int:
     if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation")): return 0xE6B500
     if any(k in a for k in ("dungeon", "pit", "crypt", "deep", "spire")): return 0x8A2BE2
     return 0x2F3136  # neutral
+
+def _is_raid_or_dungeon(activity: str) -> bool:
+    """Best-effort raid/dungeon classifier for activity-specific options."""
+    act = activity or ""
+    try:
+        if act in (PRESETS.get("raids") or []):
+            return True
+        if act in (PRESETS.get("dungeons") or []):
+            return True
+        norm = _normalize_activity_text(act)
+        raid_norms = {_normalize_activity_text(a) for a in (PRESETS.get("raids") or [])}
+        dungeon_norms = {_normalize_activity_text(a) for a in (PRESETS.get("dungeons") or [])}
+        return norm in raid_norms or norm in dungeon_norms
+    except Exception:
+        pass
+    a = act.lower()
+    return any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare")) or any(
+        k in a for k in ("dungeon", "pit", "spire", "deep", "watcher", "throne", "prophecy", "grasp", "duality", "ghost", "warlord", "ruin", "avarice")
+    )
 
 async def _send_to_channel_id(
     channel_id: Optional[int],
@@ -580,6 +604,10 @@ QUEUES_LOCK = asyncio.Lock()
 CHECKED_FILE = os.path.join(DATA_DIR, "checked.json")
 CHECKED_LOCK = asyncio.Lock()
 
+# Persistent storage for queue users requesting catty/weapon runs
+CATTY_FILE = os.path.join(DATA_DIR, "catty_runs.json")
+CATTY_LOCK = asyncio.Lock()
+
 # Persistent storage for queue cooldowns (per-activity)
 COOLDOWN_FILE = os.path.join(DATA_DIR, "cooldowns.json")
 COOLDOWNS_LOCK = asyncio.Lock()
@@ -735,6 +763,69 @@ async def load_checked() -> None:
         if loaded:
             for k, v in loaded.items():
                 CHECKED[k] = set(v)
+
+
+# ---------------
+# Catty/weapon run persistence
+# ---------------
+def _read_catty_from_disk() -> Dict[str, Set[int]]:
+    try:
+        path = CATTY_FILE
+        if not os.path.isfile(path):
+            legacy = os.path.join(os.path.dirname(__file__), "catty_runs.json")
+            if os.path.isfile(legacy):
+                path = legacy
+            else:
+                return {}
+        with open(path, "r") as f:
+            raw = json.load(f)
+        out: Dict[str, Set[int]] = {}
+        for k, v in (raw or {}).items():
+            try:
+                name = str(k)
+                ids = {int(x) for x in (v or [])}
+                out[name] = ids
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+def _write_catty_to_disk(state: Dict[str, Set[int]]) -> None:
+    try:
+        tmp_path = f"{CATTY_FILE}.tmp"
+        serializable = {str(k): [int(x) for x in (v or set())] for k, v in state.items()}
+        with open(tmp_path, "w") as f:
+            json.dump(serializable, f)
+            try:
+                f.flush(); os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, CATTY_FILE)
+        try:
+            dir_fd = os.open(os.path.dirname(CATTY_FILE) or ".", os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print("Catty write failed:", e)
+        except Exception:
+            pass
+
+async def persist_catty() -> None:
+    async with CATTY_LOCK:
+        _write_catty_to_disk(CATTY_RUNS)
+
+async def load_catty() -> None:
+    async with CATTY_LOCK:
+        loaded = _read_catty_from_disk()
+        if loaded:
+            for k, v in loaded.items():
+                CATTY_RUNS[k] = set(v)
 
 
 # ---------------
@@ -1235,6 +1326,8 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
 
     if not is_user_event:
         embed.add_field(name="When", value=when or "TBD", inline=False)
+        if data.get("difficulty"):
+            embed.add_field(name="Difficulty", value=str(data.get("difficulty")), inline=True)
 
     promoter_id = data.get("promoter_id")
     if promoter_id:
@@ -1383,12 +1476,13 @@ async def on_ready():
         try:
             await load_queues()
             await load_checked()
+            await load_catty()
             await load_cooldowns()
             await load_builds()
             bot._queues_loaded = True  # type: ignore[attr-defined]
-            print("Queues, checked, and builds loaded from disk")
+            print("Queues, checked, catty, and builds loaded from disk")
         except Exception as e:
-            print("Queue/checked/builds load failed:", e)
+            print("Queue/checked/catty/builds load failed:", e)
     if not getattr(bot, "_sched_task", None):
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     if not getattr(bot, "_autosave_task", None):
@@ -1479,13 +1573,14 @@ async def _post_activity_board(activity: str, fallback_channel_id: Optional[int]
     # Always ensure a queue exists so we can render empty boards as well
     q = _ensure_queue(activity)
     checked = _ensure_checked(activity)
+    catty = _ensure_catty(activity)
     embed = discord.Embed(title=f"Queue — {activity}", color=_activity_color(activity))
     embed.add_field(name="Signed Up", value=str(len(q)), inline=True)
     if q:
-        # If any are checked, annotate legend
-        note = "\n\n✅ = scheduled participant"
-        lines = [f"<@{uid}>{' ✅' if uid in checked else ''}" for uid in q]
-        value = "\n".join(lines) + (note if any(uid in checked for uid in q) else "")
+        # Annotate queue symbols for schedule/check state and catty/weapon requests.
+        note = "\n\n✅ = scheduled participant\n⭐ = needs catty/weapon run"
+        lines = [f"<@{uid}>{' ✅' if uid in checked else ''}{' ⭐' if uid in catty else ''}" for uid in q]
+        value = "\n".join(lines) + (note if any(uid in checked or uid in catty for uid in q) else "")
         embed.add_field(name="Players (in order)", value=value, inline=False)
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
@@ -1505,9 +1600,22 @@ async def _post_all_activity_boards(fallback_channel_id: Optional[int] = None):
 # ---------------------------
 
 @bot.tree.command(name="join", description="Join an activity queue")
-@app_commands.describe(activity="Choose an activity to join")
+@app_commands.describe(
+    activity="Choose an activity to join",
+    catty_weapon_run="Need catty/weapon run? (Yes/No)",
+)
+@app_commands.choices(
+    catty_weapon_run=[
+        app_commands.Choice(name="No", value="no"),
+        app_commands.Choice(name="Yes", value="yes"),
+    ]
+)
 @app_commands.autocomplete(activity=_activity_autocomplete)
-async def join_cmd(interaction: discord.Interaction, activity: str):
+async def join_cmd(
+    interaction: discord.Interaction,
+    activity: str,
+    catty_weapon_run: str = "no",
+):
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
     # Queue is for players; Sherpas and Assistants should use Sherpa signup posts instead.
     if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
@@ -1519,6 +1627,8 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
         await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
         return
     uid = interaction.user.id
+    catty_needed = str(catty_weapon_run or "no").strip().lower() == "yes"
+    catty = _ensure_catty(act)
     # Enforce cooldown for players who just completed this activity via /schedule
     try:
         now = int(datetime.utcnow().timestamp())
@@ -1535,16 +1645,36 @@ async def join_cmd(interaction: discord.Interaction, activity: str):
         pass
     in_any = [a for a, lst in QUEUES.items() if uid in lst]
     if act in in_any:
+        before = uid in catty
+        if catty_needed:
+            catty.add(uid)
+        else:
+            catty.discard(uid)
+        if before != catty_needed:
+            await persist_catty()
+            await interaction.response.send_message(
+                f"You're already in that queue. Updated catty/weapon run: {'Yes ⭐' if catty_needed else 'No'}",
+                ephemeral=True,
+            )
+            await _post_activity_board(act)
+            return
         await interaction.response.send_message("You're already in that queue.", ephemeral=True)
         return
     if len(in_any) >= 2:
         await interaction.response.send_message("You can be in at most 2 different activity queues.", ephemeral=True)
         return
     _ensure_queue(act).append(uid)
+    if catty_needed:
+        catty.add(uid)
+    else:
+        catty.discard(uid)
     await persist_queues()
-    await interaction.response.send_message(f"Joined queue for: {act}", ephemeral=True)
+    await persist_catty()
+    await interaction.response.send_message(
+        f"Joined queue for: {act}" + (" (⭐ catty/weapon run requested)" if catty_needed else ""),
+        ephemeral=True,
+    )
     await _post_activity_board(act)
-
 @bot.tree.command(name="leave", description="Leave an activity queue or an event by message ID")
 @app_commands.describe(activity="(Optional) activity name to leave", message_id="(Optional) event message ID to leave")
 @app_commands.autocomplete(activity=_activity_autocomplete)
@@ -1552,6 +1682,7 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     # Refresh queues from disk to ensure we use the latest queue file state
     try:
         await load_queues()
+        await load_catty()
     except Exception:
         pass
     uid = interaction.user.id
@@ -1586,7 +1717,8 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
         q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
-            await persist_queues()
+            _ensure_catty(act).discard(uid)
+            await persist_queues(); await persist_catty()
             await interaction.response.send_message(f"Left queue: {act}", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -1905,7 +2037,9 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
         # Auto-mark newly added users via schedule/queue as checked when added to a queue via command
         checked = _ensure_checked(act)
         checked.add(uid)
-        await persist_queues(); await persist_checked()
+        # /add does not specify catty/weapon run; default to not requested.
+        _ensure_catty(act).discard(uid)
+        await persist_queues(); await persist_checked(); await persist_catty()
         await interaction.response.send_message(f"Added user to queue: {act}", ephemeral=True)
         await _post_activity_board(act)
         return
@@ -1920,6 +2054,7 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
     # Ensure we are operating on the latest queue state (important with multiple bot instances)
     try:
         await load_queues()
+        await load_catty()
     except Exception:
         pass
     guild = interaction.guild
@@ -1966,16 +2101,19 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
             q[:] = [x for x in q if x not in uid_set]
         after = len(q)
         removed_any = after < before
-        # Also clear green checks if present
+        # Also clear green checks and catty flags if present
         try:
             check = _ensure_checked(act)
+            catty = _ensure_catty(act)
             for uid in uid_set:
                 if uid in check:
                     check.discard(uid)
+                if uid in catty:
+                    catty.discard(uid)
         except Exception:
             pass
         if removed_any:
-            await persist_queues(); await persist_checked()
+            await persist_queues(); await persist_checked(); await persist_catty()
             await interaction.response.send_message("Removed selected user(s) from queue.", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -1994,19 +2132,22 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
             q[:] = [x for x in q if x not in uid_set]
             if len(q) < before_len:
                 changed_acts.append(act)
-                # Also clear green-check marks for removed users in this activity
+                # Also clear green-check marks and catty flags for removed users in this activity
                 try:
                     chk = _ensure_checked(act)
+                    cat = _ensure_catty(act)
                     for uid in uid_set:
                         if uid in chk:
                             chk.discard(uid)
+                        if uid in cat:
+                            cat.discard(uid)
                 except Exception:
                     pass
     except Exception:
         changed_acts = []
 
     if changed_acts:
-        await persist_queues(); await persist_checked()
+        await persist_queues(); await persist_checked(); await persist_catty()
         await interaction.response.send_message(
             f"Removed selected user(s) from queues: {', '.join(changed_acts)}.", ephemeral=True
         )
@@ -2027,6 +2168,7 @@ async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[st
     try:
         await load_queues()
         await load_checked()
+        await load_catty()
     except Exception:
         pass
 
@@ -2039,27 +2181,31 @@ async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[st
 
         queue_was_nonempty = bool(QUEUES.get(act))
         checked_was_nonempty = bool(CHECKED.get(act))
+        catty_was_nonempty = bool(CATTY_RUNS.get(act))
         _ensure_queue(act).clear()
         _ensure_checked(act).clear()
-        await persist_queues(); await persist_checked()
+        _ensure_catty(act).clear()
+        await persist_queues(); await persist_checked(); await persist_catty()
         await _post_activity_board(act)
-        if queue_was_nonempty or checked_was_nonempty:
+        if queue_was_nonempty or checked_was_nonempty or catty_was_nonempty:
             await interaction.followup.send(f"Cleared queue: {act}.", ephemeral=True)
         else:
             await interaction.followup.send(f"Queue already empty: {act}.", ephemeral=True)
         return
 
     changed_acts: List[str] = []
-    all_acts = set(ALL_ACTIVITIES) | set(QUEUES.keys()) | set(CHECKED.keys())
+    all_acts = set(ALL_ACTIVITIES) | set(QUEUES.keys()) | set(CHECKED.keys()) | set(CATTY_RUNS.keys())
     for act in all_acts:
         queue_was_nonempty = bool(QUEUES.get(act))
         checked_was_nonempty = bool(CHECKED.get(act))
+        catty_was_nonempty = bool(CATTY_RUNS.get(act))
         _ensure_queue(act).clear()
         _ensure_checked(act).clear()
-        if queue_was_nonempty or checked_was_nonempty:
+        _ensure_catty(act).clear()
+        if queue_was_nonempty or checked_was_nonempty or catty_was_nonempty:
             changed_acts.append(act)
 
-    await persist_queues(); await persist_checked()
+    await persist_queues(); await persist_checked(); await persist_catty()
     for act in changed_acts:
         await _post_activity_board(act)
     if changed_acts:
@@ -2219,6 +2365,7 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     # Ensure the most recent on-disk state is used, especially with multiple instances
     try:
         await load_queues()
+        await load_catty()
     except Exception:
         pass
     if activity:
@@ -2816,7 +2963,7 @@ async def _autosave_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            await persist_queues(); await persist_checked(); await persist_cooldowns()
+            await persist_queues(); await persist_checked(); await persist_catty(); await persist_cooldowns()
         except Exception:
             pass
         await asyncio.sleep(60)
@@ -2998,6 +3145,7 @@ async def on_message_delete(message: discord.Message):
     activity="Activity name",
     datetime_str="Date and time (MM-DD HH:MM, 24h)",
     timezone="Timezone (dropdown)",
+    difficulty="Difficulty (raids/dungeons only)",
     reserved_sherpas="Number of Sherpa slots to reserve (default 2)",
     sherpas="User(s) to pre-slot as Sherpa (optional)",
     participants="User(s) to pre-slot as Participant (optional)",
@@ -3013,6 +3161,10 @@ async def on_message_delete(message: discord.Message):
         app_commands.Choice(name="Europe/London", value="Europe/London"),
         app_commands.Choice(name="Europe/Paris", value="Europe/Paris"),
         app_commands.Choice(name="Asia/Tokyo", value="Asia/Tokyo"),
+    ],
+    difficulty=[
+        app_commands.Choice(name="Normal", value="Normal"),
+        app_commands.Choice(name="Master", value="Master"),
     ]
 )
 async def schedule_cmd(
@@ -3020,6 +3172,7 @@ async def schedule_cmd(
     activity: str,
     datetime_str: str,
     timezone: str = "America/New_York",
+    difficulty: Optional[str] = None,
     reserved_sherpas: Optional[int] = 2,
     sherpas: Optional[str] = None,
     participants: Optional[str] = None,
@@ -3034,6 +3187,9 @@ async def schedule_cmd(
         if not act:
             hint = (" Try: " + ", ".join(sug)) if sug else ""
             await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True); return
+
+        is_raid_dungeon = _is_raid_or_dungeon(act)
+        selected_difficulty = difficulty if is_raid_dungeon else None
 
         # Channel: main event embed must go into EVENT_SIGNUP_CHANNEL_ID (fallback: current channel)
         channel_id = (EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id)
@@ -3118,6 +3274,7 @@ async def schedule_cmd(
             "when_text": when_text,
             "capacity": cap,
             "reserved_sherpas": reserved,
+            "difficulty": selected_difficulty,
             "sherpas": sherpa_ids,
             "sherpa_backup": set(),
             "candidates": candidates,
@@ -3368,7 +3525,7 @@ async def schedule_cmd(
 
         # Build a concise status summary for the promoter
         status_lines = [
-            f"Scheduled **{act}**.",
+            f"Scheduled **{act}**" + (f" ({selected_difficulty})" if selected_difficulty else "") + ".",
             f"DMed {sent} queued player(s), notified {p_sent} pre-slotted participant(s).",
             f"Sherpa signup posted: {'Yes' if posted_sherpa_signup else 'No'}" + (f" (fallback in <#{sherpa_signup_fallback}>)" if sherpa_signup_fallback else ""),
             (
@@ -3378,6 +3535,8 @@ async def schedule_cmd(
                 + (f" (fallback in <#{general_announce_fallback}>)" if general_announce_fallback else "")
             ),
         ]
+        if difficulty and not is_raid_dungeon:
+            status_lines.append("Difficulty ignored: this option is only used for raids and dungeons.")
         await interaction.followup.send("\n".join(status_lines), ephemeral=True)
 
     except Exception as e:
