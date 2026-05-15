@@ -142,6 +142,9 @@ CHECKED: Dict[str, Set[int]] = {}
 CATTY_RUNS: Dict[str, Set[int]] = {}
 # activity -> { user_id -> cooldown_until_epoch }
 COOLDOWNS: Dict[str, Dict[int, int]] = {}
+# (channel_id, user_id) -> last auto-help reply epoch seconds
+HELP_REPLY_LAST_SENT: Dict[Tuple[int, int], int] = {}
+HELP_REPLY_COOLDOWN_SECONDS = 20
 
 # ---------------------------
 # External Helpers (project)
@@ -419,6 +422,147 @@ def _resolve_welcome_channel_id(guild: Optional[discord.Guild]) -> Optional[int]
     except Exception as e:
         try: print("resolve_welcome_channel error:", e)
         except Exception: pass
+    return None
+
+def _help_channel_ids() -> Set[int]:
+    ids: Set[int] = set()
+    for cid in (GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID):
+        try:
+            if cid:
+                ids.add(int(cid))
+        except Exception:
+            pass
+    return ids
+
+def _channel_mention_or_fallback(channel_id: Optional[int], fallback: str) -> str:
+    try:
+        if channel_id:
+            return f"<#{int(channel_id)}>"
+    except Exception:
+        pass
+    return fallback
+
+def _help_reply_rate_limited(channel_id: int, user_id: int) -> bool:
+    """Return True if we should skip replying due to short cooldown."""
+    try:
+        now = int(datetime.utcnow().timestamp())
+        key = (int(channel_id), int(user_id))
+        last = int(HELP_REPLY_LAST_SENT.get(key, 0) or 0)
+        if (now - last) < int(HELP_REPLY_COOLDOWN_SECONDS):
+            return True
+        HELP_REPLY_LAST_SENT[key] = now
+        # Keep this small and bounded over long uptimes.
+        if len(HELP_REPLY_LAST_SENT) > 5000:
+            cutoff = now - 6 * 60 * 60
+            for k, ts in list(HELP_REPLY_LAST_SENT.items()):
+                if int(ts) < cutoff:
+                    HELP_REPLY_LAST_SENT.pop(k, None)
+        return False
+    except Exception:
+        return False
+
+def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) -> Optional[str]:
+    text = " ".join((message_text or "").lower().split())
+    if not text:
+        return None
+
+    def has_any(*phrases: str) -> bool:
+        return any(p in text for p in phrases)
+
+    has_question_tone = ("?" in text) or text.startswith(
+        ("how ", "where ", "what ", "can ", "do ", "is ", "are ", "when ", "which ", "who ", "why ", "help")
+    )
+    asks_signup = has_any("sign up", "signup", "join", "register", "queue", "lfg")
+    asks_where = has_any("where", "which channel", "what channel")
+    asks_leave = has_any("leave", "cancel", "drop", "remove me", "step out")
+    asks_commands = has_any("commands", "command", "slash", "bot command", "how to use bot")
+    asks_reactions = has_any("reaction", "reactions", "emoji", "what does ✅", "what does 🔁", "what does 📝", "what does ❌", "backup")
+    asks_queue_spot = has_any("queue position", "spot in queue", "where am i in queue", "am i queued", "queue spot")
+    asks_sherpa = has_any("sherpa", "teach", "teaching run", "first time", "new player")
+    asks_hosting = has_any("create event", "make event", "host run", "post event", "schedule run")
+    asks_time = has_any("when", "what time", "start time", "timezone", "utc", "est", "pst", "cst", "mst")
+    raid_or_dungeon = has_any("raid", "raids", "dungeon", "dungeons")
+    activity_context = has_any(
+        "raid", "raids", "dungeon", "dungeons", "lfg", "queue", "join", "signup", "sign up",
+        "event", "events", "run", "runs", "sherpa", "fireteam", "activity"
+    )
+
+    signup_channel = _channel_mention_or_fallback(EVENT_SIGNUP_CHANNEL_ID, "the event-signup channel")
+    queue_channel = _channel_mention_or_fallback(RAID_QUEUE_CHANNEL_ID, "the queue channel")
+    lfg_channel = _channel_mention_or_fallback(LFG_CHAT_CHANNEL_ID, "#lfg")
+
+    if asks_commands and activity_context:
+        return (
+            "Common commands:\n"
+            "• **/join** — join an activity queue\n"
+            "• **/queue** — view current queues\n"
+            "• **/leave** — leave a queue/signup\n"
+            "• **/event** — create a player event signup\n"
+            "• **/event_sherpa** — create a Sherpa-only signup\n"
+            "If you’re unsure, ask your question and I’ll point you to the right command."
+        )
+
+    if asks_signup and raid_or_dungeon:
+        return (
+            "For raid/dungeon signups:\n"
+            "1) Use **/join** and pick the activity.\n"
+            f"2) Check your spot with **/queue** (or watch {queue_channel}).\n"
+            f"3) Watch {signup_channel} for event posts and react **✅** to join or **🔁** for backup.\n"
+            "Need to back out? Use **/leave**."
+        )
+
+    if asks_queue_spot and activity_context:
+        return f"Use **/queue** to see your current position. Queue boards are posted in {queue_channel}."
+
+    if asks_where and any(k in text for k in ("sign", "join", "event", "raid", "dungeon")):
+        return (
+            f"Raid and dungeon events are posted in {signup_channel}, and chat/LFG updates happen in {lfg_channel}. "
+            "Use **/join** to enter the queue, then **/queue** to see your position."
+        )
+
+    if asks_reactions and activity_context:
+        return (
+            "Reaction guide on event posts:\n"
+            "• **✅** = join if a slot is open\n"
+            "• **🔁** = backup/waitlist\n"
+            "• **📝** = interest note (when enabled)\n"
+            "• **❌** = leave/cancel your participation"
+        )
+
+    if asks_leave and any(k in text for k in ("raid", "dungeon", "queue", "run", "signup")):
+        return "Use **/leave** to step out of a raid/dungeon queue or signup."
+
+    if asks_sherpa and activity_context:
+        return (
+            "New/learning runs are welcome. Join with **/join**, then watch event posts in "
+            f"{signup_channel}. If Sherpas are needed, those runs will call it out in {lfg_channel}."
+        )
+
+    if asks_hosting and activity_context:
+        return (
+            "To host, use:\n"
+            "• **/event** for normal player signups\n"
+            "• **/event_sherpa** for Sherpa-only signups\n"
+            "If permissions block it, ask a founder/admin for event-host access."
+        )
+
+    if asks_time and activity_context:
+        return (
+            f"Event posts in {signup_channel} include the scheduled time. "
+            "You’ll also get reminders before start when applicable."
+        )
+
+    if has_question_tone and (activity_context or direct_bot_question):
+        return (
+            "I can help with raid/dungeon/LFG questions. Try asking:\n"
+            "• **How do I sign up for raids?**\n"
+            "• **Where are event posts?**\n"
+            "• **How do I check queue position?**\n"
+            "• **What do the reactions mean?**\n"
+            "• **How do I leave the queue?**\n"
+            "• **Which command should I use?**"
+        )
+
     return None
 
 def _find_activity_image(activity: str) -> Optional[str]:
@@ -1560,6 +1704,36 @@ async def on_member_join(member: discord.Member):
             except Exception: pass
     except Exception:
         pass
+
+@bot.event
+async def on_message(message: discord.Message):
+    try:
+        if message.author.bot:
+            return
+        channel_id = getattr(message.channel, "id", None)
+        if not channel_id:
+            return
+        if int(channel_id) not in _help_channel_ids():
+            return
+
+        is_direct_bot_question = False
+        try:
+            if bot.user:
+                is_direct_bot_question = bot.user.mentioned_in(message)
+        except Exception:
+            is_direct_bot_question = False
+
+        reply = _chat_help_reply(message.content or "", direct_bot_question=is_direct_bot_question)
+        if reply:
+            if _help_reply_rate_limited(int(channel_id), int(message.author.id)):
+                return
+            await message.reply(reply, mention_author=False)
+    except Exception as e:
+        try: print("chat help reply failed:", e)
+        except Exception: pass
+    finally:
+        # Keep prefix-command behavior intact when on_message is present.
+        await bot.process_commands(message)
 
 # ---------------------------
 # Queue Boards (optional utility)
