@@ -146,6 +146,9 @@ COOLDOWNS: Dict[str, Dict[int, int]] = {}
 HELP_REPLY_LAST_SENT: Dict[Tuple[int, int], int] = {}
 HELP_REPLY_COOLDOWN_SECONDS = 20
 _ACTIVITY_ALIAS_CACHE: Optional[Dict[str, str]] = None
+HELP_QUEUE_CONFIRM_PENDING: Dict[Tuple[int, int], Dict[str, object]] = {}
+HELP_QUEUE_CONFIRM_TTL_SECONDS = 180
+HELP_REMINDER_FOOTER = "Don't forget to message @GFerryGoon."
 
 # ---------------------------
 # External Helpers (project)
@@ -540,16 +543,178 @@ def _extract_activity_from_help_text(message_text: str) -> Tuple[Optional[str], 
             return act, True
     return None, False
 
-def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) -> Optional[str]:
+def _set_help_queue_confirm(channel_id: int, user_id: int, activity: str) -> None:
+    try:
+        now = int(datetime.utcnow().timestamp())
+        HELP_QUEUE_CONFIRM_PENDING[(int(channel_id), int(user_id))] = {
+            "activity": str(activity),
+            "expires_at": now + int(HELP_QUEUE_CONFIRM_TTL_SECONDS),
+        }
+        # Keep pending confirmations bounded.
+        if len(HELP_QUEUE_CONFIRM_PENDING) > 3000:
+            for key, data in list(HELP_QUEUE_CONFIRM_PENDING.items()):
+                try:
+                    if int(data.get("expires_at", 0) or 0) < now:
+                        HELP_QUEUE_CONFIRM_PENDING.pop(key, None)
+                except Exception:
+                    HELP_QUEUE_CONFIRM_PENDING.pop(key, None)
+    except Exception:
+        pass
+
+def _get_help_queue_confirm(channel_id: int, user_id: int) -> Optional[str]:
+    try:
+        now = int(datetime.utcnow().timestamp())
+        data = HELP_QUEUE_CONFIRM_PENDING.get((int(channel_id), int(user_id)))
+        if not data:
+            return None
+        expires_at = int(data.get("expires_at", 0) or 0)
+        if expires_at and now > expires_at:
+            HELP_QUEUE_CONFIRM_PENDING.pop((int(channel_id), int(user_id)), None)
+            return None
+        activity = str(data.get("activity") or "").strip()
+        return activity or None
+    except Exception:
+        return None
+
+def _clear_help_queue_confirm(channel_id: int, user_id: int) -> None:
+    try:
+        HELP_QUEUE_CONFIRM_PENDING.pop((int(channel_id), int(user_id)), None)
+    except Exception:
+        pass
+
+def _is_affirmative_help_reply(message_text: str) -> bool:
+    txt = _normalize_activity_text(message_text or "")
+    if not txt:
+        return False
+    affirm_set = {
+        "y", "yes", "yea", "yeah", "yep", "yup", "ok", "okay", "sure", "please",
+        "do it", "go ahead", "sounds good", "for sure", "affirmative",
+    }
+    if txt in affirm_set:
+        return True
+    return txt.startswith(("yes ", "yeah ", "yep ", "ok ", "okay ", "sure "))
+
+def _is_negative_help_reply(message_text: str) -> bool:
+    txt = _normalize_activity_text(message_text or "")
+    if not txt:
+        return False
+    negative_set = {
+        "n", "no", "nah", "nope", "not now", "cancel", "stop", "never mind",
+    }
+    if txt in negative_set:
+        return True
+    return txt.startswith(("no ", "nah ", "nope ", "not now "))
+
+async def _reply_queue_confirmation_embed(
+    message: discord.Message,
+    *,
+    activity: str,
+    status: str,
+    details: str,
+    success: bool,
+) -> None:
+    embed = discord.Embed(
+        title="Queue Confirmation",
+        description=details,
+        color=(0x57F287 if success else 0xED4245),
+    )
+    embed.add_field(name="Activity", value=activity, inline=True)
+    embed.add_field(name="Status", value=status, inline=True)
+    embed.set_footer(text=HELP_REMINDER_FOOTER)
+    await message.reply(embed=embed, mention_author=False)
+
+async def _join_queue_from_help_confirmation(message: discord.Message, activity: str) -> None:
+    member = message.author if isinstance(message.author, discord.Member) else None
+    uid = int(message.author.id)
+
+    # Queue is for players; Sherpas and Assistants use Sherpa signup posts.
+    if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
+        await _reply_queue_confirmation_embed(
+            message,
+            activity=activity,
+            status="Not Added",
+            details="Sherpas and Sherpa Assistants cannot join player queues.",
+            success=False,
+        )
+        return
+
+    act, _ = _resolve_activity(activity, list(ALL_ACTIVITIES) + list(QUEUES.keys()))
+    if not act:
+        await _reply_queue_confirmation_embed(
+            message,
+            activity=activity,
+            status="Not Added",
+            details="I couldn't find that activity queue. Try `/join` and pick from autocomplete.",
+            success=False,
+        )
+        return
+
+    # Enforce per-activity cooldown.
+    try:
+        now = int(datetime.utcnow().timestamp())
+        cd_map = COOLDOWNS.get(act, {})
+        until = int(cd_map.get(uid, 0) or 0)
+        if until and now < until:
+            remaining = until - now
+            hrs = max(1, int((remaining + 3599) // 3600))
+            await _reply_queue_confirmation_embed(
+                message,
+                activity=act,
+                status="Cooldown Active",
+                details=f"You can rejoin **{act}** in about {hrs} hour(s).",
+                success=False,
+            )
+            return
+    except Exception:
+        pass
+
+    in_any = [a for a, lst in QUEUES.items() if uid in lst]
+    q = _ensure_queue(act)
+    if act in in_any:
+        pos = q.index(uid) + 1 if uid in q else len(q)
+        await _reply_queue_confirmation_embed(
+            message,
+            activity=act,
+            status="Already Queued",
+            details=f"You're already in the queue at position **#{pos}** ({len(q)} total).",
+            success=True,
+        )
+        return
+
+    if len(in_any) >= 2:
+        await _reply_queue_confirmation_embed(
+            message,
+            activity=act,
+            status="Queue Limit Reached",
+            details="You can be in at most **2** different activity queues at a time.",
+            success=False,
+        )
+        return
+
+    q.append(uid)
+    _ensure_catty(act).discard(uid)
+    await persist_queues()
+    await persist_catty()
+    pos = q.index(uid) + 1
+    await _post_activity_board(act)
+    await _reply_queue_confirmation_embed(
+        message,
+        activity=act,
+        status="Added to Queue",
+        details=f"You're signed up for **{act}** at position **#{pos}** ({len(q)} total).",
+        success=True,
+    )
+
+def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) -> Tuple[Optional[str], Optional[str]]:
     text = " ".join((message_text or "").lower().split())
     if not text:
-        return None
+        return None, None
 
     def has_any(*phrases: str) -> bool:
         return any(p in text for p in phrases)
 
     def with_footer(reply_text: str) -> str:
-        return reply_text.rstrip() + "\n\nDon't forget to message @GFerryGoon."
+        return reply_text.rstrip() + f"\n\n{HELP_REMINDER_FOOTER}"
 
     has_question_tone = ("?" in text) or text.startswith(
         ("how ", "where ", "what ", "can ", "do ", "is ", "are ", "when ", "which ", "who ", "why ", "help")
@@ -585,7 +750,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "• **/event** — create a player event signup\n"
             "• **/event_sherpa** — create a Sherpa-only signup\n"
             "If you’re unsure, ask your question and I’ll point you to the right command."
-        )
+        ), None
 
     if asks_join_raid:
         return with_footer(
@@ -593,7 +758,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "1) Use **/join** and select the raid.\n"
             f"2) Use **/queue** to check your place (or watch {queue_channel}).\n"
             f"3) Watch {signup_channel} and react **✅** when your run is posted."
-        )
+        ), None
 
     if asks_how_to_join and mentioned_activity and _is_raid_or_dungeon(mentioned_activity):
         alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
@@ -601,14 +766,14 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             f"I see **{mentioned_activity}**{alias_hint}. Do you want to be signed up for that queue?\n"
             f"If yes, run **/join** and select **{mentioned_activity}**.\n"
             f"Then use **/queue** (or check {queue_channel}) to confirm your spot."
-        )
+        ), mentioned_activity
 
     if asks_signup and mentioned_activity and _is_raid_or_dungeon(mentioned_activity):
         alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
         return with_footer(
             f"Do you want to be signed up for **{mentioned_activity}**{alias_hint} queue?\n"
             f"Use **/join** and pick **{mentioned_activity}**, then check **/queue**."
-        )
+        ), mentioned_activity
 
     if asks_signup and raid_or_dungeon:
         return with_footer(
@@ -617,16 +782,16 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             f"2) Check your spot with **/queue** (or watch {queue_channel}).\n"
             f"3) Watch {signup_channel} for event posts and react **✅** to join or **🔁** for backup.\n"
             "Need to back out? Use **/leave**."
-        )
+        ), None
 
     if asks_queue_spot and activity_context:
-        return with_footer(f"Use **/queue** to see your current position. Queue boards are posted in {queue_channel}.")
+        return with_footer(f"Use **/queue** to see your current position. Queue boards are posted in {queue_channel}."), None
 
     if asks_where and any(k in text for k in ("sign", "join", "event", "raid", "dungeon")):
         return with_footer(
             f"Raid and dungeon events are posted in {signup_channel}, and chat/LFG updates happen in {lfg_channel}. "
             "Use **/join** to enter the queue, then **/queue** to see your position."
-        )
+        ), None
 
     if asks_reactions and activity_context:
         return with_footer(
@@ -635,16 +800,16 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "• **🔁** = backup/waitlist\n"
             "• **📝** = interest note (when enabled)\n"
             "• **❌** = leave/cancel your participation"
-        )
+        ), None
 
     if asks_leave and any(k in text for k in ("raid", "dungeon", "queue", "run", "signup")):
-        return with_footer("Use **/leave** to step out of a raid/dungeon queue or signup.")
+        return with_footer("Use **/leave** to step out of a raid/dungeon queue or signup."), None
 
     if asks_sherpa and activity_context:
         return with_footer(
             "New/learning runs are welcome. Join with **/join**, then watch event posts in "
             f"{signup_channel}. If Sherpas are needed, those runs will call it out in {lfg_channel}."
-        )
+        ), None
 
     if asks_hosting and activity_context:
         return with_footer(
@@ -652,13 +817,13 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "• **/event** for normal player signups\n"
             "• **/event_sherpa** for Sherpa-only signups\n"
             "If permissions block it, ask a founder/admin for event-host access."
-        )
+        ), None
 
     if asks_time and activity_context:
         return with_footer(
             f"Event posts in {signup_channel} include the scheduled time. "
             "You’ll also get reminders before start when applicable."
-        )
+        ), None
 
     if has_question_tone and (activity_context or direct_bot_question):
         return with_footer(
@@ -670,9 +835,9 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "• **What do the reactions mean?**\n"
             "• **How do I leave the queue?**\n"
             "• **Which command should I use?**"
-        )
+        ), None
 
-    return None
+    return None, None
 
 def _find_activity_image(activity: str) -> Optional[str]:
     aset = os.path.join(os.path.dirname(__file__), "assets")
@@ -1825,6 +1990,20 @@ async def on_message(message: discord.Message):
         if int(channel_id) not in _help_channel_ids():
             return
 
+        pending_activity = _get_help_queue_confirm(int(channel_id), int(message.author.id))
+        if pending_activity:
+            if _is_affirmative_help_reply(message.content or ""):
+                _clear_help_queue_confirm(int(channel_id), int(message.author.id))
+                await _join_queue_from_help_confirmation(message, pending_activity)
+                return
+            if _is_negative_help_reply(message.content or ""):
+                _clear_help_queue_confirm(int(channel_id), int(message.author.id))
+                await message.reply(
+                    f"No problem. If you change your mind, use **/join** for **{pending_activity}**.\n\n{HELP_REMINDER_FOOTER}",
+                    mention_author=False,
+                )
+                return
+
         is_direct_bot_question = False
         try:
             if bot.user:
@@ -1832,11 +2011,13 @@ async def on_message(message: discord.Message):
         except Exception:
             is_direct_bot_question = False
 
-        reply = _chat_help_reply(message.content or "", direct_bot_question=is_direct_bot_question)
+        reply, pending_prompt_activity = _chat_help_reply(message.content or "", direct_bot_question=is_direct_bot_question)
         if reply:
             if _help_reply_rate_limited(int(channel_id), int(message.author.id)):
                 return
             await message.reply(reply, mention_author=False)
+            if pending_prompt_activity:
+                _set_help_queue_confirm(int(channel_id), int(message.author.id), pending_prompt_activity)
     except Exception as e:
         try: print("chat help reply failed:", e)
         except Exception: pass
