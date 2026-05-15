@@ -421,6 +421,67 @@ def _resolve_welcome_channel_id(guild: Optional[discord.Guild]) -> Optional[int]
         except Exception: pass
     return None
 
+def _help_channel_ids() -> Set[int]:
+    ids: Set[int] = set()
+    for cid in (GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID):
+        try:
+            if cid:
+                ids.add(int(cid))
+        except Exception:
+            pass
+    return ids
+
+def _channel_mention_or_fallback(channel_id: Optional[int], fallback: str) -> str:
+    try:
+        if channel_id:
+            return f"<#{int(channel_id)}>"
+    except Exception:
+        pass
+    return fallback
+
+def _chat_help_reply(message_text: str) -> Optional[str]:
+    text = " ".join((message_text or "").lower().split())
+    if not text:
+        return None
+
+    has_question_tone = ("?" in text) or text.startswith(("how ", "where ", "what ", "can ", "do ", "is ", "are "))
+    asks_signup = any(k in text for k in ("sign up", "signup", "join", "register", "queue", "lfg"))
+    raid_or_dungeon = any(k in text for k in ("raid", "raids", "dungeon", "dungeons"))
+    asks_where = any(k in text for k in ("where", "which channel", "what channel"))
+    asks_leave = any(k in text for k in ("leave", "cancel", "drop", "remove me"))
+
+    signup_channel = _channel_mention_or_fallback(EVENT_SIGNUP_CHANNEL_ID, "the event-signup channel")
+    queue_channel = _channel_mention_or_fallback(RAID_QUEUE_CHANNEL_ID, "the queue channel")
+    lfg_channel = _channel_mention_or_fallback(LFG_CHAT_CHANNEL_ID, "#lfg")
+
+    if asks_signup and raid_or_dungeon:
+        return (
+            "For raid/dungeon signups:\n"
+            "1) Use **/join** and pick the activity.\n"
+            f"2) Check your spot with **/queue** (or watch {queue_channel}).\n"
+            f"3) Watch {signup_channel} for event posts and react **✅** to join or **🔁** for backup.\n"
+            "Need to back out? Use **/leave**."
+        )
+
+    if asks_where and any(k in text for k in ("sign", "join", "event", "raid", "dungeon")):
+        return (
+            f"Raid and dungeon events are posted in {signup_channel}, and chat/LFG updates happen in {lfg_channel}. "
+            "Use **/join** to enter the queue, then **/queue** to see your position."
+        )
+
+    if asks_leave and any(k in text for k in ("raid", "dungeon", "queue", "run", "signup")):
+        return "Use **/leave** to step out of a raid/dungeon queue or signup."
+
+    if has_question_tone and any(k in text for k in ("raid", "dungeon", "lfg", "queue", "signup", "join", "event")):
+        return (
+            "I can help with raid/dungeon signups. Try:\n"
+            "• **How do I sign up for raids?**\n"
+            "• **Where are event posts?**\n"
+            "• **How do I leave the queue?**"
+        )
+
+    return None
+
 def _find_activity_image(activity: str) -> Optional[str]:
     aset = os.path.join(os.path.dirname(__file__), "assets")
     if not os.path.isdir(aset):
@@ -1560,6 +1621,27 @@ async def on_member_join(member: discord.Member):
             except Exception: pass
     except Exception:
         pass
+
+@bot.event
+async def on_message(message: discord.Message):
+    try:
+        if message.author.bot:
+            return
+        channel_id = getattr(message.channel, "id", None)
+        if not channel_id:
+            return
+        if int(channel_id) not in _help_channel_ids():
+            return
+
+        reply = _chat_help_reply(message.content or "")
+        if reply:
+            await message.reply(reply, mention_author=False)
+    except Exception as e:
+        try: print("chat help reply failed:", e)
+        except Exception: pass
+    finally:
+        # Keep prefix-command behavior intact when on_message is present.
+        await bot.process_commands(message)
 
 # ---------------------------
 # Queue Boards (optional utility)
