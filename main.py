@@ -469,10 +469,14 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     def has_any(*phrases: str) -> bool:
         return any(p in text for p in phrases)
 
+    def with_footer(reply_text: str) -> str:
+        return reply_text.rstrip() + "\n\nDon't forget to message @GFerryGoon."
+
     has_question_tone = ("?" in text) or text.startswith(
         ("how ", "where ", "what ", "can ", "do ", "is ", "are ", "when ", "which ", "who ", "why ", "help")
     )
     asks_signup = has_any("sign up", "signup", "join", "register", "queue", "lfg")
+    asks_join_raid = has_any("how do i join a raid", "join raid", "join a raid")
     asks_where = has_any("where", "which channel", "what channel")
     asks_leave = has_any("leave", "cancel", "drop", "remove me", "step out")
     asks_commands = has_any("commands", "command", "slash", "bot command", "how to use bot")
@@ -492,7 +496,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     lfg_channel = _channel_mention_or_fallback(LFG_CHAT_CHANNEL_ID, "#lfg")
 
     if asks_commands and activity_context:
-        return (
+        return with_footer(
             "Common commands:\n"
             "• **/join** — join an activity queue\n"
             "• **/queue** — view current queues\n"
@@ -502,8 +506,16 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "If you’re unsure, ask your question and I’ll point you to the right command."
         )
 
+    if asks_join_raid:
+        return with_footer(
+            "To join a raid:\n"
+            "1) Use **/join** and select the raid.\n"
+            f"2) Use **/queue** to check your place (or watch {queue_channel}).\n"
+            f"3) Watch {signup_channel} and react **✅** when your run is posted."
+        )
+
     if asks_signup and raid_or_dungeon:
-        return (
+        return with_footer(
             "For raid/dungeon signups:\n"
             "1) Use **/join** and pick the activity.\n"
             f"2) Check your spot with **/queue** (or watch {queue_channel}).\n"
@@ -512,16 +524,16 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
         )
 
     if asks_queue_spot and activity_context:
-        return f"Use **/queue** to see your current position. Queue boards are posted in {queue_channel}."
+        return with_footer(f"Use **/queue** to see your current position. Queue boards are posted in {queue_channel}.")
 
     if asks_where and any(k in text for k in ("sign", "join", "event", "raid", "dungeon")):
-        return (
+        return with_footer(
             f"Raid and dungeon events are posted in {signup_channel}, and chat/LFG updates happen in {lfg_channel}. "
             "Use **/join** to enter the queue, then **/queue** to see your position."
         )
 
     if asks_reactions and activity_context:
-        return (
+        return with_footer(
             "Reaction guide on event posts:\n"
             "• **✅** = join if a slot is open\n"
             "• **🔁** = backup/waitlist\n"
@@ -530,16 +542,16 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
         )
 
     if asks_leave and any(k in text for k in ("raid", "dungeon", "queue", "run", "signup")):
-        return "Use **/leave** to step out of a raid/dungeon queue or signup."
+        return with_footer("Use **/leave** to step out of a raid/dungeon queue or signup.")
 
     if asks_sherpa and activity_context:
-        return (
+        return with_footer(
             "New/learning runs are welcome. Join with **/join**, then watch event posts in "
             f"{signup_channel}. If Sherpas are needed, those runs will call it out in {lfg_channel}."
         )
 
     if asks_hosting and activity_context:
-        return (
+        return with_footer(
             "To host, use:\n"
             "• **/event** for normal player signups\n"
             "• **/event_sherpa** for Sherpa-only signups\n"
@@ -547,14 +559,15 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
         )
 
     if asks_time and activity_context:
-        return (
+        return with_footer(
             f"Event posts in {signup_channel} include the scheduled time. "
             "You’ll also get reminders before start when applicable."
         )
 
     if has_question_tone and (activity_context or direct_bot_question):
-        return (
+        return with_footer(
             "I can help with raid/dungeon/LFG questions. Try asking:\n"
+            "• **How do I join a raid?**\n"
             "• **How do I sign up for raids?**\n"
             "• **Where are event posts?**\n"
             "• **How do I check queue position?**\n"
