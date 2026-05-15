@@ -145,6 +145,7 @@ COOLDOWNS: Dict[str, Dict[int, int]] = {}
 # (channel_id, user_id) -> last auto-help reply epoch seconds
 HELP_REPLY_LAST_SENT: Dict[Tuple[int, int], int] = {}
 HELP_REPLY_COOLDOWN_SECONDS = 20
+_ACTIVITY_ALIAS_CACHE: Optional[Dict[str, str]] = None
 
 # ---------------------------
 # External Helpers (project)
@@ -461,6 +462,84 @@ def _help_reply_rate_limited(channel_id: int, user_id: int) -> bool:
     except Exception:
         return False
 
+def _find_activity_by_terms(*terms: str) -> Optional[str]:
+    norm_terms = [_normalize_activity_text(t) for t in terms if t]
+    if not norm_terms:
+        return None
+    for act in ALL_ACTIVITIES:
+        norm_act = _normalize_activity_text(act)
+        if norm_act and all(t in norm_act for t in norm_terms):
+            return act
+    return None
+
+def _activity_alias_map() -> Dict[str, str]:
+    global _ACTIVITY_ALIAS_CACHE
+    if _ACTIVITY_ALIAS_CACHE is not None:
+        return _ACTIVITY_ALIAS_CACHE
+
+    aliases: Dict[str, str] = {}
+
+    # Auto-generate simple initialisms (e.g., "last wish" -> "lw").
+    stop_words = {"of", "the", "and", "a", "an", "to", "for", "in", "on"}
+    for act in ALL_ACTIVITIES:
+        words = [w for w in _normalize_activity_text(act).split() if w and w not in stop_words]
+        if len(words) >= 2:
+            init = "".join(w[0] for w in words)
+            if 2 <= len(init) <= 5:
+                aliases.setdefault(init, act)
+
+    # Common Destiny abbreviations (raids + dungeons).
+    manual_alias_terms: List[Tuple[str, Tuple[str, ...]]] = [
+        ("vog", ("vault", "glass")),
+        ("lw", ("last", "wish")),
+        ("gos", ("garden", "salvation")),
+        ("dsc", ("deep", "stone", "crypt")),
+        ("votd", ("vow", "disciple")),
+        ("vow", ("vow", "disciple")),
+        ("kf", ("king", "fall")),
+        ("ron", ("root", "nightmare")),
+        ("ce", ("crota", "end")),
+        ("se", ("salvation", "edge")),
+        ("sos", ("spire", "stars")),
+        ("eow", ("eater", "world")),
+        ("poh", ("pit", "heresy")),
+        ("st", ("shattered", "throne")),
+        ("goa", ("grasp", "avarice")),
+        ("sotw", ("spire", "watcher")),
+        ("gotd", ("ghost", "deep")),
+        ("wr", ("warlord", "ruin")),
+        ("vh", ("vesper", "host")),
+        ("sd", ("sunder", "doctrine")),
+    ]
+    for alias, terms in manual_alias_terms:
+        act = _find_activity_by_terms(*terms)
+        if act:
+            aliases[alias] = act
+
+    _ACTIVITY_ALIAS_CACHE = aliases
+    return aliases
+
+def _extract_activity_from_help_text(message_text: str) -> Tuple[Optional[str], bool]:
+    """Return (activity_name, matched_by_alias)."""
+    norm_text = _normalize_activity_text(message_text or "")
+    if not norm_text:
+        return None, False
+
+    # Full-name mention first (prefer longest activity name).
+    sorted_activities = sorted(ALL_ACTIVITIES, key=lambda a: len(_normalize_activity_text(a)), reverse=True)
+    for act in sorted_activities:
+        norm_act = _normalize_activity_text(act)
+        if not norm_act:
+            continue
+        if re.search(rf"\b{re.escape(norm_act)}\b", norm_text):
+            return act, False
+
+    # Abbreviation mention second.
+    for alias, act in _activity_alias_map().items():
+        if re.search(rf"\b{re.escape(alias)}\b", norm_text):
+            return act, True
+    return None, False
+
 def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) -> Optional[str]:
     text = " ".join((message_text or "").lower().split())
     if not text:
@@ -477,6 +556,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     )
     asks_signup = has_any("sign up", "signup", "join", "register", "queue", "lfg")
     asks_join_raid = has_any("how do i join a raid", "join raid", "join a raid")
+    asks_how_to_join = has_any("how do i join", "how to join", "how can i join", "where do i join")
     asks_where = has_any("where", "which channel", "what channel")
     asks_leave = has_any("leave", "cancel", "drop", "remove me", "step out")
     asks_commands = has_any("commands", "command", "slash", "bot command", "how to use bot")
@@ -494,6 +574,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     signup_channel = _channel_mention_or_fallback(EVENT_SIGNUP_CHANNEL_ID, "the event-signup channel")
     queue_channel = _channel_mention_or_fallback(RAID_QUEUE_CHANNEL_ID, "the queue channel")
     lfg_channel = _channel_mention_or_fallback(LFG_CHAT_CHANNEL_ID, "#lfg")
+    mentioned_activity, matched_by_alias = _extract_activity_from_help_text(text)
 
     if asks_commands and activity_context:
         return with_footer(
@@ -512,6 +593,21 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "1) Use **/join** and select the raid.\n"
             f"2) Use **/queue** to check your place (or watch {queue_channel}).\n"
             f"3) Watch {signup_channel} and react **✅** when your run is posted."
+        )
+
+    if asks_how_to_join and mentioned_activity and _is_raid_or_dungeon(mentioned_activity):
+        alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
+        return with_footer(
+            f"I see **{mentioned_activity}**{alias_hint}. Do you want to be signed up for that queue?\n"
+            f"If yes, run **/join** and select **{mentioned_activity}**.\n"
+            f"Then use **/queue** (or check {queue_channel}) to confirm your spot."
+        )
+
+    if asks_signup and mentioned_activity and _is_raid_or_dungeon(mentioned_activity):
+        alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
+        return with_footer(
+            f"Do you want to be signed up for **{mentioned_activity}**{alias_hint} queue?\n"
+            f"Use **/join** and pick **{mentioned_activity}**, then check **/queue**."
         )
 
     if asks_signup and raid_or_dungeon:
