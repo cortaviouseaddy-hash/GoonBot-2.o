@@ -719,9 +719,11 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     has_question_tone = ("?" in text) or text.startswith(
         ("how ", "where ", "what ", "can ", "do ", "is ", "are ", "when ", "which ", "who ", "why ", "help")
     )
-    asks_signup = has_any("sign up", "signup", "join", "register", "queue", "lfg")
+    asks_signup = has_any("sign up", "signup", "join", "register", "queue", "lfg", "sing up")
+    asks_sign_up_for = has_any("how do i sign up for", "how to sign up for", "how can i sign up for", "sign me up for", "sing up for")
     asks_join_raid = has_any("how do i join a raid", "join raid", "join a raid")
     asks_how_to_join = has_any("how do i join", "how to join", "how can i join", "where do i join")
+    asks_join_queue = has_any("how do i join the queue", "how to join the queue", "how can i join the queue", "join the queue", "can i join queue", "queue me")
     asks_where = has_any("where", "which channel", "what channel")
     asks_leave = has_any("leave", "cancel", "drop", "remove me", "step out")
     asks_commands = has_any("commands", "command", "slash", "bot command", "how to use bot")
@@ -752,6 +754,18 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "If you’re unsure, ask your question and I’ll point you to the right command."
         ), None
 
+    if (
+        mentioned_activity
+        and _is_raid_or_dungeon(mentioned_activity)
+        and (asks_how_to_join or asks_signup or asks_join_raid or asks_join_queue or asks_sign_up_for)
+    ):
+        alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
+        return with_footer(
+            f"I see **{mentioned_activity}**{alias_hint}. Do you want to be in that queue?\n"
+            f"If yes, reply **yes** and I'll sign you up for **{mentioned_activity}**.\n"
+            f"Then use **/queue** (or check {queue_channel}) to confirm your spot."
+        ), mentioned_activity
+
     if asks_join_raid:
         return with_footer(
             "To join a raid:\n"
@@ -760,20 +774,11 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             f"3) Watch {signup_channel} and react **✅** when your run is posted."
         ), None
 
-    if asks_how_to_join and mentioned_activity and _is_raid_or_dungeon(mentioned_activity):
-        alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
+    if asks_join_queue and not mentioned_activity:
         return with_footer(
-            f"I see **{mentioned_activity}**{alias_hint}. Do you want to be signed up for that queue?\n"
-            f"If yes, run **/join** and select **{mentioned_activity}**.\n"
-            f"Then use **/queue** (or check {queue_channel}) to confirm your spot."
-        ), mentioned_activity
-
-    if asks_signup and mentioned_activity and _is_raid_or_dungeon(mentioned_activity):
-        alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
-        return with_footer(
-            f"Do you want to be signed up for **{mentioned_activity}**{alias_hint} queue?\n"
-            f"Use **/join** and pick **{mentioned_activity}**, then check **/queue**."
-        ), mentioned_activity
+            "I can queue you right here. Tell me which raid or dungeon (name or abbreviation like VOG/KF/RON), "
+            "and I’ll ask you to confirm."
+        ), None
 
     if asks_signup and raid_or_dungeon:
         return with_footer(
@@ -829,6 +834,8 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
         return with_footer(
             "I can help with raid/dungeon/LFG questions. Try asking:\n"
             "• **How do I join a raid?**\n"
+            "• **How do I sign up for VOG?**\n"
+            "• **How do I join the queue for KF?**\n"
             "• **How do I sign up for raids?**\n"
             "• **Where are event posts?**\n"
             "• **How do I check queue position?**\n"
