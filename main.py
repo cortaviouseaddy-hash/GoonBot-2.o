@@ -724,6 +724,11 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     asks_join_raid = has_any("how do i join a raid", "join raid", "join a raid")
     asks_how_to_join = has_any("how do i join", "how to join", "how can i join", "where do i join")
     asks_join_queue = has_any("how do i join the queue", "how to join the queue", "how can i join the queue", "join the queue", "can i join queue", "queue me")
+    asks_want_activity = has_any(
+        "i want to", "iwant to", "i wanna", "i wanna do", "wanna do", "i need", "i need to",
+        "need to run", "need to do", "put me in", "put me on", "add me to", "queue me for",
+        "im trying to", "i m trying to", "id like to", "i d like to", "i would like to", "im down for",
+    )
     asks_where = has_any("where", "which channel", "what channel")
     asks_leave = has_any("leave", "cancel", "drop", "remove me", "step out")
     asks_commands = has_any("commands", "command", "slash", "bot command", "how to use bot")
@@ -757,7 +762,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     if (
         mentioned_activity
         and _is_raid_or_dungeon(mentioned_activity)
-        and (asks_how_to_join or asks_signup or asks_join_raid or asks_join_queue or asks_sign_up_for)
+        and (asks_how_to_join or asks_signup or asks_join_raid or asks_join_queue or asks_sign_up_for or asks_want_activity)
     ):
         alias_hint = " (recognized from abbreviation)" if matched_by_alias else ""
         return with_footer(
