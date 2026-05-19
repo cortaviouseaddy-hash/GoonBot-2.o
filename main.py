@@ -737,10 +737,14 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
     asks_sherpa = has_any("sherpa", "teach", "teaching run", "first time", "new player")
     asks_hosting = has_any("create event", "make event", "host run", "post event", "schedule run")
     asks_time = has_any("when", "what time", "start time", "timezone", "utc", "est", "pst", "cst", "mst")
+    asks_help_style = has_any(
+        "help", "how do i", "how to", "how can i", "where do i", "where are",
+        "what does", "which command", "what command", "can you help",
+    )
     raid_or_dungeon = has_any("raid", "raids", "dungeon", "dungeons")
     activity_context = has_any(
         "raid", "raids", "dungeon", "dungeons", "lfg", "queue", "join", "signup", "sign up",
-        "event", "events", "run", "runs", "sherpa", "fireteam", "activity"
+        "event", "events", "sherpa"
     )
 
     signup_channel = _channel_mention_or_fallback(EVENT_SIGNUP_CHANNEL_ID, "the event-signup channel")
@@ -835,7 +839,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "You’ll also get reminders before start when applicable."
         ), None
 
-    if has_question_tone and (activity_context or direct_bot_question):
+    if has_question_tone and (direct_bot_question or (asks_help_style and activity_context)):
         return with_footer(
             "I can help with raid/dungeon/LFG questions. Try asking:\n"
             "• **How do I join a raid?**\n"
