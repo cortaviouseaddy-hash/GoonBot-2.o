@@ -243,7 +243,7 @@ def _cap_for_activity(activity: str) -> int:
 
     # Heuristic fallback by keywords (kept broad, errs toward raid=6)
     a = act.lower()
-    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare", "edge", "desert")):
+    if any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare", "edge", "desert", "pantheon", "calus")):
         return 6
     if any(k in a for k in ("dungeon", "pit", "spire", "deep", "watcher", "throne", "prophecy", "grasp", "duality", "ghost", "warlord", "ruin", "sunder", "doctrine", "vesper", "host", "avarice")):
         return 3
@@ -341,7 +341,7 @@ def _is_raid_or_dungeon(activity: str) -> bool:
     except Exception:
         pass
     a = act.lower()
-    return any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare")) or any(
+    return any(k in a for k in ("raid", "vault", "wish", "garden", "crota", "salvation", "vow", "king", "root", "nightmare", "pantheon", "calus")) or any(
         k in a for k in ("dungeon", "pit", "spire", "deep", "watcher", "throne", "prophecy", "grasp", "duality", "ghost", "warlord", "ruin", "avarice")
     )
 
@@ -503,6 +503,8 @@ def _activity_alias_map() -> Dict[str, str]:
         ("ron", ("root", "nightmare")),
         ("ce", ("crota", "end")),
         ("se", ("salvation", "edge")),
+        ("calus", ("pantheon", "calus")),
+        ("pantheon", ("pantheon", "calus")),
         ("sos", ("spire", "stars")),
         ("eow", ("eater", "world")),
         ("poh", ("pit", "heresy")),
