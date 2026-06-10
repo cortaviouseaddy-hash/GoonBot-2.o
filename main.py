@@ -303,13 +303,38 @@ def sherpa_host_only():
     return app_commands.check(predicate)
 
 async def _activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    cur = (current or "").lower()
-    out: List[app_commands.Choice[str]] = []
+    cur_raw = (current or "").strip()
+    cur = cur_raw.lower()
+    cur_norm = _normalize_activity_text(cur_raw)
+
+    def _match_score(act: str) -> int:
+        if not cur:
+            return 0
+        act_low = act.lower()
+        act_norm = _normalize_activity_text(act)
+        if act_low.startswith(cur) or act_norm.startswith(cur_norm):
+            return 3
+        if cur in act_low or (cur_norm and cur_norm in act_norm):
+            return 2
+        for alias, target in _activity_alias_map().items():
+            if target == act and (cur == alias or cur_norm == _normalize_activity_text(alias)):
+                return 4
+        return 0
+
+    ranked: List[Tuple[int, str]] = []
     for act in ALL_ACTIVITIES:
-        if not cur or cur in act.lower():
-            out.append(app_commands.Choice(name=act, value=act))
-            if len(out) >= 25:
-                break
+        score = _match_score(act)
+        if not cur or score > 0:
+            ranked.append((score, act))
+
+    if cur:
+        ranked.sort(key=lambda item: (-item[0], item[1].lower()))
+    else:
+        ranked.sort(key=lambda item: item[1].lower())
+
+    out: List[app_commands.Choice[str]] = []
+    for _, act in ranked[:25]:
+        out.append(app_commands.Choice(name=act, value=act))
     return out
 
 def _activity_color(activity: str) -> int:
