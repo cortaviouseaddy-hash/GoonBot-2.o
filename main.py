@@ -1420,7 +1420,13 @@ def _parse_queue_board_embed(embed: discord.Embed) -> Tuple[Optional[str], List[
     except Exception:
         return None, [], set(), set()
 
-async def _recover_queues_from_queue_boards(*, include_older_nonempty: bool = False, replace_existing: bool = False) -> bool:
+async def _recover_queues_from_queue_boards(
+    *,
+    include_older_nonempty: bool = False,
+    replace_existing: bool = False,
+    prefer_fullest: bool = False,
+    history_limit: int = 1000,
+) -> bool:
     if not RAID_QUEUE_CHANNEL_ID or (_queue_total(QUEUES) > 0 and not replace_existing):
         return False
     try:
@@ -1432,10 +1438,18 @@ async def _recover_queues_from_queue_boards(*, include_older_nonempty: bool = Fa
     recovered_catty: Dict[str, Set[int]] = {}
     seen_activities: Set[str] = set()
     try:
-        async for msg in ch.history(limit=150):  # type: ignore[attr-defined]
+        async for msg in ch.history(limit=int(history_limit)):  # type: ignore[attr-defined]
             for embed in getattr(msg, "embeds", []) or []:
                 activity, q, checked, catty = _parse_queue_board_embed(embed)
-                if not activity or activity in seen_activities:
+                if not activity:
+                    continue
+                if prefer_fullest:
+                    if q and len(q) > len(recovered.get(activity, []) or []):
+                        recovered[activity] = q
+                        recovered_checked[activity] = checked
+                        recovered_catty[activity] = catty
+                    continue
+                if activity in seen_activities:
                     continue
                 # The newest board for an activity is authoritative. If it is
                 # empty, do not resurrect older signups for that activity.
@@ -3239,7 +3253,12 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
 async def restorequeue_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        recovered = await _recover_queues_from_queue_boards(include_older_nonempty=True, replace_existing=True)
+        recovered = await _recover_queues_from_queue_boards(
+            include_older_nonempty=True,
+            replace_existing=True,
+            prefer_fullest=True,
+            history_limit=1000,
+        )
         if not recovered:
             await interaction.followup.send("No queue signups found in recent queue board history.", ephemeral=True)
             return
@@ -3248,7 +3267,11 @@ async def restorequeue_cmd(interaction: discord.Interaction):
         await persist_catty()
         await _post_all_activity_boards(interaction.channel_id)
         total = _queue_total(QUEUES)
-        await interaction.followup.send(f"Restored {total} queued signup(s) from queue board history.", ephemeral=True)
+        await interaction.followup.send(
+            f"Restored {total} queued signup(s) from queue board history "
+            f"across {len(QUEUES)} activity queue(s).",
+            ephemeral=True,
+        )
     except Exception as e:
         await interaction.followup.send(f"Queue restore failed: {e.__class__.__name__}", ephemeral=True)
 
