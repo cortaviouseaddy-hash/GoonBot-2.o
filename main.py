@@ -1395,17 +1395,34 @@ async def load_queues() -> None:
 def _parse_queue_board_embed(embed: discord.Embed) -> Tuple[Optional[str], List[int], Set[int], Set[int]]:
     try:
         title = str(getattr(embed, "title", "") or "")
-        if not title.startswith("Queue — "):
+        m_title = re.match(r"^\s*Queue\s*(?:—|-|:)\s*(.+?)\s*$", title, flags=re.IGNORECASE)
+        if not m_title:
             return None, [], set(), set()
-        activity = title.split("Queue — ", 1)[1].strip()
+        activity = m_title.group(1).strip()
         q: List[int] = []
         checked: Set[int] = set()
         catty: Set[int] = set()
+        all_candidate_lines: List[str] = []
         for field in getattr(embed, "fields", []) or []:
             name = str(getattr(field, "name", "") or "").lower()
-            if "players" not in name:
+            value_lines = str(getattr(field, "value", "") or "").splitlines()
+            all_candidate_lines.extend(value_lines)
+            if not any(token in name for token in ("player", "signed", "queue")):
                 continue
-            for line in str(getattr(field, "value", "") or "").splitlines():
+            for line in value_lines:
+                m = re.search(r"<@!?(\d+)>", line)
+                if not m:
+                    continue
+                uid = int(m.group(1))
+                if uid not in q:
+                    q.append(uid)
+                if "✅" in line:
+                    checked.add(uid)
+                if "⭐" in line:
+                    catty.add(uid)
+        # Fallback for older embeds whose player field had a different name.
+        if not q:
+            for line in all_candidate_lines:
                 m = re.search(r"<@!?(\d+)>", line)
                 if not m:
                     continue
@@ -1419,6 +1436,15 @@ def _parse_queue_board_embed(embed: discord.Embed) -> Tuple[Optional[str], List[
         return activity or None, q, checked, catty
     except Exception:
         return None, [], set(), set()
+
+def _queue_restore_summary() -> str:
+    parts = [f"{act}: {len(q or [])}" for act, q in sorted(QUEUES.items()) if q]
+    if not parts:
+        return "No activity queues restored."
+    summary = "; ".join(parts)
+    if len(summary) > 1500:
+        summary = summary[:1497] + "..."
+    return summary
 
 async def _recover_queues_from_queue_boards(
     *,
@@ -3269,7 +3295,8 @@ async def restorequeue_cmd(interaction: discord.Interaction):
         total = _queue_total(QUEUES)
         await interaction.followup.send(
             f"Restored {total} queued signup(s) from queue board history "
-            f"across {len(QUEUES)} activity queue(s).",
+            f"across {len([q for q in QUEUES.values() if q])} activity queue(s).\n"
+            f"Found: {_queue_restore_summary()}",
             ephemeral=True,
         )
     except Exception as e:
