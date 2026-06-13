@@ -1452,9 +1452,10 @@ async def _recover_queues_from_queue_boards(
     replace_existing: bool = False,
     prefer_fullest: bool = False,
     prefer_oldest: bool = False,
+    activity_filter: Optional[str] = None,
     history_limit: int = 1000,
 ) -> bool:
-    if not RAID_QUEUE_CHANNEL_ID or (_queue_total(QUEUES) > 0 and not replace_existing):
+    if not RAID_QUEUE_CHANNEL_ID:
         return False
     try:
         ch = bot.get_channel(int(RAID_QUEUE_CHANNEL_ID)) or await bot.fetch_channel(int(RAID_QUEUE_CHANNEL_ID))
@@ -1464,11 +1465,14 @@ async def _recover_queues_from_queue_boards(
     recovered_checked: Dict[str, Set[int]] = {}
     recovered_catty: Dict[str, Set[int]] = {}
     seen_activities: Set[str] = set()
+    filter_norm = _normalize_activity_text(activity_filter) if activity_filter else ""
     try:
         async for msg in ch.history(limit=int(history_limit)):  # type: ignore[attr-defined]
             for embed in getattr(msg, "embeds", []) or []:
                 activity, q, checked, catty = _parse_queue_board_embed(embed)
                 if not activity:
+                    continue
+                if filter_norm and filter_norm not in _normalize_activity_text(activity):
                     continue
                 if prefer_fullest:
                     if q and len(q) > len(recovered.get(activity, []) or []):
@@ -1504,15 +1508,14 @@ async def _recover_queues_from_queue_boards(
         return False
     if _queue_total(recovered) <= 0:
         return False
-    QUEUES.clear()
-    CHECKED.clear()
-    CATTY_RUNS.clear()
+    if replace_existing:
+        QUEUES.clear()
+        CHECKED.clear()
+        CATTY_RUNS.clear()
     for act, q in recovered.items():
         QUEUES[act] = list(q)
-        if recovered_checked.get(act):
-            CHECKED[act] = set(recovered_checked[act])
-        if recovered_catty.get(act):
-            CATTY_RUNS[act] = set(recovered_catty[act])
+        CHECKED[act] = set(recovered_checked.get(act, set()))
+        CATTY_RUNS[act] = set(recovered_catty.get(act, set()))
     try:
         print(f"Recovered queues from queue board embeds: {sorted(recovered.keys())}")
     except Exception:
@@ -3288,6 +3291,8 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
 @app_commands.describe(
     strategy="Which queue board to use for each activity",
     history_limit="How many recent #raid-queue messages to scan (100-2000)",
+    activity_filter="Optional: only restore activities whose queue title contains this text, e.g. Pantheon",
+    replace_existing="Replace all current queues instead of merging restored activities into them",
 )
 @app_commands.choices(
     strategy=[
@@ -3300,6 +3305,8 @@ async def restorequeue_cmd(
     interaction: discord.Interaction,
     strategy: str = "fullest",
     history_limit: Optional[int] = 1000,
+    activity_filter: Optional[str] = None,
+    replace_existing: bool = False,
 ):
     await interaction.response.defer(ephemeral=True)
     try:
@@ -3309,15 +3316,17 @@ async def restorequeue_cmd(
         scan_limit = max(100, min(int(history_limit or 1000), 2000))
         recovered = await _recover_queues_from_queue_boards(
             include_older_nonempty=True,
-            replace_existing=True,
+            replace_existing=bool(replace_existing),
             prefer_fullest=(chosen_strategy == "fullest"),
             prefer_oldest=(chosen_strategy == "oldest"),
+            activity_filter=activity_filter,
             history_limit=scan_limit,
         )
         if not recovered:
-            await interaction.followup.send("No queue signups found in recent queue board history.", ephemeral=True)
+            suffix = f" matching `{activity_filter}`" if activity_filter else ""
+            await interaction.followup.send(f"No queue signups found in recent queue board history{suffix}.", ephemeral=True)
             return
-        await persist_queues()
+        await persist_queues(allow_removals=bool(replace_existing))
         await persist_checked()
         await persist_catty()
         await _post_all_activity_boards(interaction.channel_id)
@@ -3326,6 +3335,7 @@ async def restorequeue_cmd(
             f"Restored {total} queued signup(s) from queue board history "
             f"across {len([q for q in QUEUES.values() if q])} activity queue(s).\n"
             f"Strategy: {chosen_strategy}; scanned: {scan_limit} messages.\n"
+            f"Filter: {activity_filter or 'none'}; replace existing: {bool(replace_existing)}.\n"
             f"Found: {_queue_restore_summary()}",
             ephemeral=True,
         )
