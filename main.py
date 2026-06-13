@@ -4,7 +4,7 @@
 # - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
 # - Sherpa Announcement -> GENERAL_SHERPA_CHANNEL_ID (pings SHERPA_ROLE_ID if set; points to Sherpa signup post)
 # - T-2h before start (if player slots remain): add ✅ to main embed + single LFG nudge in LFG_CHAT_CHANNEL_ID
-# - DM the entire queue with Confirm buttons; confirming joins as participant; no response = nothing
+# - DM unchecked queue users with Confirm buttons; confirming as participant adds a queue ✅
 # - Colors based on category; optional activity images from ./assets/** by fuzzy filename match
 # - Reminders at T-2h, T-30m, and start; survey DM 3h after start
 
@@ -212,6 +212,33 @@ def _ensure_checked(activity: str) -> Set[int]:
 
 def _ensure_catty(activity: str) -> Set[int]:
     return CATTY_RUNS.setdefault(activity, set())
+
+def _queue_members_needing_prompt(activity: str) -> List[int]:
+    checked = CHECKED.get(activity, set()) or set()
+    return [int(uid) for uid in (QUEUES.get(activity, []) or []) if int(uid) not in checked]
+
+async def _mark_queue_participants_checked(activity: Optional[str], user_ids: List[int]) -> bool:
+    if not activity or not user_ids:
+        return False
+    act = str(activity)
+    q = QUEUES.get(act, []) or []
+    if not q:
+        return False
+    queued = {int(uid) for uid in q}
+    checked = _ensure_checked(act)
+    before = len(checked)
+    for uid in user_ids:
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        if uid_int in queued:
+            checked.add(uid_int)
+    if len(checked) == before:
+        return False
+    await persist_checked()
+    await _post_activity_board(act)
+    return True
 
 def _cap_for_activity(activity: str) -> int:
     """Return player capacity based on presets, with sensible fallbacks.
@@ -719,8 +746,10 @@ async def _join_queue_from_help_confirmation(message: discord.Message, activity:
         return
 
     q.append(uid)
+    _ensure_checked(act).discard(uid)
     _ensure_catty(act).discard(uid)
     await persist_queues()
+    await persist_checked()
     await persist_catty()
     pos = q.index(uid) + 1
     await _post_activity_board(act)
@@ -2167,11 +2196,13 @@ async def join_cmd(
         await interaction.response.send_message("You can be in at most 2 different activity queues.", ephemeral=True)
         return
     _ensure_queue(act).append(uid)
+    _ensure_checked(act).discard(uid)
     if catty_needed:
         catty.add(uid)
     else:
         catty.discard(uid)
     await persist_queues()
+    await persist_checked()
     await persist_catty()
     await interaction.response.send_message(
         f"Joined queue for: {act}" + (" (⭐ catty/weapon run requested)" if catty_needed else ""),
@@ -2185,6 +2216,7 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     # Refresh queues from disk to ensure we use the latest queue file state
     try:
         await load_queues()
+        await load_checked()
         await load_catty()
     except Exception:
         pass
@@ -2220,8 +2252,9 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
         q = QUEUES.get(act, [])
         if uid in q:
             q[:] = [x for x in q if x != uid]
+            _ensure_checked(act).discard(uid)
             _ensure_catty(act).discard(uid)
-            await persist_queues(); await persist_catty()
+            await persist_queues(); await persist_checked(); await persist_catty()
             await interaction.response.send_message(f"Left queue: {act}", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -2522,6 +2555,11 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
             participants.append(uid); status = "Player"
         else:
             backups.append(uid); status = "Backup"
+        if status == "Player":
+            try:
+                await _mark_queue_participants_checked(str(data.get("activity") or ""), [uid])
+            except Exception:
+                pass
         if guild: await _update_schedule_message(guild, message_id)  # type: ignore
         await interaction.response.send_message(f"Added user as {status}.", ephemeral=True)
         return
@@ -2537,9 +2575,8 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
             await interaction.response.send_message("User already in queue.", ephemeral=True)
             return
         q.append(uid)
-        # Auto-mark newly added users via schedule/queue as checked when added to a queue via command
-        checked = _ensure_checked(act)
-        checked.add(uid)
+        # Adding someone to a queue is not the same as making them a participant.
+        _ensure_checked(act).discard(uid)
         # /add does not specify catty/weapon run; default to not requested.
         _ensure_catty(act).discard(uid)
         await persist_queues(); await persist_checked(); await persist_catty()
@@ -3199,14 +3236,12 @@ class ConfirmView(discord.ui.View):
                     _log_confirmation(self.mid, self.uid, "confirm", "skipped", reason)
         guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
         if guild: await _update_schedule_message(guild, self.mid)
-        # Auto-mark check for participants confirmed via DM for the activity's queue
+        # Mark queued users with ✅ only once they are actual players, not backups.
         try:
-            act = str(data.get("activity"))
-            if act:
-                q_list = QUEUES.get(act, [])
-                if self.uid in q_list:
-                    _ensure_checked(act).add(self.uid)
-                    await persist_checked()
+            act = str(data.get("activity") or "")
+            current_players: List[int] = data.get("players", []) or []  # type: ignore
+            if act and self.uid in current_players:
+                await _mark_queue_participants_checked(act, [self.uid])
         except Exception:
             pass
 
@@ -3291,7 +3326,14 @@ def _autofill_from_backups(data: Dict[str, object]):
     return moved
 
 async def _dm_promoted_users(guild: Optional[discord.Guild], moved: List[int], data: Dict[str, object]):
-    if not guild or not moved:
+    if not moved:
+        return
+    try:
+        if str(data.get("type")) != "sherpa_only":
+            await _mark_queue_participants_checked(str(data.get("activity") or ""), moved)
+    except Exception:
+        pass
+    if not guild:
         return
     activity = data.get("activity", "Event")
     when_text = data.get("when_text", "soon")
@@ -3700,8 +3742,16 @@ async def schedule_cmd(
         cap = _cap_for_activity(act)
         reserved = max(0, min(int(reserved_sherpas or 0), cap))
 
+        try:
+            await load_queues()
+            await load_checked()
+            await load_catty()
+        except Exception:
+            pass
         q = QUEUES.get(act, [])
-        candidates = list(q)  # DM everyone in queue
+        checked_queue = CHECKED.get(act, set()) or set()
+        skipped_checked = sum(1 for uid in q if int(uid) in checked_queue)
+        candidates = _queue_members_needing_prompt(act)
 
         # Parse datetime_str (MM-DD HH:MM) with current year
         try:
@@ -3759,17 +3809,6 @@ async def schedule_cmd(
         players_final = uniq_participants[:player_slots]
         backups_final = uniq_participants[player_slots:]
 
-        # Auto-mark queue users who were placed as participants by /schedule
-        try:
-            q_list = QUEUES.get(act, [])
-            checked = _ensure_checked(act)
-            for uid in players_final:
-                if uid in q_list:
-                    checked.add(uid)
-            await persist_checked()
-        except Exception:
-            pass
-
         data = {
             "guild_id": guild.id if guild else None,
             "activity": act,
@@ -3824,6 +3863,12 @@ async def schedule_cmd(
         except Exception:
             pass
         SCHEDULES[mid] = data
+        # Auto-mark queue users who were placed as participants by /schedule
+        # only after the event exists.
+        try:
+            await _mark_queue_participants_checked(act, players_final)
+        except Exception:
+            pass
         # Immediately re-render using the CDN image URL and remove attachments to avoid duplicate image card
         try:
             if guild:
@@ -3990,9 +4035,13 @@ async def schedule_cmd(
         except Exception:
             pass
 
-        # ---- DMs to entire queue (ConfirmView) ----
+        # ---- DMs to unchecked queued users who are not already players (ConfirmView) ----
         sent = 0
+        pre_slotted_players = {int(uid) for uid in (data.get("players", []) or [])}
+        sent_candidate_ids: Set[int] = set()
         for uid in candidates:
+            if int(uid) in pre_slotted_players:
+                continue
             try:
                 m = guild.get_member(uid) if guild else None
                 if not m: continue
@@ -4005,11 +4054,12 @@ async def schedule_cmd(
                     view=ConfirmView(mid=mid, uid=uid),
                 )
                 sent += 1
+                sent_candidate_ids.add(int(uid))
             except Exception as e:
                 print("DM failed:", e)
 
         # DM any pre-slotted players we didn't DM above (info-only)
-        pre_dmed = set(candidates)
+        pre_dmed = set(sent_candidate_ids)
         p_sent = 0
         for uid in data.get("players", []) or []:
             try:
@@ -4038,6 +4088,8 @@ async def schedule_cmd(
                 + (f" (fallback in <#{general_announce_fallback}>)" if general_announce_fallback else "")
             ),
         ]
+        if skipped_checked:
+            status_lines.append(f"Skipped {skipped_checked} already-checked queue participant(s).")
         if difficulty and not is_raid_dungeon:
             status_lines.append("Difficulty ignored: this option is only used for raids and dungeons.")
         await interaction.followup.send("\n".join(status_lines), ephemeral=True)
@@ -4462,14 +4514,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await _update_schedule_message(guild, int(payload.message_id)); return
         if len(participants) < player_slots:
             participants.append(payload.user_id)
-            # Auto-mark check if this user came from the activity's queue
+            # Auto-mark check if this user came from the activity's queue.
             try:
-                act = str(data.get("activity"))
+                act = str(data.get("activity") or "")
                 if act:
-                    q_list = QUEUES.get(act, [])
-                    if payload.user_id in q_list:
-                        _ensure_checked(act).add(payload.user_id)
-                        await persist_checked()
+                    await _mark_queue_participants_checked(act, [payload.user_id])
                 # Set a 24h cooldown only if they were in the queue when scheduled
                 if act and payload.user_id in (data.get("candidates", []) or []):
                     start_ts = int(data.get("start_ts") or 0)
