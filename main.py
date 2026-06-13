@@ -756,6 +756,7 @@ async def _join_queue_from_help_confirmation(message: discord.Message, activity:
     _ensure_checked(act).discard(uid)
     _ensure_catty(act).discard(uid)
     await persist_queues()
+    _append_queue_event("join", act, [uid])
     await persist_checked()
     await persist_catty()
     pos = q.index(uid) + 1
@@ -1091,6 +1092,9 @@ COUNTER_LOCK = asyncio.Lock()
 
 # Persistent storage for activity queues
 QUEUES_FILE = os.path.join(DATA_DIR, "queues.json")
+QUEUE_EVENTS_FILE = os.path.join(DATA_DIR, "queue_events.jsonl")
+QUEUE_BACKUP_DIR = os.path.join(DATA_DIR, "queue_backups")
+QUEUE_EMPTY_MARKER_FILE = os.path.join(DATA_DIR, "queues.empty")
 QUEUES_LOCK = asyncio.Lock()
 
 # Persistent storage for green-check marks on queue users
@@ -1131,29 +1135,199 @@ async def _increment_counter() -> int:
 # ---------------
 # Queue persistence
 # ---------------
-def _read_queues_from_disk() -> Dict[str, List[int]]:
+def _queue_total(state: Optional[Dict[str, List[int]]]) -> int:
     try:
-        # Prefer new data dir path; fall back to legacy file near this module
-        path = QUEUES_FILE
-        if not os.path.isfile(path):
-            legacy = os.path.join(os.path.dirname(__file__), "queues.json")
-            if os.path.isfile(legacy):
-                path = legacy
-            else:
-                return {}
-        with open(path, "r") as f:
-            raw = json.load(f)
-        out: Dict[str, List[int]] = {}
-        for k, v in (raw or {}).items():
+        return sum(len(v or []) for v in (state or {}).values())
+    except Exception:
+        return 0
+
+def _normalize_queue_state(raw: object) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+    try:
+        for k, v in ((raw or {}) if isinstance(raw, dict) else {}).items():
             try:
                 name = str(k)
-                ids = [int(x) for x in (v or [])]
+                seen: Set[int] = set()
+                ids: List[int] = []
+                for x in (v or []):
+                    uid = int(x)
+                    if uid not in seen:
+                        seen.add(uid)
+                        ids.append(uid)
                 out[name] = ids
             except Exception:
                 continue
-        return out
     except Exception:
         return {}
+    return out
+
+def _read_queue_json_file(path: str) -> Tuple[Dict[str, List[int]], bool]:
+    try:
+        if not os.path.isfile(path):
+            return {}, False
+        with open(path, "r") as f:
+            raw = json.load(f)
+        return _normalize_queue_state(raw), True
+    except Exception:
+        return {}, False
+
+def _queue_empty_marker_exists() -> bool:
+    try:
+        return os.path.isfile(QUEUE_EMPTY_MARKER_FILE)
+    except Exception:
+        return False
+
+def _set_queue_empty_marker(enabled: bool) -> None:
+    try:
+        if enabled:
+            with open(QUEUE_EMPTY_MARKER_FILE, "w") as f:
+                f.write(str(int(datetime.utcnow().timestamp())))
+        elif os.path.isfile(QUEUE_EMPTY_MARKER_FILE):
+            os.remove(QUEUE_EMPTY_MARKER_FILE)
+    except Exception:
+        pass
+
+def _write_queue_backup(state: Dict[str, List[int]]) -> None:
+    if _queue_total(state) <= 0:
+        return
+    try:
+        _ensure_dir(QUEUE_BACKUP_DIR)
+        stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        path = os.path.join(QUEUE_BACKUP_DIR, f"queues-{stamp}.json")
+        with open(path, "w") as f:
+            json.dump({str(k): [int(x) for x in (v or [])] for k, v in state.items()}, f)
+            try:
+                f.flush(); os.fsync(f.fileno())
+            except Exception:
+                pass
+        try:
+            backups = sorted(
+                [
+                    os.path.join(QUEUE_BACKUP_DIR, name)
+                    for name in os.listdir(QUEUE_BACKUP_DIR)
+                    if name.startswith("queues-") and name.endswith(".json")
+                ],
+                key=lambda p: os.path.getmtime(p),
+            )
+            for old in backups[:-25]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print("Queue backup failed:", e)
+        except Exception:
+            pass
+
+def _read_latest_queue_backup() -> Dict[str, List[int]]:
+    try:
+        if not os.path.isdir(QUEUE_BACKUP_DIR):
+            return {}
+        backups = sorted(
+            [
+                os.path.join(QUEUE_BACKUP_DIR, name)
+                for name in os.listdir(QUEUE_BACKUP_DIR)
+                if name.startswith("queues-") and name.endswith(".json")
+            ],
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        for path in backups:
+            state, ok = _read_queue_json_file(path)
+            if ok and _queue_total(state) > 0:
+                return state
+    except Exception:
+        pass
+    return {}
+
+def _append_queue_event(action: str, activity: Optional[str] = None, user_ids: Optional[List[int]] = None) -> None:
+    try:
+        record = {
+            "ts": int(datetime.utcnow().timestamp()),
+            "action": str(action),
+            "activity": str(activity) if activity else None,
+            "user_ids": [int(uid) for uid in (user_ids or [])],
+        }
+        with open(QUEUE_EVENTS_FILE, "a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            try:
+                f.flush(); os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            print("Queue event log failed:", e)
+        except Exception:
+            pass
+
+def _replay_queue_events() -> Tuple[Dict[str, List[int]], bool]:
+    state: Dict[str, List[int]] = {}
+    saw_event = False
+    try:
+        if not os.path.isfile(QUEUE_EVENTS_FILE):
+            return {}, False
+        with open(QUEUE_EVENTS_FILE, "r") as f:
+            for line in f:
+                try:
+                    evt = json.loads(line)
+                    action = str(evt.get("action") or "")
+                    act = str(evt.get("activity") or "") if evt.get("activity") else None
+                    user_ids = [int(uid) for uid in (evt.get("user_ids") or [])]
+                    saw_event = True
+                    if action in ("join", "add") and act:
+                        q = state.setdefault(act, [])
+                        for uid in user_ids:
+                            if uid not in q:
+                                q.append(uid)
+                    elif action in ("leave", "remove"):
+                        if act:
+                            q = state.setdefault(act, [])
+                            state[act] = [uid for uid in q if uid not in set(user_ids)]
+                        else:
+                            uid_set = set(user_ids)
+                            for key in list(state.keys()):
+                                state[key] = [uid for uid in state.get(key, []) if uid not in uid_set]
+                    elif action == "clear":
+                        if act:
+                            state[act] = []
+                        else:
+                            state = {}
+                except Exception:
+                    continue
+    except Exception:
+        return {}, False
+    return state, saw_event
+
+def _read_queues_from_disk() -> Dict[str, List[int]]:
+    # Prefer new data dir path; fall back to legacy file near this module.
+    state, ok = _read_queue_json_file(QUEUES_FILE)
+    if not ok:
+        legacy = os.path.join(os.path.dirname(__file__), "queues.json")
+        state, ok = _read_queue_json_file(legacy)
+    if ok and _queue_total(state) > 0:
+        return state
+    if _queue_empty_marker_exists():
+        return state if ok else {}
+    journal_state, saw_journal = _replay_queue_events()
+    if saw_journal:
+        if _queue_total(journal_state) > 0:
+            try:
+                print("Recovered queues from event log")
+            except Exception:
+                pass
+            return journal_state
+        return state if ok else {}
+    backup_state = _read_latest_queue_backup()
+    if _queue_total(backup_state) > 0:
+        try:
+            print("Recovered queues from backup snapshot")
+        except Exception:
+            pass
+        return backup_state
+    return state if ok else {}
 
 def _merge_queue_states(existing: Dict[str, List[int]], incoming: Dict[str, List[int]]) -> Dict[str, List[int]]:
     merged: Dict[str, List[int]] = {}
@@ -1184,6 +1358,7 @@ def _write_queues_to_disk(state: Dict[str, List[int]]) -> None:
             except Exception:
                 pass
         os.replace(tmp_path, QUEUES_FILE)
+        _write_queue_backup(serializable)
         # Best-effort fsync the directory entry
         try:
             dir_fd = os.open(os.path.dirname(QUEUES_FILE) or ".", os.O_DIRECTORY)
@@ -1208,6 +1383,7 @@ async def persist_queues(*, allow_removals: bool = False) -> None:
             for k, v in state.items():
                 QUEUES[k] = list(v)
         _write_queues_to_disk(state)
+        _set_queue_empty_marker(bool(allow_removals and _queue_total(state) == 0))
 
 async def load_queues() -> None:
     async with QUEUES_LOCK:
@@ -1215,6 +1391,84 @@ async def load_queues() -> None:
         QUEUES.clear()
         for k, v in loaded.items():
             QUEUES[k] = list(v)
+
+def _parse_queue_board_embed(embed: discord.Embed) -> Tuple[Optional[str], List[int], Set[int], Set[int]]:
+    try:
+        title = str(getattr(embed, "title", "") or "")
+        if not title.startswith("Queue — "):
+            return None, [], set(), set()
+        activity = title.split("Queue — ", 1)[1].strip()
+        q: List[int] = []
+        checked: Set[int] = set()
+        catty: Set[int] = set()
+        for field in getattr(embed, "fields", []) or []:
+            name = str(getattr(field, "name", "") or "").lower()
+            if "players" not in name:
+                continue
+            for line in str(getattr(field, "value", "") or "").splitlines():
+                m = re.search(r"<@!?(\d+)>", line)
+                if not m:
+                    continue
+                uid = int(m.group(1))
+                if uid not in q:
+                    q.append(uid)
+                if "✅" in line:
+                    checked.add(uid)
+                if "⭐" in line:
+                    catty.add(uid)
+        return activity or None, q, checked, catty
+    except Exception:
+        return None, [], set(), set()
+
+async def _recover_queues_from_queue_boards(*, include_older_nonempty: bool = False, replace_existing: bool = False) -> bool:
+    if not RAID_QUEUE_CHANNEL_ID or (_queue_total(QUEUES) > 0 and not replace_existing):
+        return False
+    try:
+        ch = bot.get_channel(int(RAID_QUEUE_CHANNEL_ID)) or await bot.fetch_channel(int(RAID_QUEUE_CHANNEL_ID))
+    except Exception:
+        return False
+    recovered: Dict[str, List[int]] = {}
+    recovered_checked: Dict[str, Set[int]] = {}
+    recovered_catty: Dict[str, Set[int]] = {}
+    seen_activities: Set[str] = set()
+    try:
+        async for msg in ch.history(limit=150):  # type: ignore[attr-defined]
+            for embed in getattr(msg, "embeds", []) or []:
+                activity, q, checked, catty = _parse_queue_board_embed(embed)
+                if not activity or activity in seen_activities:
+                    continue
+                # The newest board for an activity is authoritative. If it is
+                # empty, do not resurrect older signups for that activity.
+                if not q:
+                    if not include_older_nonempty:
+                        seen_activities.add(activity)
+                    continue
+                seen_activities.add(activity)
+                recovered[activity] = q
+                recovered_checked[activity] = checked
+                recovered_catty[activity] = catty
+    except Exception as e:
+        try:
+            print("Queue board recovery failed:", e)
+        except Exception:
+            pass
+        return False
+    if _queue_total(recovered) <= 0:
+        return False
+    QUEUES.clear()
+    CHECKED.clear()
+    CATTY_RUNS.clear()
+    for act, q in recovered.items():
+        QUEUES[act] = list(q)
+        if recovered_checked.get(act):
+            CHECKED[act] = set(recovered_checked[act])
+        if recovered_catty.get(act):
+            CATTY_RUNS[act] = set(recovered_catty[act])
+    try:
+        print(f"Recovered queues from queue board embeds: {sorted(recovered.keys())}")
+    except Exception:
+        pass
+    return True
 
 
 # ---------------
@@ -1994,6 +2248,14 @@ async def on_ready():
             await load_catty()
             await load_cooldowns()
             await load_builds()
+            try:
+                if _queue_total(QUEUES) <= 0 and await _recover_queues_from_queue_boards():
+                    await persist_queues()
+                    await persist_checked()
+                    await persist_catty()
+            except Exception as e:
+                try: print("Queue board recovery skipped:", e)
+                except Exception: pass
             bot._queues_loaded = True  # type: ignore[attr-defined]
             print("Queues, checked, catty, and builds loaded from disk")
         except Exception as e:
@@ -2237,6 +2499,7 @@ async def join_cmd(
     else:
         catty.discard(uid)
     await persist_queues()
+    _append_queue_event("join", act, [uid])
     await persist_checked()
     await persist_catty()
     await interaction.response.send_message(
@@ -2290,6 +2553,7 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
             _ensure_checked(act).discard(uid)
             _ensure_catty(act).discard(uid)
             await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
+            _append_queue_event("leave", act, [uid])
             await interaction.response.send_message(f"Left queue: {act}", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -2621,6 +2885,7 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
         # /add does not specify catty/weapon run; default to not requested.
         _ensure_catty(act).discard(uid)
         await persist_queues(); await persist_checked(); await persist_catty()
+        _append_queue_event("add", act, [uid])
         await interaction.response.send_message(f"Added user to queue: {act}", ephemeral=True)
         await _post_activity_board(act)
         return
@@ -2696,6 +2961,7 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
             pass
         if removed_any:
             await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
+            _append_queue_event("remove", act, list(uid_set))
             await interaction.response.send_message("Removed selected user(s) from queue.", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -2730,6 +2996,8 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
 
     if changed_acts:
         await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
+        for act in changed_acts:
+            _append_queue_event("remove", act, list(uid_set))
         await interaction.response.send_message(
             f"Removed selected user(s) from queues: {', '.join(changed_acts)}.", ephemeral=True
         )
@@ -2768,6 +3036,7 @@ async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[st
         _ensure_checked(act).clear()
         _ensure_catty(act).clear()
         await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
+        _append_queue_event("clear", act, [])
         await _post_activity_board(act)
         if queue_was_nonempty or checked_was_nonempty or catty_was_nonempty:
             await interaction.followup.send(f"Cleared queue: {act}.", ephemeral=True)
@@ -2788,6 +3057,7 @@ async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[st
             changed_acts.append(act)
 
     await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
+    _append_queue_event("clear", None, [])
     for act in changed_acts:
         await _post_activity_board(act)
     if changed_acts:
@@ -2962,6 +3232,25 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     else:
         await _post_all_activity_boards(interaction.channel_id)
         await interaction.followup.send("Queue boards posted.", ephemeral=True)
+
+
+@bot.tree.command(name="restorequeue", description="Founder only: restore queues from queue board history")
+@founder_only()
+async def restorequeue_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        recovered = await _recover_queues_from_queue_boards(include_older_nonempty=True, replace_existing=True)
+        if not recovered:
+            await interaction.followup.send("No queue signups found in recent queue board history.", ephemeral=True)
+            return
+        await persist_queues()
+        await persist_checked()
+        await persist_catty()
+        await _post_all_activity_boards(interaction.channel_id)
+        total = _queue_total(QUEUES)
+        await interaction.followup.send(f"Restored {total} queued signup(s) from queue board history.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Queue restore failed: {e.__class__.__name__}", ephemeral=True)
 
 
 @bot.tree.command(name="check", description="Add a green check next to a user in a queue")
