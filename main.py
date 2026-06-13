@@ -1451,6 +1451,7 @@ async def _recover_queues_from_queue_boards(
     include_older_nonempty: bool = False,
     replace_existing: bool = False,
     prefer_fullest: bool = False,
+    prefer_oldest: bool = False,
     history_limit: int = 1000,
 ) -> bool:
     if not RAID_QUEUE_CHANNEL_ID or (_queue_total(QUEUES) > 0 and not replace_existing):
@@ -1471,6 +1472,14 @@ async def _recover_queues_from_queue_boards(
                     continue
                 if prefer_fullest:
                     if q and len(q) > len(recovered.get(activity, []) or []):
+                        recovered[activity] = q
+                        recovered_checked[activity] = checked
+                        recovered_catty[activity] = catty
+                    continue
+                if prefer_oldest:
+                    # History scans newest -> oldest, so overwriting with each
+                    # non-empty board leaves the oldest non-empty board found.
+                    if q:
                         recovered[activity] = q
                         recovered_checked[activity] = checked
                         recovered_catty[activity] = catty
@@ -3276,14 +3285,34 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
 
 @bot.tree.command(name="restorequeue", description="Founder only: restore queues from queue board history")
 @founder_only()
-async def restorequeue_cmd(interaction: discord.Interaction):
+@app_commands.describe(
+    strategy="Which queue board to use for each activity",
+    history_limit="How many recent #raid-queue messages to scan (100-2000)",
+)
+@app_commands.choices(
+    strategy=[
+        app_commands.Choice(name="Fullest board per activity (recommended)", value="fullest"),
+        app_commands.Choice(name="Oldest non-empty board per activity", value="oldest"),
+        app_commands.Choice(name="Newest non-empty board per activity", value="newest"),
+    ]
+)
+async def restorequeue_cmd(
+    interaction: discord.Interaction,
+    strategy: str = "fullest",
+    history_limit: Optional[int] = 1000,
+):
     await interaction.response.defer(ephemeral=True)
     try:
+        chosen_strategy = str(strategy or "fullest").strip().lower()
+        if chosen_strategy not in ("fullest", "oldest", "newest"):
+            chosen_strategy = "fullest"
+        scan_limit = max(100, min(int(history_limit or 1000), 2000))
         recovered = await _recover_queues_from_queue_boards(
             include_older_nonempty=True,
             replace_existing=True,
-            prefer_fullest=True,
-            history_limit=1000,
+            prefer_fullest=(chosen_strategy == "fullest"),
+            prefer_oldest=(chosen_strategy == "oldest"),
+            history_limit=scan_limit,
         )
         if not recovered:
             await interaction.followup.send("No queue signups found in recent queue board history.", ephemeral=True)
@@ -3296,6 +3325,7 @@ async def restorequeue_cmd(interaction: discord.Interaction):
         await interaction.followup.send(
             f"Restored {total} queued signup(s) from queue board history "
             f"across {len([q for q in QUEUES.values() if q])} activity queue(s).\n"
+            f"Strategy: {chosen_strategy}; scanned: {scan_limit} messages.\n"
             f"Found: {_queue_restore_summary()}",
             ephemeral=True,
         )
