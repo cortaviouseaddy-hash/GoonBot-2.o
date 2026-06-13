@@ -1532,6 +1532,42 @@ async def _recover_queues_from_queue_boards(
         pass
     return True
 
+async def _preview_queue_board_history(
+    *,
+    activity_filter: Optional[str] = None,
+    history_limit: int = 2000,
+) -> Tuple[int, int, List[str]]:
+    if not RAID_QUEUE_CHANNEL_ID:
+        return 0, 0, ["RAID_QUEUE_CHANNEL_ID is not configured."]
+    try:
+        ch = bot.get_channel(int(RAID_QUEUE_CHANNEL_ID)) or await bot.fetch_channel(int(RAID_QUEUE_CHANNEL_ID))
+    except Exception as e:
+        return 0, 0, [f"Could not read queue channel: {e.__class__.__name__}"]
+    filter_norm = _normalize_activity_text(activity_filter) if activity_filter else ""
+    messages_seen = 0
+    boards_seen = 0
+    lines: List[str] = []
+    try:
+        async for msg in ch.history(limit=int(history_limit)):  # type: ignore[attr-defined]
+            messages_seen += 1
+            for embed in getattr(msg, "embeds", []) or []:
+                activity, q, checked, catty = _parse_queue_board_embed(embed)
+                if not activity:
+                    continue
+                if filter_norm and filter_norm not in _normalize_activity_text(activity):
+                    continue
+                boards_seen += 1
+                title = str(getattr(embed, "title", "") or activity)
+                msg_id = int(getattr(msg, "id", 0) or 0)
+                lines.append(
+                    f"{boards_seen}. {title} — players={len(q)} checks={len(checked)} stars={len(catty)} msg={msg_id}"
+                )
+                if len(lines) >= 25:
+                    return messages_seen, boards_seen, lines
+    except Exception as e:
+        lines.append(f"History scan failed: {e.__class__.__name__}")
+    return messages_seen, boards_seen, lines
+
 
 # ---------------
 # Checked persistence
@@ -3353,6 +3389,36 @@ async def restorequeue_cmd(
         )
     except Exception as e:
         await interaction.followup.send(f"Queue restore failed: {e.__class__.__name__}", ephemeral=True)
+
+
+@bot.tree.command(name="restorequeue_preview", description="Founder only: preview queue boards seen by restore")
+@founder_only()
+@app_commands.describe(
+    activity_filter="Optional: only show queue boards whose title contains this text, e.g. Pantheon",
+    history_limit="How many recent #raid-queue messages to scan (100-2000)",
+)
+async def restorequeue_preview_cmd(
+    interaction: discord.Interaction,
+    activity_filter: Optional[str] = None,
+    history_limit: Optional[int] = 2000,
+):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        scan_limit = max(100, min(int(history_limit or 2000), 2000))
+        messages_seen, boards_seen, lines = await _preview_queue_board_history(
+            activity_filter=activity_filter,
+            history_limit=scan_limit,
+        )
+        body = "\n".join(lines) if lines else "No matching queue-board embeds found."
+        if len(body) > 1800:
+            body = body[:1797] + "..."
+        await interaction.followup.send(
+            f"Scanned {messages_seen} message(s), found {boards_seen} matching queue board(s).\n"
+            f"Filter: {activity_filter or 'none'}.\n{body}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"Queue restore preview failed: {e.__class__.__name__}", ephemeral=True)
 
 
 @bot.tree.command(name="check", description="Add a green check next to a user in a queue")
