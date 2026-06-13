@@ -692,6 +692,13 @@ async def _join_queue_from_help_confirmation(message: discord.Message, activity:
         )
         return
 
+    try:
+        await load_queues()
+        await load_checked()
+        await load_catty()
+    except Exception:
+        pass
+
     act, _ = _resolve_activity(activity, list(ALL_ACTIVITIES) + list(QUEUES.keys()))
     if not act:
         await _reply_queue_confirmation_embed(
@@ -1148,6 +1155,23 @@ def _read_queues_from_disk() -> Dict[str, List[int]]:
     except Exception:
         return {}
 
+def _merge_queue_states(existing: Dict[str, List[int]], incoming: Dict[str, List[int]]) -> Dict[str, List[int]]:
+    merged: Dict[str, List[int]] = {}
+    for act in set(existing.keys()) | set(incoming.keys()):
+        seen: Set[int] = set()
+        ordered: List[int] = []
+        for uid in list(existing.get(act, []) or []) + list(incoming.get(act, []) or []):
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
+            if uid_int in seen:
+                continue
+            seen.add(uid_int)
+            ordered.append(uid_int)
+        merged[str(act)] = ordered
+    return merged
+
 def _write_queues_to_disk(state: Dict[str, List[int]]) -> None:
     try:
         tmp_path = f"{QUEUES_FILE}.tmp"
@@ -1175,17 +1199,22 @@ def _write_queues_to_disk(state: Dict[str, List[int]]) -> None:
         except Exception:
             pass
 
-async def persist_queues() -> None:
+async def persist_queues(*, allow_removals: bool = False) -> None:
     async with QUEUES_LOCK:
-        _write_queues_to_disk(QUEUES)
+        state = {str(k): [int(x) for x in (v or [])] for k, v in QUEUES.items()}
+        if not allow_removals:
+            state = _merge_queue_states(_read_queues_from_disk(), state)
+            QUEUES.clear()
+            for k, v in state.items():
+                QUEUES[k] = list(v)
+        _write_queues_to_disk(state)
 
 async def load_queues() -> None:
     async with QUEUES_LOCK:
         loaded = _read_queues_from_disk()
-        if loaded:
-            # Merge into current to preserve references
-            for k, v in loaded.items():
-                QUEUES[k] = list(v)
+        QUEUES.clear()
+        for k, v in loaded.items():
+            QUEUES[k] = list(v)
 
 
 # ---------------
@@ -2158,6 +2187,12 @@ async def join_cmd(
         hint = (" Try: " + ", ".join(sug)) if sug else ""
         await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
         return
+    try:
+        await load_queues()
+        await load_checked()
+        await load_catty()
+    except Exception:
+        pass
     uid = interaction.user.id
     catty_needed = str(catty_weapon_run or "no").strip().lower() == "yes"
     catty = _ensure_catty(act)
@@ -2254,7 +2289,7 @@ async def leave_cmd(interaction: discord.Interaction, activity: Optional[str] = 
             q[:] = [x for x in q if x != uid]
             _ensure_checked(act).discard(uid)
             _ensure_catty(act).discard(uid)
-            await persist_queues(); await persist_checked(); await persist_catty()
+            await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
             await interaction.response.send_message(f"Left queue: {act}", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -2570,6 +2605,12 @@ async def add_cmd(interaction: discord.Interaction, user: str, activity: Optiona
             hint = (" Try: " + ", ".join(sug)) if sug else ""
             await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
             return
+        try:
+            await load_queues()
+            await load_checked()
+            await load_catty()
+        except Exception:
+            pass
         q = _ensure_queue(act)
         if uid in q:
             await interaction.response.send_message("User already in queue.", ephemeral=True)
@@ -2594,6 +2635,7 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
     # Ensure we are operating on the latest queue state (important with multiple bot instances)
     try:
         await load_queues()
+        await load_checked()
         await load_catty()
     except Exception:
         pass
@@ -2653,7 +2695,7 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
         except Exception:
             pass
         if removed_any:
-            await persist_queues(); await persist_checked(); await persist_catty()
+            await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
             await interaction.response.send_message("Removed selected user(s) from queue.", ephemeral=True)
             await _post_activity_board(act)
             return
@@ -2687,7 +2729,7 @@ async def remove_cmd(interaction: discord.Interaction, user: str, activity: Opti
         changed_acts = []
 
     if changed_acts:
-        await persist_queues(); await persist_checked(); await persist_catty()
+        await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
         await interaction.response.send_message(
             f"Removed selected user(s) from queues: {', '.join(changed_acts)}.", ephemeral=True
         )
@@ -2725,7 +2767,7 @@ async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[st
         _ensure_queue(act).clear()
         _ensure_checked(act).clear()
         _ensure_catty(act).clear()
-        await persist_queues(); await persist_checked(); await persist_catty()
+        await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
         await _post_activity_board(act)
         if queue_was_nonempty or checked_was_nonempty or catty_was_nonempty:
             await interaction.followup.send(f"Cleared queue: {act}.", ephemeral=True)
@@ -2745,7 +2787,7 @@ async def clearqueue_cmd(interaction: discord.Interaction, activity: Optional[st
         if queue_was_nonempty or checked_was_nonempty or catty_was_nonempty:
             changed_acts.append(act)
 
-    await persist_queues(); await persist_checked(); await persist_catty()
+    await persist_queues(allow_removals=True); await persist_checked(); await persist_catty()
     for act in changed_acts:
         await _post_activity_board(act)
     if changed_acts:
@@ -2905,6 +2947,7 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
     # Ensure the most recent on-disk state is used, especially with multiple instances
     try:
         await load_queues()
+        await load_checked()
         await load_catty()
     except Exception:
         pass
@@ -2932,6 +2975,7 @@ async def check_cmd(interaction: discord.Interaction, activity: str, user: str):
     # Refresh queues to avoid stale membership checks
     try:
         await load_queues()
+        await load_checked()
     except Exception:
         pass
     act, sug = _resolve_activity(activity)
@@ -2965,6 +3009,7 @@ async def uncheck_cmd(interaction: discord.Interaction, activity: str, user: str
     # Refresh queues to avoid stale membership checks
     try:
         await load_queues()
+        await load_checked()
     except Exception:
         pass
     act, sug = _resolve_activity(activity)
@@ -3504,11 +3549,12 @@ async def _scheduler_loop():
 
 
 async def _autosave_loop():
-    # Periodically persist queues to reduce data loss windows
+    # Queue mutations persist at the command/action point. Avoid rewriting queue
+    # state from a background task because stale bot memory can wipe active queues.
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            await persist_queues(); await persist_checked(); await persist_catty(); await persist_cooldowns()
+            await persist_checked(); await persist_catty(); await persist_cooldowns()
         except Exception:
             pass
         await asyncio.sleep(60)
