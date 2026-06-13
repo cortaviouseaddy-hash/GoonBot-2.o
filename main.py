@@ -1452,6 +1452,7 @@ async def _recover_queues_from_queue_boards(
     replace_existing: bool = False,
     prefer_fullest: bool = False,
     prefer_oldest: bool = False,
+    include_all_names: bool = False,
     activity_filter: Optional[str] = None,
     history_limit: int = 1000,
 ) -> bool:
@@ -1473,6 +1474,15 @@ async def _recover_queues_from_queue_boards(
                 if not activity:
                     continue
                 if filter_norm and filter_norm not in _normalize_activity_text(activity):
+                    continue
+                if include_all_names:
+                    if q:
+                        existing = recovered.setdefault(activity, [])
+                        for uid in q:
+                            if uid not in existing:
+                                existing.append(uid)
+                        recovered_checked.setdefault(activity, set()).update(checked)
+                        recovered_catty.setdefault(activity, set()).update(catty)
                     continue
                 if prefer_fullest:
                     if q and len(q) > len(recovered.get(activity, []) or []):
@@ -3296,6 +3306,7 @@ async def queue_cmd(interaction: discord.Interaction, activity: Optional[str] = 
 )
 @app_commands.choices(
     strategy=[
+        app_commands.Choice(name="All names found across boards", value="all"),
         app_commands.Choice(name="Fullest board per activity (recommended)", value="fullest"),
         app_commands.Choice(name="Oldest non-empty board per activity", value="oldest"),
         app_commands.Choice(name="Newest non-empty board per activity", value="newest"),
@@ -3311,12 +3322,13 @@ async def restorequeue_cmd(
     await interaction.response.defer(ephemeral=True)
     try:
         chosen_strategy = str(strategy or "fullest").strip().lower()
-        if chosen_strategy not in ("fullest", "oldest", "newest"):
+        if chosen_strategy not in ("all", "fullest", "oldest", "newest"):
             chosen_strategy = "fullest"
         scan_limit = max(100, min(int(history_limit or 1000), 2000))
         recovered = await _recover_queues_from_queue_boards(
             include_older_nonempty=True,
             replace_existing=bool(replace_existing),
+            include_all_names=(chosen_strategy == "all"),
             prefer_fullest=(chosen_strategy == "fullest"),
             prefer_oldest=(chosen_strategy == "oldest"),
             activity_filter=activity_filter,
