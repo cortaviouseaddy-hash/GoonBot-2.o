@@ -2970,14 +2970,23 @@ async def list_cmd(
         return
 
     queued_to_prompt = _queue_members_needing_prompt(act)
-    channel = interaction.channel
+    target_channel_id = EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id
+    try:
+        channel = bot.get_channel(int(target_channel_id)) if target_channel_id else None
+        if channel is None and target_channel_id:
+            channel = await bot.fetch_channel(int(target_channel_id))
+    except Exception:
+        channel = None
     if not channel or not hasattr(channel, "send"):
-        await interaction.followup.send("I could not post the list in this channel.", ephemeral=True)
+        await interaction.followup.send(
+            "I could not post the list in the raid/dungeon event signup channel.",
+            ephemeral=True,
+        )
         return
 
     data: Dict[str, object] = {
         "guild_id": int(guild.id),
-        "channel_id": int(interaction.channel_id or 0),
+        "channel_id": int(getattr(channel, "id", target_channel_id or 0) or 0),
         "message_id": 0,
         "activity": act,
         "host_id": int(interaction.user.id),
@@ -3022,7 +3031,7 @@ async def list_cmd(
                 (
                     f"Do you want to run **{act}**?\n"
                     f"If yes, you'll be added to the list in your current queue order.\n"
-                    "Check the latest list post in the channel for the current group."
+                    "Check the latest list post in the raid/dungeon event signup channel for the current group."
                 ).strip(),
                 view=ListDMConfirmView(int(msg.id), int(uid)),
             )
@@ -3036,7 +3045,7 @@ async def list_cmd(
     skipped_checked = max(0, len(QUEUES.get(act, []) or []) - len(queued_to_prompt))
     await interaction.followup.send(
         (
-            f"List posted for **{act}**. DMed {sent} queued player(s); {failed} DM(s) failed."
+            f"List posted for **{act}** in <#{int(msg.channel.id)}>. DMed {sent} queued player(s); {failed} DM(s) failed."
             + (f" Skipped {skipped_checked} already-marked queued player(s)." if skipped_checked else "")
         ),
         ephemeral=True,
