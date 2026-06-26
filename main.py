@@ -2670,7 +2670,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     )
     if guild:
         try:
-            embed.set_footer(text=f"Use Done or Next Group when this group is finished. List ID: {int(data.get('message_id') or 0)}")
+            embed.set_footer(text=f"Use Next Group to ping the next team, or Done to end the list. List ID: {int(data.get('message_id') or 0)}")
         except Exception:
             pass
     return embed
@@ -2747,16 +2747,56 @@ async def _list_decline(list_id: int, uid: int) -> Tuple[bool, str]:
     await _update_list_message(int(list_id))
     return True, "No problem. You were marked as not available for this pull."
 
-async def _list_advance_group(list_id: int) -> str:
+async def _list_notify_group(data: Dict[str, object], user_ids: List[int]) -> Tuple[int, int]:
+    if not user_ids:
+        return 0, 0
+    activity = str(data.get("activity") or "Activity")
+    group_number = max(1, int(data.get("group_index", 0) or 0) + 1)
+    mentions = " ".join(f"<@{int(uid)}>" for uid in user_ids)
+    channel_sent = 0
+    dm_sent = 0
+    try:
+        ch_id = int(data.get("channel_id") or 0)
+        if ch_id:
+            ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+            await ch.send(
+                f"Next group for **{activity}** (Group {group_number}): {mentions}",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+            channel_sent = 1
+    except Exception as e:
+        try: print("List next-group mention failed:", e)
+        except Exception: pass
+    guild = None
+    try:
+        guild_id = int(data.get("guild_id") or 0)
+        if guild_id:
+            guild = bot.get_guild(guild_id)
+    except Exception:
+        guild = None
+    if guild:
+        for uid in user_ids:
+            try:
+                member = guild.get_member(int(uid))
+                if member is None:
+                    member = await guild.fetch_member(int(uid))
+                dm = await member.create_dm()
+                await dm.send(f"You're up next for **{activity}** (Group {group_number}). Please get ready.")
+                dm_sent += 1
+            except Exception:
+                pass
+    return channel_sent, dm_sent
+
+async def _list_advance_group(list_id: int) -> Tuple[str, List[int]]:
     data = LISTS.get(int(list_id))
     if not data:
-        return "This list no longer exists."
+        return "This list no longer exists.", []
     group_index = max(0, int(data.get("group_index", 0) or 0))
     completed = _list_completed_groups(data)
     current_players = _list_current_players(data)
     if not current_players:
         await _update_list_message(int(list_id))
-        return "No confirmed players are in the current group yet."
+        return "No confirmed players are in the current group yet.", []
     if group_index not in completed:
         completed.add(group_index)
         data["completed_groups"] = completed
@@ -2768,11 +2808,13 @@ async def _list_advance_group(list_id: int) -> str:
     slots = _list_player_slots(data)
     data["group_index"] = group_index + 1
     if len(ordered) > int(data["group_index"]) * slots:
+        next_players = _list_current_players(data)
         msg = f"Moved to group {int(data['group_index']) + 1}."
     else:
+        next_players = []
         msg = f"Group {group_index + 1} marked done. Waiting for more confirmed players."
     await _update_list_message(int(list_id))
-    return msg
+    return msg, next_players
 
 class ListDMConfirmView(discord.ui.View):
     def __init__(self, list_id: int, uid: int):
@@ -2809,8 +2851,24 @@ class ListPublicView(discord.ui.View):
         if not _list_host_allowed(interaction, data):
             await interaction.response.send_message("Only the list host or founder can advance groups.", ephemeral=True)
             return
-        msg = await _list_advance_group(self.list_id)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        msg, next_players = await _list_advance_group(self.list_id)
+        if next_players:
+            channel_sent, dm_sent = await _list_notify_group(data, next_players)
+            msg += f" Mentioned next group in channel: {'Yes' if channel_sent else 'No'}; DMed {dm_sent}/{len(next_players)}."
+        await interaction.followup.send(msg, ephemeral=True)
+
+    async def _close_from_button(self, interaction: discord.Interaction) -> None:
+        data = LISTS.get(self.list_id)
+        if not data:
+            await interaction.response.send_message("This list is already gone.", ephemeral=True)
+            return
+        if not _list_host_allowed(interaction, data):
+            await interaction.response.send_message("Only the list host or founder can close this list.", ephemeral=True)
+            return
+        data["closed"] = True
+        await _update_list_message(self.list_id)
+        await interaction.response.send_message("List ended.", ephemeral=True)
 
     @discord.ui.button(label="Join List", style=discord.ButtonStyle.primary, custom_id="list_public_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
@@ -2823,7 +2881,7 @@ class ListPublicView(discord.ui.View):
 
     @discord.ui.button(label="Done", style=discord.ButtonStyle.success, custom_id="list_public_done")
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
-        await self._advance_from_button(interaction)
+        await self._close_from_button(interaction)
 
     @discord.ui.button(label="Next Group", style=discord.ButtonStyle.success, custom_id="list_public_next")
     async def next_group(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
@@ -2831,16 +2889,7 @@ class ListPublicView(discord.ui.View):
 
     @discord.ui.button(label="Close List", style=discord.ButtonStyle.danger, custom_id="list_public_close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
-        data = LISTS.get(self.list_id)
-        if not data:
-            await interaction.response.send_message("This list is already gone.", ephemeral=True)
-            return
-        if not _list_host_allowed(interaction, data):
-            await interaction.response.send_message("Only the list host or founder can close this list.", ephemeral=True)
-            return
-        data["closed"] = True
-        await _update_list_message(self.list_id)
-        await interaction.response.send_message("List closed.", ephemeral=True)
+        await self._close_from_button(interaction)
 
 # ---------------------------
 # Slash Commands
