@@ -2670,7 +2670,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     )
     if guild:
         try:
-            embed.set_footer(text=f"Use Next Group when this group is done. List ID: {int(data.get('message_id') or 0)}")
+            embed.set_footer(text=f"Use Done or Next Group when this group is finished. List ID: {int(data.get('message_id') or 0)}")
         except Exception:
             pass
     return embed
@@ -2801,17 +2801,7 @@ class ListPublicView(discord.ui.View):
         super().__init__(timeout=12 * 60 * 60)
         self.list_id = int(list_id)
 
-    @discord.ui.button(label="Join List", style=discord.ButtonStyle.primary, custom_id="list_public_join")
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
-            ok, msg = await _list_add_sherpa(self.list_id, int(interaction.user.id))
-        else:
-            ok, msg = await _list_add_player(self.list_id, int(interaction.user.id))
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @discord.ui.button(label="Next Group", style=discord.ButtonStyle.success, custom_id="list_public_next")
-    async def next_group(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+    async def _advance_from_button(self, interaction: discord.Interaction) -> None:
         data = LISTS.get(self.list_id)
         if not data or data.get("closed"):
             await interaction.response.send_message("This list is closed.", ephemeral=True)
@@ -2821,6 +2811,23 @@ class ListPublicView(discord.ui.View):
             return
         msg = await _list_advance_group(self.list_id)
         await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Join List", style=discord.ButtonStyle.primary, custom_id="list_public_join")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
+            ok, msg = await _list_add_sherpa(self.list_id, int(interaction.user.id))
+        else:
+            ok, msg = await _list_add_player(self.list_id, int(interaction.user.id))
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, custom_id="list_public_done")
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        await self._advance_from_button(interaction)
+
+    @discord.ui.button(label="Next Group", style=discord.ButtonStyle.success, custom_id="list_public_next")
+    async def next_group(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        await self._advance_from_button(interaction)
 
     @discord.ui.button(label="Close List", style=discord.ButtonStyle.danger, custom_id="list_public_close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
