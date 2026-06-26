@@ -138,6 +138,8 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 SCHEDULES: Dict[int, Dict[str, object]] = {}
 QUEUES: Dict[str, List[int]] = {}
 CHECKED: Dict[str, Set[int]] = {}
+# message_id -> active /list pull state
+LISTS: Dict[int, Dict[str, object]] = {}
 # activity -> users who requested catty/weapon run while queued
 CATTY_RUNS: Dict[str, Set[int]] = {}
 # activity -> { user_id -> cooldown_until_epoch }
@@ -817,6 +819,7 @@ def _chat_help_reply(message_text: str, *, direct_bot_question: bool = False) ->
             "Common commands:\n"
             "• **/join** — join an activity queue\n"
             "• **/queue** — view current queues\n"
+            "• **/list** — Sherpas pull the next ordered group from a queue\n"
             "• **/leave** — leave a queue/signup\n"
             "• **/event** — create a player event signup\n"
             "• **/event_sherpa** — create a Sherpa-only signup\n"
@@ -2392,6 +2395,7 @@ async def on_member_join(member: discord.Member):
                     value=(
                         "• /join — choose an activity to enter its queue (max 2)\n"
                         "• /queue — view current queues or a specific activity\n"
+                        "• /list — Sherpas pull an ordered group from a queue\n"
                         "• /schedule — founder-only: creates the event post and prioritizes queued players"
                     ),
                     inline=False,
@@ -2424,6 +2428,7 @@ async def on_member_join(member: discord.Member):
                 "Commands:\n"
                 "• /join — choose an activity to enter its queue (max 2)\n"
                 "• /queue — view current queues or a specific activity\n"
+                "• /list — Sherpas pull an ordered group from a queue\n"
                 "• /schedule — founder-only: creates an event post and prioritizes queued players\n\n"
                 "What to look for:\n"
                 "• Event posts: 📝 adds you as backup; ✅ tries to join when signups open; ❌ leaves\n"
@@ -2517,8 +2522,434 @@ async def _post_all_activity_boards(fallback_channel_id: Optional[int] = None):
         await _post_activity_board(act, target_channel_id)
 
 # ---------------------------
+# Pull Lists
+# ---------------------------
+
+def _field_value(text: str, limit: int = 1024) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)] + "..."
+
+def _mentions_in_order(user_ids: List[int], *, start_index: int = 1, empty: str = "None yet") -> str:
+    if not user_ids:
+        return empty
+    lines = [f"{idx}. <@{int(uid)}>" for idx, uid in enumerate(user_ids[:35], start=start_index)]
+    if len(user_ids) > 35:
+        lines.append(f"...and {len(user_ids) - 35} more")
+    return _field_value("\n".join(lines))
+
+def _list_player_slots(data: Dict[str, object]) -> int:
+    group_size = max(1, int(data.get("group_size", 1) or 1))
+    sherpa_count = max(0, int(data.get("sherpa_count", 0) or 0))
+    return max(1, group_size - sherpa_count)
+
+def _list_ordered_players(data: Dict[str, object]) -> List[int]:
+    confirmed = {int(uid) for uid in (data.get("confirmed") or [])}
+    ordered: List[int] = []
+    seen: Set[int] = set()
+    for uid in (data.get("source_order") or []):
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        if uid_int in confirmed and uid_int not in seen:
+            ordered.append(uid_int)
+            seen.add(uid_int)
+    for uid in (data.get("confirmed") or []):
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        if uid_int not in seen:
+            ordered.append(uid_int)
+            seen.add(uid_int)
+    return ordered
+
+def _list_current_players(data: Dict[str, object]) -> List[int]:
+    players = _list_ordered_players(data)
+    slots = _list_player_slots(data)
+    index = max(0, int(data.get("group_index", 0) or 0))
+    return players[index * slots : (index + 1) * slots]
+
+def _list_current_sherpas(data: Dict[str, object]) -> List[int]:
+    sherpa_count = max(0, int(data.get("sherpa_count", 0) or 0))
+    sherpas = []
+    seen: Set[int] = set()
+    for uid in (data.get("sherpas") or []):
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        if uid_int not in seen:
+            sherpas.append(uid_int)
+            seen.add(uid_int)
+    return sherpas[:sherpa_count] if sherpa_count else []
+
+def _list_group_count(data: Dict[str, object]) -> int:
+    players = len(_list_ordered_players(data))
+    slots = _list_player_slots(data)
+    current_index = max(0, int(data.get("group_index", 0) or 0))
+    return max(current_index + 1, (players + slots - 1) // slots, 1)
+
+def _list_completed_groups(data: Dict[str, object]) -> Set[int]:
+    try:
+        return {int(x) for x in (data.get("completed_groups") or set())}
+    except Exception:
+        return set()
+
+def _list_host_allowed(interaction: discord.Interaction, data: Dict[str, object]) -> bool:
+    if _is_promoter_or_founder(interaction, data):
+        return True
+    return False
+
+async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, object]) -> discord.Embed:
+    activity = str(data.get("activity") or "Activity")
+    group_size = max(1, int(data.get("group_size", 1) or 1))
+    sherpa_count = max(0, int(data.get("sherpa_count", 0) or 0))
+    player_slots = _list_player_slots(data)
+    ordered_players = _list_ordered_players(data)
+    current_players = _list_current_players(data)
+    current_sherpas = _list_current_sherpas(data)
+    group_index = max(0, int(data.get("group_index", 0) or 0))
+    group_count = _list_group_count(data)
+    completed = group_index in _list_completed_groups(data)
+    declined = {int(uid) for uid in (data.get("declined") or [])}
+    source_order = [int(uid) for uid in (data.get("source_order") or [])]
+    pending = [uid for uid in source_order if uid not in set(ordered_players) and uid not in declined]
+
+    embed = discord.Embed(
+        title=f"Raid List - {activity}",
+        description=(
+            "Queued players were DMed to confirm. Anyone else can press **Join List** below.\n"
+            "Confirmed players are grouped in queue order."
+        ),
+        color=_activity_color(activity),
+    )
+    host_id = data.get("host_id")
+    if host_id:
+        embed.add_field(name="Host", value=f"<@{int(host_id)}>", inline=True)
+    embed.add_field(name="Group Size", value=f"{group_size} total ({player_slots} player + {sherpa_count} sherpa)", inline=True)
+    status = "Completed" if completed else "Active"
+    embed.add_field(name="Current Group", value=f"{group_index + 1} of {group_count} - {status}", inline=True)
+
+    group_start = group_index * player_slots + 1
+    embed.add_field(
+        name=f"Current Players ({len(current_players)}/{player_slots})",
+        value=_mentions_in_order(current_players, start_index=group_start),
+        inline=False,
+    )
+    if sherpa_count:
+        embed.add_field(
+            name=f"Sherpas ({len(current_sherpas)}/{sherpa_count})",
+            value=_mentions_in_order(current_sherpas, empty="Sherpas can press Join List to be listed here."),
+            inline=False,
+        )
+
+    remaining_after_current = ordered_players[(group_index + 1) * player_slots :]
+    if remaining_after_current:
+        embed.add_field(
+            name=f"Up Next ({len(remaining_after_current)})",
+            value=_mentions_in_order(remaining_after_current, start_index=(group_index + 1) * player_slots + 1),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Up Next", value="No confirmed players waiting yet.", inline=False)
+
+    notified = int(data.get("dm_sent", 0) or 0)
+    failed = int(data.get("dm_failed", 0) or 0)
+    embed.add_field(
+        name=f"Confirmed List ({len(ordered_players)})",
+        value=_mentions_in_order(ordered_players, empty="No yes responses yet."),
+        inline=False,
+    )
+    embed.add_field(
+        name="Queue Responses",
+        value=f"DMed: {notified} | Pending: {len(pending)} | Declined: {len(declined)} | DM failed: {failed}",
+        inline=True,
+    )
+    if guild:
+        try:
+            embed.set_footer(text=f"Use Next Group when this group is done. List ID: {int(data.get('message_id') or 0)}")
+        except Exception:
+            pass
+    return embed
+
+async def _update_list_message(list_id: int) -> None:
+    data = LISTS.get(int(list_id))
+    if not data:
+        return
+    try:
+        ch_id = int(data.get("channel_id") or 0)
+        if not ch_id:
+            return
+        ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+        msg = await ch.fetch_message(int(list_id))
+        guild_id = data.get("guild_id")
+        guild = bot.get_guild(int(guild_id)) if guild_id else None
+        embed = await _render_list_embed(guild, data)
+        if data.get("closed"):
+            await msg.edit(embed=embed, view=None)
+        else:
+            await msg.edit(embed=embed, view=ListPublicView(int(list_id)))
+    except Exception as e:
+        try: print("Failed to update list msg:", e)
+        except Exception: pass
+
+async def _list_add_player(list_id: int, uid: int) -> Tuple[bool, str]:
+    data = LISTS.get(int(list_id))
+    if not data or data.get("closed"):
+        return False, "This list is closed."
+    uid = int(uid)
+    sherpas = {int(x) for x in (data.get("sherpas") or [])}
+    confirmed: List[int] = data.get("confirmed") or []  # type: ignore
+    if uid in sherpas:
+        return False, "You're already listed as a Sherpa."
+    if uid in [int(x) for x in confirmed]:
+        return False, "You're already on the list."
+    confirmed.append(uid)
+    data["confirmed"] = confirmed
+    try:
+        declined: Set[int] = data.get("declined") or set()  # type: ignore
+        declined.discard(uid)
+        data["declined"] = declined
+    except Exception:
+        pass
+    await _update_list_message(int(list_id))
+    ordered = _list_ordered_players(data)
+    position = ordered.index(uid) + 1 if uid in ordered else len(ordered)
+    return True, f"You're on the list at position #{position}."
+
+async def _list_add_sherpa(list_id: int, uid: int) -> Tuple[bool, str]:
+    data = LISTS.get(int(list_id))
+    if not data or data.get("closed"):
+        return False, "This list is closed."
+    uid = int(uid)
+    if uid in {int(x) for x in (data.get("confirmed") or [])}:
+        return False, "You're already listed as a player."
+    sherpas: List[int] = data.get("sherpas") or []  # type: ignore
+    if uid in [int(x) for x in sherpas]:
+        return False, "You're already listed as a Sherpa."
+    sherpas.append(uid)
+    data["sherpas"] = sherpas
+    await _update_list_message(int(list_id))
+    return True, "You're listed as a Sherpa for this run."
+
+async def _list_decline(list_id: int, uid: int) -> Tuple[bool, str]:
+    data = LISTS.get(int(list_id))
+    if not data or data.get("closed"):
+        return False, "This list is closed."
+    confirmed: List[int] = data.get("confirmed") or []  # type: ignore
+    data["confirmed"] = [int(x) for x in confirmed if int(x) != int(uid)]
+    declined: Set[int] = data.get("declined") or set()  # type: ignore
+    declined.add(int(uid))
+    data["declined"] = declined
+    await _update_list_message(int(list_id))
+    return True, "No problem. You were marked as not available for this pull."
+
+async def _list_advance_group(list_id: int) -> str:
+    data = LISTS.get(int(list_id))
+    if not data:
+        return "This list no longer exists."
+    group_index = max(0, int(data.get("group_index", 0) or 0))
+    completed = _list_completed_groups(data)
+    current_players = _list_current_players(data)
+    if not current_players:
+        await _update_list_message(int(list_id))
+        return "No confirmed players are in the current group yet."
+    if group_index not in completed:
+        completed.add(group_index)
+        data["completed_groups"] = completed
+        try:
+            await _mark_queue_participants_checked(str(data.get("activity") or ""), current_players)
+        except Exception:
+            pass
+    ordered = _list_ordered_players(data)
+    slots = _list_player_slots(data)
+    data["group_index"] = group_index + 1
+    if len(ordered) > int(data["group_index"]) * slots:
+        msg = f"Moved to group {int(data['group_index']) + 1}."
+    else:
+        msg = f"Group {group_index + 1} marked done. Waiting for more confirmed players."
+    await _update_list_message(int(list_id))
+    return msg
+
+class ListDMConfirmView(discord.ui.View):
+    def __init__(self, list_id: int, uid: int):
+        super().__init__(timeout=12 * 60 * 60)
+        self.list_id = int(list_id)
+        self.uid = int(uid)
+
+    @discord.ui.button(label="Yes, I'm in", style=discord.ButtonStyle.success, custom_id="list_dm_yes")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if int(interaction.user.id) != self.uid:
+            await interaction.response.send_message("This button is not for you.", ephemeral=True)
+            return
+        ok, msg = await _list_add_player(self.list_id, self.uid)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary, custom_id="list_dm_no")
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if int(interaction.user.id) != self.uid:
+            await interaction.response.send_message("This button is not for you.", ephemeral=True)
+            return
+        ok, msg = await _list_decline(self.list_id, self.uid)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+class ListPublicView(discord.ui.View):
+    def __init__(self, list_id: int):
+        super().__init__(timeout=12 * 60 * 60)
+        self.list_id = int(list_id)
+
+    @discord.ui.button(label="Join List", style=discord.ButtonStyle.primary, custom_id="list_public_join")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member and (_is_sherpa(member) or _is_sherpa_assistant(member)):
+            ok, msg = await _list_add_sherpa(self.list_id, int(interaction.user.id))
+        else:
+            ok, msg = await _list_add_player(self.list_id, int(interaction.user.id))
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Next Group", style=discord.ButtonStyle.success, custom_id="list_public_next")
+    async def next_group(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        data = LISTS.get(self.list_id)
+        if not data or data.get("closed"):
+            await interaction.response.send_message("This list is closed.", ephemeral=True)
+            return
+        if not _list_host_allowed(interaction, data):
+            await interaction.response.send_message("Only the list host or founder can advance groups.", ephemeral=True)
+            return
+        msg = await _list_advance_group(self.list_id)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Close List", style=discord.ButtonStyle.danger, custom_id="list_public_close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        data = LISTS.get(self.list_id)
+        if not data:
+            await interaction.response.send_message("This list is already gone.", ephemeral=True)
+            return
+        if not _list_host_allowed(interaction, data):
+            await interaction.response.send_message("Only the list host or founder can close this list.", ephemeral=True)
+            return
+        data["closed"] = True
+        await _update_list_message(self.list_id)
+        await interaction.response.send_message("List closed.", ephemeral=True)
+
+# ---------------------------
 # Slash Commands
 # ---------------------------
+
+@bot.tree.command(name="list", description="Pull queued players into ordered raid groups")
+@sherpa_host_only()
+@app_commands.describe(
+    activity="Choose the activity queue to pull from",
+    how_many_per_group="Total guardians per group, including sherpas",
+    sherpas="How many sherpas you want in each group",
+)
+@app_commands.autocomplete(activity=_activity_autocomplete)
+async def list_cmd(
+    interaction: discord.Interaction,
+    activity: str,
+    how_many_per_group: int,
+    sherpas: int,
+):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("Use this in a server.", ephemeral=True)
+        return
+    try:
+        await load_queues()
+        await load_checked()
+        await load_catty()
+    except Exception:
+        pass
+    act, sug = _resolve_activity(activity, list(ALL_ACTIVITIES) + list(QUEUES.keys()))
+    if not act:
+        hint = (" Try: " + ", ".join(sug)) if sug else ""
+        await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
+        return
+    group_size = int(how_many_per_group or 0)
+    sherpa_count = int(sherpas or 0)
+    if group_size < 1 or group_size > 12:
+        await interaction.followup.send("how_many_per_group must be between 1 and 12.", ephemeral=True)
+        return
+    if sherpa_count < 0 or sherpa_count >= group_size:
+        await interaction.followup.send("sherpas must be 0 or more, and less than how_many_per_group.", ephemeral=True)
+        return
+
+    queued_to_prompt = _queue_members_needing_prompt(act)
+    channel = interaction.channel
+    if not channel or not hasattr(channel, "send"):
+        await interaction.followup.send("I could not post the list in this channel.", ephemeral=True)
+        return
+
+    data: Dict[str, object] = {
+        "guild_id": int(guild.id),
+        "channel_id": int(interaction.channel_id or 0),
+        "message_id": 0,
+        "activity": act,
+        "host_id": int(interaction.user.id),
+        "promoter_id": int(interaction.user.id),
+        "group_size": group_size,
+        "sherpa_count": sherpa_count,
+        "source_order": list(queued_to_prompt),
+        "confirmed": [],
+        "declined": set(),
+        "sherpas": [],
+        "group_index": 0,
+        "completed_groups": set(),
+        "dm_sent": 0,
+        "dm_failed": 0,
+        "closed": False,
+    }
+
+    embed = await _render_list_embed(guild, data)
+    try:
+        msg = await channel.send(embed=embed)  # type: ignore[attr-defined]
+    except Exception as e:
+        await interaction.followup.send(f"Could not post the list: {e.__class__.__name__}", ephemeral=True)
+        return
+
+    data["message_id"] = int(msg.id)
+    data["channel_id"] = int(msg.channel.id)
+    LISTS[int(msg.id)] = data
+    try:
+        await msg.edit(view=ListPublicView(int(msg.id)))
+    except Exception:
+        pass
+
+    sent = 0
+    failed = 0
+    for uid in queued_to_prompt:
+        try:
+            member = guild.get_member(int(uid))
+            if member is None:
+                member = await guild.fetch_member(int(uid))
+            dm = await member.create_dm()
+            await dm.send(
+                (
+                    f"Do you want to run **{act}**?\n"
+                    f"If yes, you'll be added to the list in your current queue order.\n"
+                    f"List post: {getattr(msg, 'jump_url', '')}"
+                ).strip(),
+                view=ListDMConfirmView(int(msg.id), int(uid)),
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+    data["dm_sent"] = sent
+    data["dm_failed"] = failed
+    await _update_list_message(int(msg.id))
+
+    skipped_checked = max(0, len(QUEUES.get(act, []) or []) - len(queued_to_prompt))
+    await interaction.followup.send(
+        (
+            f"List posted for **{act}**. DMed {sent} queued player(s); {failed} DM(s) failed."
+            + (f" Skipped {skipped_checked} already-marked queued player(s)." if skipped_checked else "")
+        ),
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="join", description="Join an activity queue")
 @app_commands.describe(
