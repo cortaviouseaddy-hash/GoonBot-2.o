@@ -2450,6 +2450,7 @@ async def on_message(message: discord.Message):
         if not channel_id:
             return
         if int(channel_id) not in _help_channel_ids():
+            await _bump_active_lists_for_channel(int(channel_id))
             return
 
         pending_activity = _get_help_queue_confirm(int(channel_id), int(message.author.id))
@@ -2457,6 +2458,7 @@ async def on_message(message: discord.Message):
             if _is_affirmative_help_reply(message.content or ""):
                 _clear_help_queue_confirm(int(channel_id), int(message.author.id))
                 await _join_queue_from_help_confirmation(message, pending_activity)
+                await _bump_active_lists_for_channel(int(channel_id))
                 return
             if _is_negative_help_reply(message.content or ""):
                 _clear_help_queue_confirm(int(channel_id), int(message.author.id))
@@ -2464,6 +2466,7 @@ async def on_message(message: discord.Message):
                     f"No problem. If you change your mind, use **/join** for **{pending_activity}**.\n\n{HELP_REMINDER_FOOTER}",
                     mention_author=False,
                 )
+                await _bump_active_lists_for_channel(int(channel_id))
                 return
 
         is_direct_bot_question = False
@@ -2480,6 +2483,7 @@ async def on_message(message: discord.Message):
             await message.reply(reply, mention_author=False)
             if pending_prompt_activity:
                 _set_help_queue_confirm(int(channel_id), int(message.author.id), pending_prompt_activity)
+        await _bump_active_lists_for_channel(int(channel_id))
     except Exception as e:
         try: print("chat help reply failed:", e)
         except Exception: pass
@@ -2684,17 +2688,47 @@ async def _update_list_message(list_id: int) -> None:
         if not ch_id:
             return
         ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
-        msg = await ch.fetch_message(int(list_id))
         guild_id = data.get("guild_id")
         guild = bot.get_guild(int(guild_id)) if guild_id else None
+        active_id = int(data.get("message_id") or list_id)
         embed = await _render_list_embed(guild, data)
         if data.get("closed"):
+            msg = await ch.fetch_message(active_id)
             await msg.edit(embed=embed, view=None)
         else:
-            await msg.edit(embed=embed, view=ListPublicView(int(list_id)))
+            # Discord cannot move a message, so keep active lists at the bottom
+            # by reposting the latest embed and removing the previous active copy.
+            new_msg = await ch.send(embed=embed)
+            new_id = int(new_msg.id)
+            data["message_id"] = new_id
+            data["channel_id"] = int(new_msg.channel.id)
+            LISTS[new_id] = data
+            fresh_embed = await _render_list_embed(guild, data)
+            await new_msg.edit(embed=fresh_embed, view=ListPublicView(new_id))
+            if active_id != new_id:
+                try:
+                    old_msg = await ch.fetch_message(active_id)
+                    await old_msg.delete()
+                except Exception:
+                    pass
     except Exception as e:
         try: print("Failed to update list msg:", e)
         except Exception: pass
+
+async def _bump_active_lists_for_channel(channel_id: int) -> None:
+    seen_data: Set[int] = set()
+    for key, data in list(LISTS.items()):
+        try:
+            if id(data) in seen_data:
+                continue
+            seen_data.add(id(data))
+            if data.get("closed"):
+                continue
+            if int(data.get("channel_id") or 0) != int(channel_id):
+                continue
+            await _update_list_message(int(data.get("message_id") or key))
+        except Exception:
+            continue
 
 async def _list_add_player(list_id: int, uid: int) -> Tuple[bool, str]:
     data = LISTS.get(int(list_id))
@@ -2855,6 +2889,7 @@ class ListPublicView(discord.ui.View):
         msg, next_players = await _list_advance_group(self.list_id)
         if next_players:
             channel_sent, dm_sent = await _list_notify_group(data, next_players)
+            await _update_list_message(self.list_id)
             msg += f" Mentioned next group in channel: {'Yes' if channel_sent else 'No'}; DMed {dm_sent}/{len(next_players)}."
         await interaction.followup.send(msg, ephemeral=True)
 
@@ -2987,7 +3022,7 @@ async def list_cmd(
                 (
                     f"Do you want to run **{act}**?\n"
                     f"If yes, you'll be added to the list in your current queue order.\n"
-                    f"List post: {getattr(msg, 'jump_url', '')}"
+                    "Check the latest list post in the channel for the current group."
                 ).strip(),
                 view=ListDMConfirmView(int(msg.id), int(uid)),
             )
