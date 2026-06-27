@@ -3761,6 +3761,106 @@ async def _list_add_join_reaction(message: Optional[discord.Message]) -> None:
     except Exception:
         pass
 
+async def _list_post_sherpa_and_community_announcements(
+    act: str,
+    when_text: str,
+    ctrl_msg: discord.Message,
+    sherpa_alert_msg: Optional[discord.Message],
+    sherpa_needed: int,
+) -> List[str]:
+    """Sherpa channel + @everyone LFG/general alerts (mirrors /schedule style)."""
+    lines: List[str] = []
+    list_url = ctrl_msg.jump_url
+    sherpa_url = sherpa_alert_msg.jump_url if sherpa_alert_msg else None
+
+    if sherpa_needed > 0 and GENERAL_SHERPA_CHANNEL_ID:
+        try:
+            ping_text = f"<@&{SHERPA_ASSISTANT_ROLE_ID}>" if SHERPA_ASSISTANT_ROLE_ID else None
+            if not ping_text and SHERPA_ROLE_ID:
+                ping_text = f"<@&{SHERPA_ROLE_ID}>"
+            gen_embed = discord.Embed(
+                title=f"Sherpas Needed — /list: {act}",
+                description=(
+                    f"{when_text}\n"
+                    f"We need **{sherpa_needed}** Sherpa(s) per group.\n"
+                    "React ✅ on the **Sherpa signup post** to join the rotation, "
+                    "or 🔁 for **Sherpa Backup**."
+                ),
+                color=_activity_color(act),
+            )
+            if sherpa_url:
+                gen_embed.add_field(name="Sherpa Signup", value=f"[Tap here to claim]({sherpa_url})", inline=False)
+            gen_embed.add_field(name="List", value=f"[Jump to list]({list_url})", inline=False)
+            msg = await _send_to_channel_id(int(GENERAL_SHERPA_CHANNEL_ID), content=ping_text, embed=gen_embed)
+            lines.append(
+                f"Sherpa announcement: {'Yes' if msg else 'Failed'} → <#{int(GENERAL_SHERPA_CHANNEL_ID)}>"
+            )
+        except Exception as e:
+            try:
+                print("List general-sherpa announcement failed:", e)
+            except Exception:
+                pass
+            lines.append("Sherpa announcement: Failed")
+
+    everyone_mentions = discord.AllowedMentions(everyone=True)
+
+    if LFG_CHAT_CHANNEL_ID:
+        try:
+            lfg_lines = [
+                "@everyone",
+                f"📋 **/list** — **{act}** — {when_text}",
+                f"Repeat runs today! React {LIST_JOIN_EMOJI} on the list post to join the line.",
+                f"List: {list_url}",
+            ]
+            if sherpa_needed > 0:
+                lfg_lines.append(f"Sherpas needed: **{sherpa_needed}** per group (✅/🔁 on Sherpa signup).")
+            await _send_to_channel_id(
+                int(LFG_CHAT_CHANNEL_ID),
+                content="\n".join(lfg_lines),
+                allowed_mentions=everyone_mentions,
+            )
+            lines.append(f"LFG @everyone: Yes → <#{int(LFG_CHAT_CHANNEL_ID)}>")
+            if sherpa_needed > 0 and SHERPA_ASSISTANT_ROLE_ID:
+                await _send_to_channel_id(
+                    int(LFG_CHAT_CHANNEL_ID),
+                    content=(
+                        f"<@&{SHERPA_ASSISTANT_ROLE_ID}> — Need **{sherpa_needed}** Sherpa(s) "
+                        f"per group for this /list run."
+                    ),
+                )
+        except Exception as e:
+            try:
+                print("List LFG announcement failed:", e)
+            except Exception:
+                pass
+            lines.append("LFG @everyone: Failed")
+
+    if GENERAL_CHANNEL_ID:
+        try:
+            gen_lines = [
+                "@everyone",
+                f"📋 **/list** marathon — **{act}** at {when_text}",
+                f"Join the line: {list_url}",
+            ]
+            if sherpa_needed > 0:
+                gen_lines.append(
+                    f"Looking for **{sherpa_needed}** Sherpa(s) per group — see Sherpa signup / Sherpa chat."
+                )
+            await _send_to_channel_id(
+                int(GENERAL_CHANNEL_ID),
+                content="\n".join(gen_lines),
+                allowed_mentions=everyone_mentions,
+            )
+            lines.append(f"General @everyone: Yes → <#{int(GENERAL_CHANNEL_ID)}>")
+        except Exception as e:
+            try:
+                print("List general announcement failed:", e)
+            except Exception:
+                pass
+            lines.append("General @everyone: Failed")
+
+    return lines
+
 def _guild_sherpa_member_ids(guild: Optional[discord.Guild]) -> List[int]:
     if not guild:
         return []
@@ -3780,14 +3880,24 @@ def _pick_sherpas_for_batch(guild: Optional[discord.Guild], data: Dict[str, obje
     if count <= 0:
         return []
     pool: List[int] = list(data.get("sherpa_pool") or [])  # type: ignore[arg-type]
+    backup_pool: List[int] = list(data.get("sherpa_backup") or [])  # type: ignore[arg-type]
     idx = int(data.get("sherpa_index", 0) or 0)
+    backup_idx = int(data.get("sherpa_backup_index", 0) or 0)
     picked: List[int] = []
     seen: Set[int] = set()
-    # Prefer registered sherpa pool (round-robin)
     attempts = 0
     while len(picked) < count and pool and attempts < len(pool) * 2:
         uid = int(pool[idx % len(pool)])
         idx += 1
+        attempts += 1
+        if uid in seen:
+            continue
+        seen.add(uid)
+        picked.append(uid)
+    attempts = 0
+    while len(picked) < count and backup_pool and attempts < len(backup_pool) * 2:
+        uid = int(backup_pool[backup_idx % len(backup_pool)])
+        backup_idx += 1
         attempts += 1
         if uid in seen:
             continue
@@ -3803,6 +3913,7 @@ def _pick_sherpas_for_batch(guild: Optional[discord.Guild], data: Dict[str, obje
             if len(picked) >= count:
                 break
     data["sherpa_index"] = idx
+    data["sherpa_backup_index"] = backup_idx
     return picked
 
 async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, object]) -> Tuple[discord.Embed, Optional[discord.File]]:
@@ -5319,7 +5430,9 @@ async def list_cmd(
             "next_index": 0,
             "completed_batches": [],
             "sherpa_pool": sherpa_pool,
+            "sherpa_backup": [],
             "sherpa_index": 0,
+            "sherpa_backup_index": 0,
             "status": "active",
             "batch_number": 0,
             "round_number": 1,
@@ -5361,24 +5474,30 @@ async def list_cmd(
             pass
 
         sherpa_slots = _list_run_sherpa_slots_needed(data, batch_players)
-        if RAID_SIGN_UP_CHANNEL_ID and sherpa_slots > 0 and sherpa_slots_fixed is None:
+        sherpa_alert_msg = None
+        if RAID_SIGN_UP_CHANNEL_ID and sherpa_slots > 0:
             try:
                 sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Signup — /list: {act}",
                     description=(
-                        f"We're running **{act}** back-to-back at {when_text}.\n"
-                        f"React ✅ to join the Sherpa rotation (fills remaining fireteam slots)."
+                        f"We need **{sherpa_slots}** Sherpa(s) per group for **{act}** "
+                        f"(back-to-back list run at {when_text}).\n"
+                        f"React ✅ to join the **Sherpa rotation**.\n"
+                        f"React 🔁 to be **Sherpa Backup**."
                     ),
                     color=_activity_color(act),
                 )
                 sherpa_embed.add_field(name="When", value=when_text, inline=True)
+                sherpa_embed.add_field(name="Sherpas Needed / Group", value=str(sherpa_slots), inline=True)
                 sherpa_embed.add_field(name="List Control", value=f"[Jump to list]({ctrl_msg.jump_url})", inline=False)
                 alert = await _send_to_channel_id(int(RAID_SIGN_UP_CHANNEL_ID), embed=sherpa_embed)
                 if alert:
+                    sherpa_alert_msg = alert
                     data["sherpa_alert_message_id"] = str(alert.id)
                     data["sherpa_alert_channel_id"] = str(alert.channel.id)
                     try:
                         await alert.add_reaction("✅")
+                        await alert.add_reaction("🔁")
                     except Exception:
                         pass
             except Exception as e:
@@ -5386,6 +5505,10 @@ async def list_cmd(
                     print("List sherpa signup post failed:", e)
                 except Exception:
                     pass
+
+        announce_lines = await _list_post_sherpa_and_community_announcements(
+            act, when_text, ctrl_msg, sherpa_alert_msg, sherpa_slots,
+        )
 
         sent = 0
         for uid in queue_members:
@@ -5422,6 +5545,7 @@ async def list_cmd(
             ),
             f"List cap: **{'unlimited' if list_cap is None else list_cap}**.",
         ]
+        status_lines.extend(announce_lines)
         if difficulty and not is_raid_dungeon:
             status_lines.append("Difficulty ignored: only used for raids and dungeons.")
         await interaction.followup.send("\n".join(status_lines), ephemeral=True)
@@ -5631,7 +5755,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                     pass
             return
 
-    # /list Sherpa signup (✅ on sherpa alert — separate from /schedule sherpa posts)
+    # /list Sherpa signup (✅ primary / 🔁 backup on sherpa alert)
     for session_id, data in list(LIST_SESSIONS.items()):
         if str(data.get("type")) != "list_run" or str(data.get("status")) == "done":
             continue
@@ -5641,7 +5765,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             continue
         if alert_ch is not None and payload.channel_id != alert_ch:
             continue
-        if emoji_str != "✅":
+        if emoji_str not in ("✅", "🔁"):
             continue
         guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
         if not guild:
@@ -5650,22 +5774,41 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not member or not (_is_sherpa(member) or _is_sherpa_assistant(member)):
             return
         pool: List[int] = list(data.get("sherpa_pool") or [])  # type: ignore[arg-type]
-        if member.id not in pool:
-            pool.append(int(member.id))
-            data["sherpa_pool"] = pool
-        try:
-            dm = await member.create_dm()
-            activity = str(data.get("activity") or "Activity")
-            when_text = str(data.get("when_text") or "")
-            await dm.send(
-                content=(
-                    f"You're signed up as a Sherpa for the **{activity}** list run"
-                    + (f" at **{when_text}**" if when_text else "")
-                    + ". You'll be rotated in to fill fireteam slots."
+        backup: List[int] = list(data.get("sherpa_backup") or [])  # type: ignore[arg-type]
+        activity = str(data.get("activity") or "Activity")
+        when_text = str(data.get("when_text") or "")
+        if emoji_str == "✅":
+            if int(member.id) not in pool:
+                pool.append(int(member.id))
+                data["sherpa_pool"] = pool
+            backup = [u for u in backup if int(u) != int(member.id)]
+            data["sherpa_backup"] = backup
+            try:
+                dm = await member.create_dm()
+                await dm.send(
+                    content=(
+                        f"You're signed up as a **Sherpa** for the **{activity}** /list run"
+                        + (f" at **{when_text}**" if when_text else "")
+                        + ". You'll be rotated in each group."
+                    )
                 )
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
+        else:
+            if int(member.id) not in pool and int(member.id) not in backup:
+                backup.append(int(member.id))
+                data["sherpa_backup"] = backup
+            try:
+                dm = await member.create_dm()
+                await dm.send(
+                    content=(
+                        f"You're **Sherpa Backup** for the **{activity}** /list run"
+                        + (f" at **{when_text}**" if when_text else "")
+                        + ". We'll pull you in if needed."
+                    )
+                )
+            except Exception:
+                pass
         return
 
     # Sherpa alert claim (✅ or 🔁 on the sherpa signup message in RAID_SIGN_UP_CHANNEL)
