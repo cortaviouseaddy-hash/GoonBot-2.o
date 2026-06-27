@@ -3727,6 +3727,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     group_size = int(data.get("group_size", 1) or 1)
     cap = int(data.get("capacity", 0) or 0)
     batch_no = int(data.get("batch_number", 0) or 0)
+    round_no = int(data.get("round_number", 1) or 1)
     status = str(data.get("status") or "active")
     line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
     next_index = int(data.get("next_index", 0) or 0)
@@ -3751,6 +3752,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     if host_id:
         embed.add_field(name="Hosted by", value=f"<@{int(host_id)}>", inline=True)
     embed.add_field(name="Batches Run", value=str(batch_no), inline=True)
+    embed.add_field(name="Round", value=str(round_no), inline=True)
     embed.add_field(name="In Line", value=str(len(line)), inline=True)
     embed.add_field(name="Waiting", value=str(len(waiting)), inline=True)
 
@@ -3770,7 +3772,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         )
 
     if status == "active":
-        embed.set_footer(text="List command • Next pulls the next group • Done ends this list")
+        embed.set_footer(text="List command • Next pulls the next group (cycles the line) • Done ends this list")
 
     try:
         img_url = data.get("image_url")
@@ -3984,15 +3986,32 @@ class ListControlView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+        if not line:
+            await interaction.followup.send(
+                "No one has joined the line yet. Players tap **Yes** in their DMs first.",
+                ephemeral=True,
+            )
+            return
+
         next_index = int(data.get("next_index", 0) or 0)
         group_size = max(1, int(data.get("group_size", 1) or 1))
         waiting = line[next_index:]
+        wrapped_round = False
         if not waiting:
-            await interaction.followup.send("No one left in line.", ephemeral=True)
-            return
+            # End of line — start another lap so Next can be used over and over
+            data["next_index"] = 0
+            data["round_number"] = int(data.get("round_number", 1) or 1) + 1
+            next_index = 0
+            waiting = line[:]
+            wrapped_round = True
+
         batch_players = waiting[:group_size]
         new_index = next_index + len(batch_players)
-        data["next_index"] = new_index
+        # If this batch finishes the line, next click wraps to round+1
+        if new_index >= len(line):
+            data["next_index"] = len(line)
+        else:
+            data["next_index"] = new_index
         sherpa_count = _list_run_sherpa_slots_needed(data, len(batch_players))
         sherpas = _pick_sherpas_for_batch(guild, data, sherpa_count)
         activity = str(data.get("activity") or "Activity")
@@ -4034,11 +4053,12 @@ class ListControlView(discord.ui.View):
                 pass
 
         await _update_list_control_message(guild, self.session_id)
-        await _repost_list_to_bottom(guild, self.session_id)
+        round_no = int(data.get("round_number", 1) or 1)
+        lap_note = f" (round {round_no})" if wrapped_round else ""
         await interaction.followup.send(
-            f"Pulled group {batch_no}: {len(batch_players)} player(s)"
+            f"Pulled group {batch_no}{lap_note}: {len(batch_players)} player(s)"
             + (f" + {len(sherpas)} Sherpa(s)" if sherpas else "")
-            + ".",
+            + ". Hit **Next** again whenever you're ready for the next group.",
             ephemeral=True,
         )
 
@@ -5181,6 +5201,7 @@ async def list_cmd(
             "sherpa_index": 0,
             "status": "active",
             "batch_number": 0,
+            "round_number": 1,
             "sherpa_alert_message_id": None,
             "sherpa_alert_channel_id": None,
         }
@@ -5453,9 +5474,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # Normalize emoji to string once
     emoji_str = str(payload.emoji)
 
-    # List-run Sherpa signup (✅ on sherpa alert for /list marathon)
+    # /list Sherpa signup (✅ on sherpa alert — separate from /schedule sherpa posts)
     for session_id, data in list(LIST_SESSIONS.items()):
-        if str(data.get("status")) == "done":
+        if str(data.get("type")) != "list_run" or str(data.get("status")) == "done":
             continue
         alert_id = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None
         alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None
