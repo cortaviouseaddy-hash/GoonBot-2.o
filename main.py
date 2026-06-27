@@ -675,6 +675,41 @@ def _is_negative_help_reply(message_text: str) -> bool:
         return True
     return txt.startswith(("no ", "nah ", "nope ", "not now "))
 
+def _user_text_for_help_reply(message: discord.Message) -> Optional[str]:
+    """Return user-typed text worth auto-help, or None to ignore embeds/commands/etc."""
+    try:
+        msg_type = getattr(message, "type", None)
+        allowed_types = {discord.MessageType.default, discord.MessageType.reply}
+        thread_starter = getattr(discord.MessageType, "thread_starter_message", None)
+        if thread_starter is not None:
+            allowed_types.add(thread_starter)
+        if msg_type is not None and msg_type not in allowed_types:
+            return None
+    except Exception:
+        pass
+
+    # Slash/context-menu invocations show up as channel messages with interaction metadata.
+    try:
+        if getattr(message, "interaction", None) is not None:
+            return None
+    except Exception:
+        pass
+
+    content = str(message.content or "").strip()
+    if not content:
+        return None
+
+    # Ignore pasted slash commands like "/join" or "/queue activity: ...".
+    if re.match(r"^/[a-z0-9_-]+(?:\s|$)", content, flags=re.IGNORECASE):
+        return None
+
+    # Ignore link-only posts that mostly exist to unfurl embeds.
+    without_urls = re.sub(r"https?://\S+", "", content).strip()
+    if not without_urls:
+        return None
+
+    return content
+
 async def _reply_queue_confirmation_embed(
     message: discord.Message,
     *,
@@ -2636,19 +2671,24 @@ async def on_message(message: discord.Message):
         if int(channel_id) not in _help_channel_ids():
             return
 
+        user_text = _user_text_for_help_reply(message)
+
         pending_activity = _get_help_queue_confirm(int(channel_id), int(message.author.id))
-        if pending_activity:
-            if _is_affirmative_help_reply(message.content or ""):
+        if pending_activity and user_text:
+            if _is_affirmative_help_reply(user_text):
                 _clear_help_queue_confirm(int(channel_id), int(message.author.id))
                 await _join_queue_from_help_confirmation(message, pending_activity)
                 return
-            if _is_negative_help_reply(message.content or ""):
+            if _is_negative_help_reply(user_text):
                 _clear_help_queue_confirm(int(channel_id), int(message.author.id))
                 await message.reply(
                     f"No problem. If you change your mind, use **/join** for **{pending_activity}**.\n\n{HELP_REMINDER_FOOTER}",
                     mention_author=False,
                 )
                 return
+
+        if not user_text:
+            return
 
         is_direct_bot_question = False
         try:
@@ -2657,7 +2697,7 @@ async def on_message(message: discord.Message):
         except Exception:
             is_direct_bot_question = False
 
-        reply, pending_prompt_activity = _chat_help_reply(message.content or "", direct_bot_question=is_direct_bot_question)
+        reply, pending_prompt_activity = _chat_help_reply(user_text, direct_bot_question=is_direct_bot_question)
         if reply:
             if _help_reply_rate_limited(int(channel_id), int(message.author.id)):
                 return
