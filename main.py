@@ -4001,7 +4001,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         )
 
     if status == "active":
-        embed.set_footer(text=f"React {LIST_JOIN_EMOJI} to join • Only the host can use Next/Done")
+        embed.set_footer(text=f"React {LIST_JOIN_EMOJI} to join • Next = full group • Grab 1 = fill-in • Host only")
 
     try:
         img_url = data.get("image_url")
@@ -4226,6 +4226,13 @@ class ListControlView(discord.ui.View):
         )
         next_btn.callback = self._next_callback  # type: ignore[method-assign]
         self.add_item(next_btn)
+        grab_btn = discord.ui.Button(
+            label="Grab 1",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"list_grab1:{self.session_id}",
+        )
+        grab_btn.callback = self._grab1_callback  # type: ignore[method-assign]
+        self.add_item(grab_btn)
         done_btn = discord.ui.Button(
             label="Done",
             style=discord.ButtonStyle.danger,
@@ -4234,19 +4241,34 @@ class ListControlView(discord.ui.View):
         done_btn.callback = self._done_callback  # type: ignore[method-assign]
         self.add_item(done_btn)
 
-    async def _next_callback(self, interaction: discord.Interaction) -> None:
+    async def _pull_players(
+        self,
+        interaction: discord.Interaction,
+        pull_count: int,
+        *,
+        fill_in: bool = False,
+    ) -> None:
         data = _list_session_data(self.session_id)
         if not data or str(data.get("status")) == "done":
             await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
             return
         if not _is_list_host_only(interaction, data):
-            await interaction.response.send_message("Only the person who started this /list can press **Next**.", ephemeral=True)
+            label = "**Grab 1**" if fill_in else "**Next**"
+            await interaction.response.send_message(
+                f"Only the person who started this /list can press {label}.",
+                ephemeral=True,
+            )
             return
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+        if fill_in and not line:
+            await interaction.followup.send("No one is in the line to grab.", ephemeral=True)
+            return
+
         next_index = int(data.get("next_index", 0) or 0)
         group_size = max(1, min(int(data.get("group_size", 1) or 1), _list_max_group_size(data)))
+        take = 1 if fill_in else group_size
         host_id = int(data.get("host_id") or 0)
         wrapped_round = False
         waiting: List[int] = []
@@ -4258,7 +4280,10 @@ class ListControlView(discord.ui.View):
                 next_index = 0
                 waiting = line[:]
                 wrapped_round = True
-            batch_players = waiting[:group_size]
+            batch_players = waiting[:take]
+            if fill_in and not batch_players:
+                await interaction.followup.send("No one left in the line to grab.", ephemeral=True)
+                return
             new_index = next_index + len(batch_players)
             if new_index >= len(line):
                 data["next_index"] = len(line)
@@ -4267,25 +4292,34 @@ class ListControlView(discord.ui.View):
         else:
             batch_players = []
 
-        sherpa_count = _list_run_sherpa_slots_needed(data, len(batch_players))
-        sherpas = _pick_sherpas_for_batch(guild, data, sherpa_count)
+        sherpa_count = 0 if fill_in else _list_run_sherpa_slots_needed(data, len(batch_players))
+        sherpas = _pick_sherpas_for_batch(guild, data, sherpa_count) if sherpa_count > 0 else []
         activity = str(data.get("activity") or "Activity")
-        batch_no = int(data.get("batch_number", 0) or 0) + 1
-        data["batch_number"] = batch_no
+        batch_no = int(data.get("batch_number", 0) or 0)
+        if not fill_in:
+            batch_no += 1
+            data["batch_number"] = batch_no
         completed_batches: List[List[int]] = list(data.get("completed_batches") or [])  # type: ignore[arg-type]
         completed_batches.append(list(batch_players))
         data["completed_batches"] = completed_batches
 
-        host_text = f"<@{host_id}>" if host_id else "_None_"
-        sherpa_text = ", ".join(f"<@{uid}>" for uid in sherpas) if sherpas else "_None_"
-        player_text = ", ".join(f"<@{uid}>" for uid in batch_players) if batch_players else "_None_"
         channel_id = int(data.get("channel_id") or interaction.channel_id)
-        turn_msg = (
-            f"**Group {batch_no} — your turn for {activity}!**\n"
-            f"Host: {host_text}\n"
-            f"Players: {player_text}\n"
-            f"Sherpas: {sherpa_text}"
-        )
+        player_text = ", ".join(f"<@{uid}>" for uid in batch_players) if batch_players else "_None_"
+        if fill_in and batch_players:
+            turn_msg = (
+                f"**Fill-in for {activity}** — someone backed out, next up:\n"
+                f"{player_text}"
+            )
+        else:
+            host_text = f"<@{host_id}>" if host_id else "_None_"
+            sherpa_text = ", ".join(f"<@{uid}>" for uid in sherpas) if sherpas else "_None_"
+            player_text = ", ".join(f"<@{uid}>" for uid in batch_players) if batch_players else "_None_"
+            turn_msg = (
+                f"**Group {batch_no} — your turn for {activity}!**\n"
+                f"Host: {host_text}\n"
+                f"Players: {player_text}\n"
+                f"Sherpas: {sherpa_text}"
+            )
         await _send_to_channel_id(
             channel_id,
             content=turn_msg,
@@ -4299,13 +4333,19 @@ class ListControlView(discord.ui.View):
                 if not member:
                     continue
                 dm = await member.create_dm()
-                await dm.send(
-                    content=(
+                if fill_in:
+                    dm_body = (
+                        f"You're the **fill-in** for **{activity}**"
+                        + (f" at **{when_text}**" if when_text else "")
+                        + " — someone backed out and you're up next!\nHead to the event channel!"
+                    )
+                else:
+                    dm_body = (
                         f"It's your turn for **{activity}**"
                         + (f" at **{when_text}**" if when_text else "")
                         + f" (Group {batch_no}).\nHead to the event channel!"
                     )
-                )
+                await dm.send(content=dm_body)
             except Exception:
                 pass
 
@@ -4313,14 +4353,26 @@ class ListControlView(discord.ui.View):
         await _schedule_list_repost_to_bottom(int(channel_id))
         round_no = int(data.get("round_number", 1) or 1)
         lap_note = f" (round {round_no})" if wrapped_round else ""
-        await interaction.followup.send(
-            f"Pulled group {batch_no}{lap_note}: host"
-            + (f" + {len(batch_players)} player(s)" if batch_players else "")
-            + (f" + {len(sherpas)} Sherpa(s)" if sherpas else "")
-            + f" = {1 + len(batch_players) + len(sherpas)}/{int(data.get('capacity', 0))} fireteam."
-            + " Hit **Next** again whenever you're ready.",
-            ephemeral=True,
-        )
+        if fill_in:
+            await interaction.followup.send(
+                f"Grabbed {player_text}{lap_note} as fill-in.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"Pulled group {batch_no}{lap_note}: host"
+                + (f" + {len(batch_players)} player(s)" if batch_players else "")
+                + (f" + {len(sherpas)} Sherpa(s)" if sherpas else "")
+                + f" = {1 + len(batch_players) + len(sherpas)}/{int(data.get('capacity', 0))} fireteam."
+                + " Hit **Next** again whenever you're ready.",
+                ephemeral=True,
+            )
+
+    async def _next_callback(self, interaction: discord.Interaction) -> None:
+        await self._pull_players(interaction, 0, fill_in=False)
+
+    async def _grab1_callback(self, interaction: discord.Interaction) -> None:
+        await self._pull_players(interaction, 1, fill_in=True)
 
     async def _done_callback(self, interaction: discord.Interaction) -> None:
         data = _list_session_data(self.session_id)
