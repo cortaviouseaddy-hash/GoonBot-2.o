@@ -1,4 +1,5 @@
 # GoonBot main.py — queues, check-in, promotions, scheduling
+# Deploy: main @ 0da7981+ (/list command live)
 # Exact behavior:
 # - /list is a separate command from /schedule: its own sessions (LIST_SESSIONS), DMs, embed, and Next/Done controls
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
