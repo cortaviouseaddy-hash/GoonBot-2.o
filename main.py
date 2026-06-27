@@ -2337,6 +2337,54 @@ def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dic
         pass
     return False
 
+# Discord embed field values are capped at 1024 characters.
+EMBED_FIELD_CHAR_LIMIT = 1024
+
+def _chunk_lines_for_embed_fields(
+    lines: List[str],
+    *,
+    max_chars: int = 1000,
+    suffix: str = "",
+) -> List[str]:
+    """Split lines into chunks that fit in a single embed field value."""
+    if not lines:
+        return []
+    reserve = len(suffix) if suffix else 0
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + (1 if current else 0)
+        if current and (current_len + line_len + reserve) > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+def _add_embed_field_chunks(
+    embed: discord.Embed,
+    name: str,
+    lines: List[str],
+    *,
+    inline: bool = False,
+    suffix: str = "",
+) -> None:
+    """Add one or more embed fields for a long list of lines."""
+    if not lines:
+        return
+    chunks = _chunk_lines_for_embed_fields(lines, suffix=suffix)
+    for idx, chunk in enumerate(chunks):
+        field_name = name if len(chunks) == 1 else f"{name} ({idx + 1}/{len(chunks)})"
+        value = chunk + (suffix if idx == len(chunks) - 1 else "")
+        if len(value) > EMBED_FIELD_CHAR_LIMIT:
+            value = value[: EMBED_FIELD_CHAR_LIMIT - 3] + "..."
+        embed.add_field(name=field_name, value=value, inline=inline)
+
 # ---------------------------
 # Embeds
 # ---------------------------
@@ -2395,23 +2443,47 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
 
     if not is_user_event:
         if sherpas:
-            embed.add_field(name="Sherpas", value=", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10]), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                "Sherpas",
+                [f"<@{int(x)}>" for x in list(sherpas)],
+            )
         if s_backups:
-            embed.add_field(name=f"Sherpa Backups ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in list(s_backups)[:10]), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Sherpa Backups ({len(s_backups)})",
+                [f"<@{int(x)}>" for x in list(s_backups)],
+            )
 
     if players:
         if is_user_event:
-            lines = [f"{i+1}. <@{uid}>" for i, uid in enumerate(players)]
-            embed.add_field(name=f"Participants ({len(players)}/{cap})", value="\n".join(lines), inline=False)
+            player_lines = [f"{i + 1}. <@{uid}>" for i, uid in enumerate(players)]
+            _add_embed_field_chunks(
+                embed,
+                f"Participants ({len(players)}/{cap})",
+                player_lines,
+            )
         else:
             # Show only the number of listed Players here to avoid confusion.
             # Overall occupancy (Players + Sherpas + Host-if-not-listed) is shown in the Capacity field above.
-            embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Players ({len(players)})",
+                [f"<@{p}>" for p in players],
+            )
     if backups:
         if is_user_event:
-            embed.add_field(name=f"Backup ({len(backups)})", value="\n".join(f"– <@{b}>" for b in backups), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Backup ({len(backups)})",
+                [f"– <@{b}>" for b in backups],
+            )
         else:
-            embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(f"<@{b}>" for b in backups), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Backups ({len(backups)})",
+                [f"<@{b}>" for b in backups],
+            )
 
     if is_user_event and desc:
         embed.add_field(name="Notes", value=desc, inline=False)
@@ -2474,10 +2546,14 @@ async def _render_sherpa_only_embed(guild: Optional[discord.Guild], activity: st
     # Participants and backup lists
     if sherpas:
         names = [f"<@{int(x)}>" + (" (Host)" if int(x) == int(host_id or 0) else "") for x in sherpas]
-        embed.add_field(name=f"Participants ({len(sherpas)}/{cap})", value="\n".join(names), inline=False)
+        _add_embed_field_chunks(embed, f"Participants ({len(sherpas)}/{cap})", names)
     s_backups: List[int] = list(data.get("sherpa_backup") or [])  # type: ignore
     if s_backups:
-        embed.add_field(name=f"Backup ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in s_backups), inline=False)
+        _add_embed_field_chunks(
+            embed,
+            f"Backup ({len(s_backups)})",
+            [f"<@{int(x)}>" for x in s_backups],
+        )
 
     # Preserve previously uploaded image if known (ignore attachment:// placeholders)
     try:
@@ -2730,8 +2806,12 @@ async def _post_activity_board(activity: str, fallback_channel_id: Optional[int]
         # Annotate queue symbols for schedule/check state and catty/weapon requests.
         note = "\n\n✅ = scheduled participant\n⭐ = needs catty/weapon run"
         lines = [f"<@{uid}>{' ✅' if uid in checked else ''}{' ⭐' if uid in catty else ''}" for uid in q]
-        value = "\n".join(lines) + (note if any(uid in checked or uid in catty for uid in q) else "")
-        embed.add_field(name="Players (in order)", value=value, inline=False)
+        _add_embed_field_chunks(
+            embed,
+            "Players (in order)",
+            lines,
+            suffix=(note if any(uid in checked or uid in catty for uid in q) else ""),
+        )
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
     embed, attachment = _apply_activity_image(embed, activity)
@@ -4050,6 +4130,97 @@ async def _list_post_sherpa_and_community_announcements(
 
     return lines
 
+async def _list_resolve_control_jump_url(data: Dict[str, object]) -> Optional[str]:
+    channel_id = int(data.get("channel_id") or 0)
+    mid = _list_control_message_id(data)
+    if not channel_id or not mid:
+        return None
+    try:
+        ch = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        if not ch:
+            return None
+        msg = await ch.fetch_message(int(mid))
+        return str(msg.jump_url)
+    except Exception:
+        return None
+
+async def _list_send_hourly_everyone_reminder(data: Dict[str, object]) -> None:
+    """Ping @everyone hourly in LFG/general while a /list session is still active."""
+    list_url = await _list_resolve_control_jump_url(data)
+    if not list_url:
+        return
+
+    act = str(data.get("activity") or "Activity")
+    when_text = str(data.get("when_text") or "")
+    batch_players = int(data.get("group_size", 1) or 1)
+    sherpa_needed = _list_run_sherpa_slots_needed(data, batch_players)
+    everyone_mentions = discord.AllowedMentions(everyone=True)
+    when_suffix = f" — {when_text}" if when_text else ""
+
+    if LFG_CHAT_CHANNEL_ID:
+        try:
+            lfg_lines = [
+                "@everyone",
+                f"📋 **/list still running — {act}**{when_suffix}",
+                f"Still signing up! React {LIST_JOIN_EMOJI} on the list post to join the line.",
+                f"List: {list_url}",
+            ]
+            if sherpa_needed > 0:
+                lfg_lines.append(f"Sherpas needed: **{sherpa_needed}** per group (✅/🔁 on Sherpa signup).")
+            await _send_to_channel_id(
+                int(LFG_CHAT_CHANNEL_ID),
+                content="\n".join(lfg_lines),
+                allowed_mentions=everyone_mentions,
+            )
+        except Exception as e:
+            try:
+                print("List hourly LFG reminder failed:", e)
+            except Exception:
+                pass
+
+    if GENERAL_CHANNEL_ID:
+        try:
+            gen_lines = [
+                "@everyone",
+                f"📋 **/list marathon still going — {act}**{when_suffix}",
+                f"Join the line: {list_url}",
+            ]
+            if sherpa_needed > 0:
+                gen_lines.append(
+                    f"Looking for **{sherpa_needed}** Sherpa(s) per group — see Sherpa signup / Sherpa chat."
+                )
+            await _send_to_channel_id(
+                int(GENERAL_CHANNEL_ID),
+                content="\n".join(gen_lines),
+                allowed_mentions=everyone_mentions,
+            )
+        except Exception as e:
+            try:
+                print("List hourly general reminder failed:", e)
+            except Exception:
+                pass
+
+async def _process_list_hourly_everyone_reminders(now: int) -> None:
+    """Send hourly @everyone signup reminders for active /list sessions."""
+    changed = False
+    for _session_id, data in list(LIST_SESSIONS.items()):
+        if str(data.get("type")) != "list_run" or str(data.get("status")) == "done":
+            continue
+        started = int(data.get("list_started_ts", 0) or 0)
+        if not started:
+            data["list_started_ts"] = now
+            data["last_everyone_ping_ts"] = now
+            changed = True
+            continue
+        last_ping = int(data.get("last_everyone_ping_ts", 0) or 0) or started
+        if (now - last_ping) < 3600:
+            continue
+        await _list_send_hourly_everyone_reminder(data)
+        data["last_everyone_ping_ts"] = now
+        changed = True
+    if changed:
+        await persist_list_sessions()
+
 def _guild_sherpa_member_ids(guild: Optional[discord.Guild]) -> List[int]:
     if not guild:
         return []
@@ -4165,18 +4336,22 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     embed.add_field(name="In Line", value=str(len(line)), inline=True)
     embed.add_field(name="Waiting", value=str(len(waiting)), inline=True)
 
-    if waiting:
+    if line:
         q_order = {int(u): i for i, u in enumerate(QUEUES.get(activity, []) or [])}
         lines = []
-        for i, uid in enumerate(waiting[:20]):
-            pos = next_index + i + 1
-            tag = " 🎫" if int(uid) in q_order else ""
+        for i, uid in enumerate(line):
+            pos = i + 1
+            tags: List[str] = []
+            if i < next_index:
+                tags.append("done")
+            if int(uid) in q_order:
+                tags.append("🎫")
+            tag = f" ({', '.join(tags)})" if tags else ""
             lines.append(f"{pos}. <@{uid}>{tag}")
-        extra = f"\n…and {len(waiting) - 20} more" if len(waiting) > 20 else ""
-        note = "\n🎫 = on activity queue (priority)"
-        embed.add_field(name="Up Next", value="\n".join(lines) + extra + note, inline=False)
+        note = "\n🎫 = on activity queue (priority) • done = already pulled for a group"
+        _add_embed_field_chunks(embed, f"Everyone in Line ({len(line)})", lines, suffix=note)
     elif status != "done":
-        embed.add_field(name="Up Next", value="_No one left in line._", inline=False)
+        embed.add_field(name="Everyone in Line", value="_No one in line yet._", inline=False)
 
     if completed_batches:
         last = completed_batches[-1]
@@ -5009,6 +5184,8 @@ async def _scheduler_loop():
                         await _send_reminders(data, label)
                         data[key] = True
 
+            await _process_list_hourly_everyone_reminders(now)
+
         except Exception as e:
             print("scheduler error:", e)
         finally:
@@ -5776,6 +5953,8 @@ async def list_cmd(
             "status": "active",
             "batch_number": 0,
             "round_number": 1,
+            "list_started_ts": int(datetime.utcnow().timestamp()),
+            "last_everyone_ping_ts": int(datetime.utcnow().timestamp()),
             "sherpa_alert_message_id": None,
             "sherpa_alert_channel_id": None,
         }
