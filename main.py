@@ -143,6 +143,8 @@ LIST_SESSIONS: Dict[str, Dict[str, object]] = {}
 LIST_RUNS_BY_CHANNEL: Dict[int, str] = {}
 LIST_RUNS_MSG_TO_SESSION: Dict[int, str] = {}
 LIST_REPOST_DEBOUNCE: Dict[int, float] = {}
+LIST_REPOST_TASKS: Dict[int, asyncio.Task] = {}
+LIST_REPOST_IN_PROGRESS: Set[int] = set()
 QUEUES: Dict[str, List[int]] = {}
 CHECKED: Dict[str, Set[int]] = {}
 # activity -> users who requested catty/weapon run while queued
@@ -2476,14 +2478,15 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_message(message: discord.Message):
     try:
+        channel_id = getattr(message.channel, "id", None)
+        if channel_id and int(channel_id) not in LIST_REPOST_IN_PROGRESS:
+            if _list_should_bump_embed(int(channel_id), message):
+                await _schedule_list_repost_to_bottom(int(channel_id))
+
         if message.author.bot:
             return
-        channel_id = getattr(message.channel, "id", None)
         if not channel_id:
             return
-
-        if EVENT_SIGNUP_CHANNEL_ID and int(channel_id) == int(EVENT_SIGNUP_CHANNEL_ID):
-            await _maybe_repost_list_control(int(channel_id))
 
         if int(channel_id) not in _help_channel_ids():
             return
@@ -4059,63 +4062,103 @@ async def _repost_list_to_bottom(guild: Optional[discord.Guild], session_id: str
     if not data or not guild or str(data.get("status")) == "done":
         return None
     channel_id = int(data.get("channel_id") or 0)
-    old_mid = _list_control_message_id(data)
     if not channel_id:
         return None
-    channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
-    if not channel:
-        return None
-    embed, f = await _render_list_embed(guild, data)
-    view = ListControlView(session_id=str(session_id))
-    if old_mid:
-        try:
-            old_msg = await channel.fetch_message(int(old_mid))
+    LIST_REPOST_IN_PROGRESS.add(channel_id)
+    try:
+        old_mid = _list_control_message_id(data)
+        channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
+        if not channel:
+            return None
+        embed, f = await _render_list_embed(guild, data)
+        view = ListControlView(session_id=str(session_id))
+        if old_mid:
             try:
-                await old_msg.delete()
+                old_msg = await channel.fetch_message(int(old_mid))
+                try:
+                    await old_msg.delete()
+                except Exception:
+                    pass
             except Exception:
                 pass
+            LIST_RUNS_MSG_TO_SESSION.pop(int(old_mid), None)
+        try:
+            if f:
+                new_msg = await channel.send(embed=embed, file=f, view=view)
+            else:
+                new_msg = await channel.send(embed=embed, view=view)
+        except Exception:
+            return None
+        await _list_add_join_reaction(new_msg)
+        new_mid = int(new_msg.id)
+        data["control_message_id"] = new_mid
+        LIST_RUNS_MSG_TO_SESSION[new_mid] = str(session_id)
+        _register_list_views(str(session_id))
+        try:
+            if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
+                url = str(new_msg.embeds[0].image.url)
+                if not url.startswith("attachment://"):
+                    data["image_url"] = url
+                    embed_cdn, _ = await _render_list_embed(guild, data)
+                    await new_msg.edit(embed=embed_cdn, view=view, attachments=[])
         except Exception:
             pass
-        LIST_RUNS_MSG_TO_SESSION.pop(int(old_mid), None)
-    try:
-        if f:
-            new_msg = await channel.send(embed=embed, file=f, view=view)
-        else:
-            new_msg = await channel.send(embed=embed, view=view)
-    except Exception:
-        return None
-    await _list_add_join_reaction(new_msg)
-    new_mid = int(new_msg.id)
-    data["control_message_id"] = new_mid
-    LIST_RUNS_MSG_TO_SESSION[new_mid] = str(session_id)
-    _register_list_views(str(session_id))
-    try:
-        if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
-            url = str(new_msg.embeds[0].image.url)
-            if not url.startswith("attachment://"):
-                data["image_url"] = url
-                embed_cdn, _ = await _render_list_embed(guild, data)
-                await new_msg.edit(embed=embed_cdn, view=view, attachments=[])
-    except Exception:
-        pass
-    return new_mid
+        return new_mid
+    finally:
+        LIST_REPOST_IN_PROGRESS.discard(channel_id)
 
-async def _maybe_repost_list_control(channel_id: int) -> None:
+def _list_should_bump_embed(channel_id: int, message: discord.Message) -> bool:
+    """Return True if a new message should push the list control embed back to the bottom."""
+    if LIST_REPOST_IN_PROGRESS and int(channel_id) in LIST_REPOST_IN_PROGRESS:
+        return False
     session_id = LIST_RUNS_BY_CHANNEL.get(int(channel_id))
     if not session_id:
-        return
+        return False
     data = _list_session_data(session_id)
     if not data or str(data.get("status")) == "done":
-        return
-    now = float(datetime.utcnow().timestamp())
-    last = float(LIST_REPOST_DEBOUNCE.get(int(channel_id), 0) or 0)
-    if (now - last) < 3.0:
-        return
-    LIST_REPOST_DEBOUNCE[int(channel_id)] = now
-    guild_id = data.get("guild_id")
-    guild = bot.get_guild(int(guild_id)) if guild_id else None  # type: ignore[arg-type]
-    if guild:
-        await _repost_list_to_bottom(guild, str(session_id))
+        return False
+    control_mid = _list_control_message_id(data)
+    if control_mid and int(message.id) == int(control_mid):
+        return False
+    return True
+
+async def _schedule_list_repost_to_bottom(channel_id: int, delay: float = 0.75) -> None:
+    """Debounce reposts so rapid chat still ends with the list embed on bottom."""
+    existing = LIST_REPOST_TASKS.get(int(channel_id))
+    if existing and not existing.done():
+        existing.cancel()
+        try:
+            await existing
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _job() -> None:
+        try:
+            await asyncio.sleep(delay)
+            session_id = LIST_RUNS_BY_CHANNEL.get(int(channel_id))
+            if not session_id:
+                return
+            data = _list_session_data(session_id)
+            if not data or str(data.get("status")) == "done":
+                return
+            guild_id = data.get("guild_id")
+            guild = bot.get_guild(int(guild_id)) if guild_id else None  # type: ignore[arg-type]
+            if guild:
+                await _repost_list_to_bottom(guild, str(session_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            try:
+                print("list repost task error:", channel_id, e)
+            except Exception:
+                pass
+        finally:
+            LIST_REPOST_TASKS.pop(int(channel_id), None)
+
+    LIST_REPOST_TASKS[int(channel_id)] = asyncio.create_task(_job())
+
+async def _maybe_repost_list_control(channel_id: int) -> None:
+    await _schedule_list_repost_to_bottom(int(channel_id))
 
 class ListConfirmView(discord.ui.View):
     def __init__(self, session_id: str, uid: int):
@@ -4267,6 +4310,7 @@ class ListControlView(discord.ui.View):
                 pass
 
         await _update_list_control_message(guild, self.session_id)
+        await _schedule_list_repost_to_bottom(int(channel_id))
         round_no = int(data.get("round_number", 1) or 1)
         lap_note = f" (round {round_no})" if wrapped_round else ""
         await interaction.followup.send(
