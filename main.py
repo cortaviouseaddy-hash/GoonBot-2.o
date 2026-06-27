@@ -1,5 +1,5 @@
 # GoonBot main.py — queues, check-in, promotions, scheduling
-# Deploy: main @ 59e37bf+ (/list command live)
+# Deploy: main @ 5650227+ (/list sessions persisted; Next/Done survive restarts)
 # Exact behavior:
 # - /list is a separate command from /schedule: its own sessions (LIST_SESSIONS), DMs, embed, and Next/Done controls
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
@@ -7549,5 +7549,26 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 # ---------------------------
 
 if __name__ == "__main__":
+    # Render Web Services require a bound PORT; workers ignore PORT.
+    port = os.getenv("PORT")
+    if port:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _RenderHealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                pass
+
+        def _serve() -> None:
+            HTTPServer(("0.0.0.0", int(port)), _RenderHealthHandler).serve_forever()
+
+        threading.Thread(target=_serve, daemon=True, name="render-health").start()
+
     token = get_token("DISCORD_TOKEN")
     bot.run(token)
