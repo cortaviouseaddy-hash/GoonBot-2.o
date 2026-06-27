@@ -2337,6 +2337,54 @@ def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dic
         pass
     return False
 
+# Discord embed field values are capped at 1024 characters.
+EMBED_FIELD_CHAR_LIMIT = 1024
+
+def _chunk_lines_for_embed_fields(
+    lines: List[str],
+    *,
+    max_chars: int = 1000,
+    suffix: str = "",
+) -> List[str]:
+    """Split lines into chunks that fit in a single embed field value."""
+    if not lines:
+        return []
+    reserve = len(suffix) if suffix else 0
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + (1 if current else 0)
+        if current and (current_len + line_len + reserve) > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+def _add_embed_field_chunks(
+    embed: discord.Embed,
+    name: str,
+    lines: List[str],
+    *,
+    inline: bool = False,
+    suffix: str = "",
+) -> None:
+    """Add one or more embed fields for a long list of lines."""
+    if not lines:
+        return
+    chunks = _chunk_lines_for_embed_fields(lines, suffix=suffix)
+    for idx, chunk in enumerate(chunks):
+        field_name = name if len(chunks) == 1 else f"{name} ({idx + 1}/{len(chunks)})"
+        value = chunk + (suffix if idx == len(chunks) - 1 else "")
+        if len(value) > EMBED_FIELD_CHAR_LIMIT:
+            value = value[: EMBED_FIELD_CHAR_LIMIT - 3] + "..."
+        embed.add_field(name=field_name, value=value, inline=inline)
+
 # ---------------------------
 # Embeds
 # ---------------------------
@@ -2395,23 +2443,47 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
 
     if not is_user_event:
         if sherpas:
-            embed.add_field(name="Sherpas", value=", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10]), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                "Sherpas",
+                [f"<@{int(x)}>" for x in list(sherpas)],
+            )
         if s_backups:
-            embed.add_field(name=f"Sherpa Backups ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in list(s_backups)[:10]), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Sherpa Backups ({len(s_backups)})",
+                [f"<@{int(x)}>" for x in list(s_backups)],
+            )
 
     if players:
         if is_user_event:
-            lines = [f"{i+1}. <@{uid}>" for i, uid in enumerate(players)]
-            embed.add_field(name=f"Participants ({len(players)}/{cap})", value="\n".join(lines), inline=False)
+            player_lines = [f"{i + 1}. <@{uid}>" for i, uid in enumerate(players)]
+            _add_embed_field_chunks(
+                embed,
+                f"Participants ({len(players)}/{cap})",
+                player_lines,
+            )
         else:
             # Show only the number of listed Players here to avoid confusion.
             # Overall occupancy (Players + Sherpas + Host-if-not-listed) is shown in the Capacity field above.
-            embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Players ({len(players)})",
+                [f"<@{p}>" for p in players],
+            )
     if backups:
         if is_user_event:
-            embed.add_field(name=f"Backup ({len(backups)})", value="\n".join(f"– <@{b}>" for b in backups), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Backup ({len(backups)})",
+                [f"– <@{b}>" for b in backups],
+            )
         else:
-            embed.add_field(name=f"Backups ({len(backups)})", value="\n".join(f"<@{b}>" for b in backups), inline=False)
+            _add_embed_field_chunks(
+                embed,
+                f"Backups ({len(backups)})",
+                [f"<@{b}>" for b in backups],
+            )
 
     if is_user_event and desc:
         embed.add_field(name="Notes", value=desc, inline=False)
@@ -2474,10 +2546,14 @@ async def _render_sherpa_only_embed(guild: Optional[discord.Guild], activity: st
     # Participants and backup lists
     if sherpas:
         names = [f"<@{int(x)}>" + (" (Host)" if int(x) == int(host_id or 0) else "") for x in sherpas]
-        embed.add_field(name=f"Participants ({len(sherpas)}/{cap})", value="\n".join(names), inline=False)
+        _add_embed_field_chunks(embed, f"Participants ({len(sherpas)}/{cap})", names)
     s_backups: List[int] = list(data.get("sherpa_backup") or [])  # type: ignore
     if s_backups:
-        embed.add_field(name=f"Backup ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in s_backups), inline=False)
+        _add_embed_field_chunks(
+            embed,
+            f"Backup ({len(s_backups)})",
+            [f"<@{int(x)}>" for x in s_backups],
+        )
 
     # Preserve previously uploaded image if known (ignore attachment:// placeholders)
     try:
@@ -2730,8 +2806,12 @@ async def _post_activity_board(activity: str, fallback_channel_id: Optional[int]
         # Annotate queue symbols for schedule/check state and catty/weapon requests.
         note = "\n\n✅ = scheduled participant\n⭐ = needs catty/weapon run"
         lines = [f"<@{uid}>{' ✅' if uid in checked else ''}{' ⭐' if uid in catty else ''}" for uid in q]
-        value = "\n".join(lines) + (note if any(uid in checked or uid in catty for uid in q) else "")
-        embed.add_field(name="Players (in order)", value=value, inline=False)
+        _add_embed_field_chunks(
+            embed,
+            "Players (in order)",
+            lines,
+            suffix=(note if any(uid in checked or uid in catty for uid in q) else ""),
+        )
     else:
         embed.description = "No sign-ups yet. Use `/join` to get started."
     embed, attachment = _apply_activity_image(embed, activity)
@@ -4165,18 +4245,22 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     embed.add_field(name="In Line", value=str(len(line)), inline=True)
     embed.add_field(name="Waiting", value=str(len(waiting)), inline=True)
 
-    if waiting:
+    if line:
         q_order = {int(u): i for i, u in enumerate(QUEUES.get(activity, []) or [])}
         lines = []
-        for i, uid in enumerate(waiting[:20]):
-            pos = next_index + i + 1
-            tag = " 🎫" if int(uid) in q_order else ""
+        for i, uid in enumerate(line):
+            pos = i + 1
+            tags: List[str] = []
+            if i < next_index:
+                tags.append("done")
+            if int(uid) in q_order:
+                tags.append("🎫")
+            tag = f" ({', '.join(tags)})" if tags else ""
             lines.append(f"{pos}. <@{uid}>{tag}")
-        extra = f"\n…and {len(waiting) - 20} more" if len(waiting) > 20 else ""
-        note = "\n🎫 = on activity queue (priority)"
-        embed.add_field(name="Up Next", value="\n".join(lines) + extra + note, inline=False)
+        note = "\n🎫 = on activity queue (priority) • done = already pulled for a group"
+        _add_embed_field_chunks(embed, f"Everyone in Line ({len(line)})", lines, suffix=note)
     elif status != "done":
-        embed.add_field(name="Up Next", value="_No one left in line._", inline=False)
+        embed.add_field(name="Everyone in Line", value="_No one in line yet._", inline=False)
 
     if completed_batches:
         last = completed_batches[-1]
