@@ -3673,9 +3673,64 @@ def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
 # /list command — helpers & views (standalone; does not use SCHEDULES or ConfirmView)
 # ---------------------------
 
+LIST_JOIN_EMOJI = "✅"
+
 def _list_run_sherpa_slots_needed(data: Dict[str, object], player_count: int) -> int:
+    """Sherpa slots per group. Host always reserves 1 fireteam slot."""
     cap = int(data.get("capacity", 0) or 0)
-    return max(0, cap - int(player_count))
+    host_slots = 1 if data.get("host_in_fireteam", True) else 0
+    players = int(player_count)
+    room = max(0, cap - host_slots - players)
+    explicit = data.get("num_sherpas")
+    if explicit is not None:
+        return max(0, min(int(explicit), room))
+    return room
+
+def _list_max_group_size(data: Dict[str, object]) -> int:
+    """Max players pulled from the line per Next (host slot is separate)."""
+    cap = int(data.get("capacity", 0) or 0)
+    host_slots = 1 if data.get("host_in_fireteam", True) else 0
+    explicit = data.get("num_sherpas")
+    if explicit is not None:
+        return max(1, cap - host_slots - max(0, int(explicit)))
+    return max(1, cap - host_slots)
+
+async def _list_try_add_to_line(
+    guild: Optional[discord.Guild],
+    session_id: str,
+    uid: int,
+) -> Tuple[bool, str]:
+    data = _list_session_data(session_id)
+    if not data or str(data.get("status")) == "done":
+        return False, "This list is no longer active."
+    line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+    if int(uid) in line:
+        return False, "You're already in line."
+    max_size = data.get("max_list_size")
+    if max_size is not None:
+        try:
+            limit = int(max_size)
+            if limit > 0 and len(line) >= limit:
+                return False, f"The list is full ({limit} max)."
+        except Exception:
+            pass
+    declined: Set[int] = set(int(x) for x in (data.get("declined") or set()))  # type: ignore[arg-type]
+    if int(uid) in declined:
+        declined.discard(int(uid))
+        data["declined"] = declined
+    line.append(int(uid))
+    data["line"] = line
+    if guild:
+        await _update_list_control_message(guild, session_id)
+    return True, "You're in line! We'll DM you when it's your turn."
+
+async def _list_add_join_reaction(message: Optional[discord.Message]) -> None:
+    if not message:
+        return
+    try:
+        await message.add_reaction(LIST_JOIN_EMOJI)
+    except Exception:
+        pass
 
 def _guild_sherpa_member_ids(guild: Optional[discord.Guild]) -> List[int]:
     if not guild:
@@ -3735,13 +3790,23 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     completed_batches: List[List[int]] = list(data.get("completed_batches") or [])  # type: ignore[arg-type]
     host_id = data.get("host_id") or data.get("promoter_id")
 
+    max_list_size = data.get("max_list_size")
+    num_sherpas = data.get("num_sherpas")
+    host_in = bool(data.get("host_in_fireteam", True))
+
     title = f"📋 List — {activity}"
     if status == "done":
         desc = "This **/list** session is **finished**. Thanks everyone!"
     else:
+        sherpa_note = (
+            f"**{int(num_sherpas)}** Sherpa(s) per group"
+            if num_sherpas is not None
+            else "remaining slots filled with **Sherpas**"
+        )
         desc = (
             f"**/list** session for **{activity}** — running it back-to-back.\n"
-            f"Players go in groups of **{group_size}**; remaining fireteam slots are filled with **Sherpas**."
+            f"React {LIST_JOIN_EMOJI} on this post (or tap **Yes** in DMs) to join the line.\n"
+            f"Each group: **host** + **{group_size}** player(s) + {sherpa_note} (fireteam **{cap}**)."
         )
     embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
     embed.add_field(name="When", value=when, inline=False)
@@ -3749,6 +3814,20 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         embed.add_field(name="Difficulty", value=str(data.get("difficulty")), inline=True)
     embed.add_field(name="Group Size", value=str(group_size), inline=True)
     embed.add_field(name="Fireteam Size", value=str(cap), inline=True)
+    if host_in:
+        embed.add_field(name="Host Slot", value="Yes (1 per group)", inline=True)
+    if num_sherpas is not None:
+        embed.add_field(name="Sherpas / Group", value=str(int(num_sherpas)), inline=True)
+    else:
+        embed.add_field(name="Sherpas / Group", value="Auto-fill", inline=True)
+    if max_list_size is not None:
+        try:
+            lim = int(max_list_size)
+            embed.add_field(name="List Cap", value=str(lim) if lim > 0 else "Unlimited", inline=True)
+        except Exception:
+            embed.add_field(name="List Cap", value="Unlimited", inline=True)
+    else:
+        embed.add_field(name="List Cap", value="Unlimited", inline=True)
     if host_id:
         embed.add_field(name="Hosted by", value=f"<@{int(host_id)}>", inline=True)
     embed.add_field(name="Batches Run", value=str(batch_no), inline=True)
@@ -3772,7 +3851,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         )
 
     if status == "active":
-        embed.set_footer(text="List command • Next pulls the next group (cycles the line) • Done ends this list")
+        embed.set_footer(text=f"React {LIST_JOIN_EMOJI} to join • Next pulls the next group • Done ends this list")
 
     try:
         img_url = data.get("image_url")
@@ -3858,6 +3937,7 @@ async def _repost_list_to_bottom(guild: Optional[discord.Guild], session_id: str
             new_msg = await channel.send(embed=embed, view=view)
     except Exception:
         return None
+    await _list_add_join_reaction(new_msg)
     new_mid = int(new_msg.id)
     data["control_message_id"] = new_mid
     LIST_RUNS_MSG_TO_SESSION[new_mid] = str(session_id)
@@ -3918,20 +3998,9 @@ class ListConfirmView(discord.ui.View):
         if not data or str(data.get("status")) == "done":
             await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
             return
-        line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
-        declined: Set[int] = set(int(x) for x in (data.get("declined") or set()))  # type: ignore[arg-type]
-        if self.uid in line:
-            await interaction.response.send_message("You're already in line!", ephemeral=True)
-            return
-        if self.uid in declined:
-            declined.discard(self.uid)
-            data["declined"] = declined
-        line.append(self.uid)
-        data["line"] = line
-        await interaction.response.send_message("You're in line! We'll DM you when it's your turn.", ephemeral=True)
         guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore[arg-type]
-        if guild:
-            await _update_list_control_message(guild, self.session_id)
+        ok, msg = await _list_try_add_to_line(guild, self.session_id, self.uid)
+        await interaction.response.send_message(msg, ephemeral=True)
 
     async def _no_callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.uid:
@@ -3986,32 +4055,28 @@ class ListControlView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
-        if not line:
-            await interaction.followup.send(
-                "No one has joined the line yet. Players tap **Yes** in their DMs first.",
-                ephemeral=True,
-            )
-            return
-
         next_index = int(data.get("next_index", 0) or 0)
-        group_size = max(1, int(data.get("group_size", 1) or 1))
-        waiting = line[next_index:]
+        group_size = max(1, min(int(data.get("group_size", 1) or 1), _list_max_group_size(data)))
+        host_id = int(data.get("host_id") or 0)
         wrapped_round = False
-        if not waiting:
-            # End of line — start another lap so Next can be used over and over
-            data["next_index"] = 0
-            data["round_number"] = int(data.get("round_number", 1) or 1) + 1
-            next_index = 0
-            waiting = line[:]
-            wrapped_round = True
-
-        batch_players = waiting[:group_size]
-        new_index = next_index + len(batch_players)
-        # If this batch finishes the line, next click wraps to round+1
-        if new_index >= len(line):
-            data["next_index"] = len(line)
+        waiting: List[int] = []
+        if line:
+            waiting = line[next_index:]
+            if not waiting:
+                data["next_index"] = 0
+                data["round_number"] = int(data.get("round_number", 1) or 1) + 1
+                next_index = 0
+                waiting = line[:]
+                wrapped_round = True
+            batch_players = waiting[:group_size]
+            new_index = next_index + len(batch_players)
+            if new_index >= len(line):
+                data["next_index"] = len(line)
+            else:
+                data["next_index"] = new_index
         else:
-            data["next_index"] = new_index
+            batch_players = []
+
         sherpa_count = _list_run_sherpa_slots_needed(data, len(batch_players))
         sherpas = _pick_sherpas_for_batch(guild, data, sherpa_count)
         activity = str(data.get("activity") or "Activity")
@@ -4021,11 +4086,13 @@ class ListControlView(discord.ui.View):
         completed_batches.append(list(batch_players))
         data["completed_batches"] = completed_batches
 
-        sherpa_text = ", ".join(f"<@{uid}>" for uid in sherpas) if sherpas else "_None needed_"
-        player_text = ", ".join(f"<@{uid}>" for uid in batch_players)
+        host_text = f"<@{host_id}>" if host_id else "_None_"
+        sherpa_text = ", ".join(f"<@{uid}>" for uid in sherpas) if sherpas else "_None_"
+        player_text = ", ".join(f"<@{uid}>" for uid in batch_players) if batch_players else "_None_"
         channel_id = int(data.get("channel_id") or interaction.channel_id)
         turn_msg = (
             f"**Group {batch_no} — your turn for {activity}!**\n"
+            f"Host: {host_text}\n"
             f"Players: {player_text}\n"
             f"Sherpas: {sherpa_text}"
         )
@@ -4056,9 +4123,11 @@ class ListControlView(discord.ui.View):
         round_no = int(data.get("round_number", 1) or 1)
         lap_note = f" (round {round_no})" if wrapped_round else ""
         await interaction.followup.send(
-            f"Pulled group {batch_no}{lap_note}: {len(batch_players)} player(s)"
+            f"Pulled group {batch_no}{lap_note}: host"
+            + (f" + {len(batch_players)} player(s)" if batch_players else "")
             + (f" + {len(sherpas)} Sherpa(s)" if sherpas else "")
-            + ". Hit **Next** again whenever you're ready for the next group.",
+            + f" = {1 + len(batch_players) + len(sherpas)}/{int(data.get('capacity', 0))} fireteam."
+            + " Hit **Next** again whenever you're ready.",
             ephemeral=True,
         )
 
@@ -5075,7 +5144,9 @@ async def schedule_cmd(
     activity="Activity name",
     datetime_str="Date and time (MM-DD HH:MM, 24h)",
     timezone="Timezone (dropdown)",
-    group_size="Players per group (e.g. 3 pulls 3 at a time)",
+    group_size="Players pulled from the line per group (host uses 1 slot)",
+    num_sherpas="Sherpas per group (leave empty to auto-fill remaining fireteam slots)",
+    max_list_size="Max people allowed in the line (leave empty for unlimited)",
     difficulty="Difficulty (raids/dungeons only)",
     sherpas="User(s) to pre-slot as Sherpa helpers (optional)",
 )
@@ -5102,6 +5173,8 @@ async def list_cmd(
     datetime_str: str,
     timezone: str = "America/New_York",
     group_size: int = 3,
+    num_sherpas: Optional[int] = None,
+    max_list_size: Optional[int] = None,
     difficulty: Optional[str] = None,
     sherpas: Optional[str] = None,
 ):
@@ -5121,7 +5194,22 @@ async def list_cmd(
         selected_difficulty = difficulty if is_raid_dungeon else None
         channel_id = int(EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id)
         cap = _cap_for_activity(act)
-        batch_players = max(1, min(int(group_size or 1), cap))
+        host_slots = 1
+        sherpa_slots_fixed: Optional[int] = None
+        if num_sherpas is not None:
+            sherpa_slots_fixed = max(0, min(int(num_sherpas), max(0, cap - host_slots - 1)))
+        max_group = max(1, cap - host_slots - (sherpa_slots_fixed if sherpa_slots_fixed is not None else 0))
+        if sherpa_slots_fixed is None:
+            max_group = max(1, cap - host_slots)
+        batch_players = max(1, min(int(group_size or 1), max_group))
+        list_cap: Optional[int] = None
+        if max_list_size is not None:
+            try:
+                parsed_cap = int(max_list_size)
+                if parsed_cap > 0:
+                    list_cap = parsed_cap
+            except Exception:
+                list_cap = None
 
         try:
             await load_queues()
@@ -5129,12 +5217,6 @@ async def list_cmd(
             pass
 
         queue_members = [int(uid) for uid in (QUEUES.get(act, []) or [])]
-        if not queue_members:
-            await interaction.followup.send(
-                f"No one is on the queue for **{act}**. Use /join first.",
-                ephemeral=True,
-            )
-            return
 
         try:
             date_part, time_part = datetime_str.strip().split()
@@ -5191,6 +5273,9 @@ async def list_cmd(
             "difficulty": selected_difficulty,
             "capacity": cap,
             "group_size": batch_players,
+            "num_sherpas": sherpa_slots_fixed,
+            "max_list_size": list_cap,
+            "host_in_fireteam": True,
             "channel_id": channel_id,
             "host_id": host_id,
             "line": [],
@@ -5227,6 +5312,7 @@ async def list_cmd(
         data["control_message_id"] = mid
         LIST_RUNS_MSG_TO_SESSION[mid] = session_id
         _register_list_views(session_id)
+        await _list_add_join_reaction(ctrl_msg)
 
         try:
             if ctrl_msg.embeds and ctrl_msg.embeds[0].image and ctrl_msg.embeds[0].image.url:
@@ -5239,7 +5325,7 @@ async def list_cmd(
             pass
 
         sherpa_slots = _list_run_sherpa_slots_needed(data, batch_players)
-        if RAID_SIGN_UP_CHANNEL_ID and sherpa_slots > 0:
+        if RAID_SIGN_UP_CHANNEL_ID and sherpa_slots > 0 and sherpa_slots_fixed is None:
             try:
                 sherpa_embed = discord.Embed(
                     title=f"🧭 Sherpa Signup — /list: {act}",
@@ -5287,9 +5373,18 @@ async def list_cmd(
 
         status_lines = [
             f"**/list** started for **{act}**" + (f" ({selected_difficulty})" if selected_difficulty else "") + ".",
-            f"DMed **{sent}** queued player(s) to join the line.",
+            f"DMed **{sent}** queued player(s). Anyone can also react {LIST_JOIN_EMOJI} on the list post to join.",
             f"List embed posted in <#{channel_id}> (stays at the bottom until **Done**).",
-            f"Group size: **{batch_players}** | Fireteam: **{cap}** | Sherpas per group: **{sherpa_slots}**.",
+            (
+                f"Per group: **1 host** + **{batch_players}** player(s)"
+                + (
+                    f" + **{sherpa_slots_fixed}** Sherpa(s)"
+                    if sherpa_slots_fixed is not None
+                    else f" + **{sherpa_slots}** Sherpa(s) auto-fill"
+                )
+                + f" = **{cap}** fireteam."
+            ),
+            f"List cap: **{'unlimited' if list_cap is None else list_cap}**.",
         ]
         if difficulty and not is_raid_dungeon:
             status_lines.append("Difficulty ignored: only used for raids and dungeons.")
@@ -5473,6 +5568,32 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
     # Normalize emoji to string once
     emoji_str = str(payload.emoji)
+
+    # /list — anyone reacts ✅ on the control embed to join the line
+    session_id = LIST_RUNS_MSG_TO_SESSION.get(int(payload.message_id))
+    if session_id and emoji_str == LIST_JOIN_EMOJI:
+        data = _list_session_data(str(session_id))
+        if data and str(data.get("type")) == "list_run" and str(data.get("status")) != "done":
+            guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+            if not guild:
+                return
+            member = guild.get_member(payload.user_id)
+            if not member:
+                return
+            ok, msg = await _list_try_add_to_line(guild, str(session_id), int(member.id))
+            if not ok:
+                try:
+                    dm = await member.create_dm()
+                    await dm.send(content=f"Could not join the **/list** line: {msg}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    dm = await member.create_dm()
+                    await dm.send(content=msg)
+                except Exception:
+                    pass
+            return
 
     # /list Sherpa signup (✅ on sherpa alert — separate from /schedule sherpa posts)
     for session_id, data in list(LIST_SESSIONS.items()):
