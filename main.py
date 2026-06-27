@@ -4130,6 +4130,97 @@ async def _list_post_sherpa_and_community_announcements(
 
     return lines
 
+async def _list_resolve_control_jump_url(data: Dict[str, object]) -> Optional[str]:
+    channel_id = int(data.get("channel_id") or 0)
+    mid = _list_control_message_id(data)
+    if not channel_id or not mid:
+        return None
+    try:
+        ch = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        if not ch:
+            return None
+        msg = await ch.fetch_message(int(mid))
+        return str(msg.jump_url)
+    except Exception:
+        return None
+
+async def _list_send_hourly_everyone_reminder(data: Dict[str, object]) -> None:
+    """Ping @everyone hourly in LFG/general while a /list session is still active."""
+    list_url = await _list_resolve_control_jump_url(data)
+    if not list_url:
+        return
+
+    act = str(data.get("activity") or "Activity")
+    when_text = str(data.get("when_text") or "")
+    batch_players = int(data.get("group_size", 1) or 1)
+    sherpa_needed = _list_run_sherpa_slots_needed(data, batch_players)
+    everyone_mentions = discord.AllowedMentions(everyone=True)
+    when_suffix = f" — {when_text}" if when_text else ""
+
+    if LFG_CHAT_CHANNEL_ID:
+        try:
+            lfg_lines = [
+                "@everyone",
+                f"📋 **/list still running — {act}**{when_suffix}",
+                f"Still signing up! React {LIST_JOIN_EMOJI} on the list post to join the line.",
+                f"List: {list_url}",
+            ]
+            if sherpa_needed > 0:
+                lfg_lines.append(f"Sherpas needed: **{sherpa_needed}** per group (✅/🔁 on Sherpa signup).")
+            await _send_to_channel_id(
+                int(LFG_CHAT_CHANNEL_ID),
+                content="\n".join(lfg_lines),
+                allowed_mentions=everyone_mentions,
+            )
+        except Exception as e:
+            try:
+                print("List hourly LFG reminder failed:", e)
+            except Exception:
+                pass
+
+    if GENERAL_CHANNEL_ID:
+        try:
+            gen_lines = [
+                "@everyone",
+                f"📋 **/list marathon still going — {act}**{when_suffix}",
+                f"Join the line: {list_url}",
+            ]
+            if sherpa_needed > 0:
+                gen_lines.append(
+                    f"Looking for **{sherpa_needed}** Sherpa(s) per group — see Sherpa signup / Sherpa chat."
+                )
+            await _send_to_channel_id(
+                int(GENERAL_CHANNEL_ID),
+                content="\n".join(gen_lines),
+                allowed_mentions=everyone_mentions,
+            )
+        except Exception as e:
+            try:
+                print("List hourly general reminder failed:", e)
+            except Exception:
+                pass
+
+async def _process_list_hourly_everyone_reminders(now: int) -> None:
+    """Send hourly @everyone signup reminders for active /list sessions."""
+    changed = False
+    for _session_id, data in list(LIST_SESSIONS.items()):
+        if str(data.get("type")) != "list_run" or str(data.get("status")) == "done":
+            continue
+        started = int(data.get("list_started_ts", 0) or 0)
+        if not started:
+            data["list_started_ts"] = now
+            data["last_everyone_ping_ts"] = now
+            changed = True
+            continue
+        last_ping = int(data.get("last_everyone_ping_ts", 0) or 0) or started
+        if (now - last_ping) < 3600:
+            continue
+        await _list_send_hourly_everyone_reminder(data)
+        data["last_everyone_ping_ts"] = now
+        changed = True
+    if changed:
+        await persist_list_sessions()
+
 def _guild_sherpa_member_ids(guild: Optional[discord.Guild]) -> List[int]:
     if not guild:
         return []
@@ -5093,6 +5184,8 @@ async def _scheduler_loop():
                         await _send_reminders(data, label)
                         data[key] = True
 
+            await _process_list_hourly_everyone_reminders(now)
+
         except Exception as e:
             print("scheduler error:", e)
         finally:
@@ -5860,6 +5953,8 @@ async def list_cmd(
             "status": "active",
             "batch_number": 0,
             "round_number": 1,
+            "list_started_ts": int(datetime.utcnow().timestamp()),
+            "last_everyone_ping_ts": int(datetime.utcnow().timestamp()),
             "sherpa_alert_message_id": None,
             "sherpa_alert_channel_id": None,
         }
