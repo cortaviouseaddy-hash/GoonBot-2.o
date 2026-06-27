@@ -1,5 +1,6 @@
 # GoonBot main.py — queues, check-in, promotions, scheduling
 # Exact behavior:
+# - /list is a separate command from /schedule: its own sessions (LIST_SESSIONS), DMs, embed, and Next/Done controls
 # - Main Event Embed -> EVENT_SIGNUP_CHANNEL_ID (aka RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID)
 # - Sherpa Signup Embed -> RAID_SIGN_UP_CHANNEL_ID (✅ to claim Sherpa; overflow -> Sherpa Backup)
 # - Sherpa Announcement -> GENERAL_SHERPA_CHANNEL_ID (pings SHERPA_ROLE_ID if set; points to Sherpa signup post)
@@ -137,7 +138,7 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 # ---------------------------
 
 SCHEDULES: Dict[int, Dict[str, object]] = {}
-# Active /list marathon sessions keyed by stable session id
+# Active /list sessions (separate from SCHEDULES — not events, not schedule DMs)
 LIST_SESSIONS: Dict[str, Dict[str, object]] = {}
 LIST_RUNS_BY_CHANNEL: Dict[int, str] = {}
 LIST_RUNS_MSG_TO_SESSION: Dict[int, str] = {}
@@ -2172,6 +2173,18 @@ def founder_only():
         raise app_commands.CheckFailure("You are not authorized to use this command.")
     return app_commands.check(predicate)
 
+def _is_list_host_or_founder(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
+    """Permission check for /list controls only (not shared with /schedule)."""
+    try:
+        uid = int(interaction.user.id)
+        if FOUNDER_USER_ID and uid == int(FOUNDER_USER_ID):
+            return True
+        if data and data.get("type") == "list_run" and data.get("host_id") and int(data["host_id"]) == uid:  # type: ignore[arg-type]
+            return True
+    except Exception:
+        pass
+    return False
+
 def _is_promoter_or_founder(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
     try:
         uid = int(interaction.user.id)
@@ -2416,7 +2429,8 @@ async def on_member_join(member: discord.Member):
                     value=(
                         "• /join — choose an activity to enter its queue (max 2)\n"
                         "• /queue — view current queues or a specific activity\n"
-                        "• /schedule — founder-only: creates the event post and prioritizes queued players"
+                        "• /schedule — founder-only: creates a one-time scheduled event from the queue\n"
+                        "• /list — founder-only: repeat runs with a line, Next/Done groups, and Sherpa fill"
                     ),
                     inline=False,
                 )
@@ -2448,7 +2462,8 @@ async def on_member_join(member: discord.Member):
                 "Commands:\n"
                 "• /join — choose an activity to enter its queue (max 2)\n"
                 "• /queue — view current queues or a specific activity\n"
-                "• /schedule — founder-only: creates an event post and prioritizes queued players\n\n"
+                "• /schedule — founder-only: creates a one-time scheduled event from the queue\n"
+                "• /list — founder-only: repeat runs with a line, Next/Done groups, and Sherpa fill\n\n"
                 "What to look for:\n"
                 "• Event posts: 📝 adds you as backup; ✅ tries to join when signups open; ❌ leaves\n"
                 "• DMs for confirmations and reminders (2h/30m/start); you can reply here with questions"
@@ -3655,7 +3670,7 @@ def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
     return unique_ids
 
 # ---------------------------
-# List Run (/list marathon) helpers & views
+# /list command — helpers & views (standalone; does not use SCHEDULES or ConfirmView)
 # ---------------------------
 
 def _list_run_sherpa_slots_needed(data: Dict[str, object], player_count: int) -> int:
@@ -3717,14 +3732,14 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     next_index = int(data.get("next_index", 0) or 0)
     waiting = line[next_index:]
     completed_batches: List[List[int]] = list(data.get("completed_batches") or [])  # type: ignore[arg-type]
-    promoter_id = data.get("promoter_id")
+    host_id = data.get("host_id") or data.get("promoter_id")
 
-    title = f"📋 List Run — {activity}"
+    title = f"📋 List — {activity}"
     if status == "done":
-        desc = "This list run is **finished**. Thanks everyone!"
+        desc = "This **/list** session is **finished**. Thanks everyone!"
     else:
         desc = (
-            f"We're running **{activity}** back-to-back today.\n"
+            f"**/list** session for **{activity}** — running it back-to-back.\n"
             f"Players go in groups of **{group_size}**; remaining fireteam slots are filled with **Sherpas**."
         )
     embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
@@ -3733,8 +3748,8 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         embed.add_field(name="Difficulty", value=str(data.get("difficulty")), inline=True)
     embed.add_field(name="Group Size", value=str(group_size), inline=True)
     embed.add_field(name="Fireteam Size", value=str(cap), inline=True)
-    if promoter_id:
-        embed.add_field(name="Hosted by", value=f"<@{int(promoter_id)}>", inline=True)
+    if host_id:
+        embed.add_field(name="Hosted by", value=f"<@{int(host_id)}>", inline=True)
     embed.add_field(name="Batches Run", value=str(batch_no), inline=True)
     embed.add_field(name="In Line", value=str(len(line)), inline=True)
     embed.add_field(name="Waiting", value=str(len(waiting)), inline=True)
@@ -3755,7 +3770,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         )
 
     if status == "active":
-        embed.set_footer(text="Use Next to pull the next group • Done ends this list run")
+        embed.set_footer(text="List command • Next pulls the next group • Done ends this list")
 
     try:
         img_url = data.get("image_url")
@@ -3963,8 +3978,8 @@ class ListControlView(discord.ui.View):
         if not data or str(data.get("status")) == "done":
             await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
             return
-        if not _is_promoter_or_founder(interaction, data):
-            await interaction.response.send_message("Only the host or a founder can advance the list.", ephemeral=True)
+        if not _is_list_host_or_founder(interaction, data):
+            await interaction.response.send_message("Only the list host or a founder can advance the list.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
@@ -4018,13 +4033,6 @@ class ListControlView(discord.ui.View):
             except Exception:
                 pass
 
-        try:
-            act = str(data.get("activity") or "")
-            if act:
-                await _mark_queue_participants_checked(act, batch_players)
-        except Exception:
-            pass
-
         await _update_list_control_message(guild, self.session_id)
         await _repost_list_to_bottom(guild, self.session_id)
         await interaction.followup.send(
@@ -4039,8 +4047,8 @@ class ListControlView(discord.ui.View):
         if not data:
             await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
             return
-        if not _is_promoter_or_founder(interaction, data):
-            await interaction.response.send_message("Only the host or a founder can end the list.", ephemeral=True)
+        if not _is_list_host_or_founder(interaction, data):
+            await interaction.response.send_message("Only the list host or a founder can end the list.", ephemeral=True)
             return
         data["status"] = "done"
         channel_id = int(data.get("channel_id") or 0)
@@ -5035,12 +5043,12 @@ async def schedule_cmd(
                 pass
 
 # ---------------------------
-# /list — marathon list run (batch queue with Next/Done controls)
+# /list — standalone repeat-run command (not /schedule)
 # ---------------------------
 
 @bot.tree.command(
     name="list",
-    description="(Founder) Start a back-to-back list run: DM queue, line up players, pull groups with Next/Done",
+    description="(Founder) Run an activity on repeat: DM the queue, line people up, pull groups with Next/Done",
 )
 @founder_only()
 @app_commands.describe(
@@ -5151,8 +5159,9 @@ async def list_cmd(
                         pass
 
         session_id = uuid.uuid4().hex[:12]
-        promoter_id = interaction.user.id
+        host_id = interaction.user.id
         data: Dict[str, object] = {
+            "type": "list_run",
             "session_id": session_id,
             "guild_id": guild.id if guild else None,
             "activity": act,
@@ -5163,7 +5172,7 @@ async def list_cmd(
             "capacity": cap,
             "group_size": batch_players,
             "channel_id": channel_id,
-            "promoter_id": promoter_id,
+            "host_id": host_id,
             "line": [],
             "declined": set(),
             "next_index": 0,
@@ -5212,7 +5221,7 @@ async def list_cmd(
         if RAID_SIGN_UP_CHANNEL_ID and sherpa_slots > 0:
             try:
                 sherpa_embed = discord.Embed(
-                    title=f"🧭 Sherpa Signup — List Run: {act}",
+                    title=f"🧭 Sherpa Signup — /list: {act}",
                     description=(
                         f"We're running **{act}** back-to-back at {when_text}.\n"
                         f"React ✅ to join the Sherpa rotation (fills remaining fireteam slots)."
@@ -5256,9 +5265,9 @@ async def list_cmd(
                 print("List DM failed:", e)
 
         status_lines = [
-            f"Started list run for **{act}**" + (f" ({selected_difficulty})" if selected_difficulty else "") + ".",
-            f"DMed **{sent}** queued player(s).",
-            f"Control embed posted in <#{channel_id}> (stays at the bottom until **Done**).",
+            f"**/list** started for **{act}**" + (f" ({selected_difficulty})" if selected_difficulty else "") + ".",
+            f"DMed **{sent}** queued player(s) to join the line.",
+            f"List embed posted in <#{channel_id}> (stays at the bottom until **Done**).",
             f"Group size: **{batch_players}** | Fireteam: **{cap}** | Sherpas per group: **{sherpa_slots}**.",
         ]
         if difficulty and not is_raid_dungeon:
