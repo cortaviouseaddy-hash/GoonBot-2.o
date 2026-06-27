@@ -3673,7 +3673,7 @@ def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
 # /list command — helpers & views (standalone; does not use SCHEDULES or ConfirmView)
 # ---------------------------
 
-LIST_JOIN_EMOJI = "✅"
+LIST_JOIN_EMOJI = "📋"
 
 def _list_run_sherpa_slots_needed(data: Dict[str, object], player_count: int) -> int:
     """Sherpa slots per group. Host always reserves 1 fireteam slot."""
@@ -3695,6 +3695,22 @@ def _list_max_group_size(data: Dict[str, object]) -> int:
         return max(1, cap - host_slots - max(0, int(explicit)))
     return max(1, cap - host_slots)
 
+def _list_rebuild_waiting_with_priority(
+    pulled: List[int],
+    waiting: List[int],
+    activity: str,
+) -> List[int]:
+    """Queue members in waiting sort ahead of react/open joiners."""
+    q = [int(u) for u in (QUEUES.get(activity, []) or [])]
+    queue_positions = {u: i for i, u in enumerate(q)}
+    queue_waiting = [int(u) for u in waiting if int(u) in queue_positions]
+    open_waiting = [int(u) for u in waiting if int(u) not in queue_positions]
+    queue_waiting.sort(key=lambda u: queue_positions[int(u)])
+    # Preserve join order among open (react) joiners
+    open_order = {int(u): i for i, u in enumerate(waiting) if int(u) not in queue_positions}
+    open_waiting.sort(key=lambda u: open_order.get(int(u), 0))
+    return list(pulled) + queue_waiting + open_waiting
+
 async def _list_try_add_to_line(
     guild: Optional[discord.Guild],
     session_id: str,
@@ -3704,7 +3720,8 @@ async def _list_try_add_to_line(
     if not data or str(data.get("status")) == "done":
         return False, "This list is no longer active."
     line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
-    if int(uid) in line:
+    uid = int(uid)
+    if uid in line:
         return False, "You're already in line."
     max_size = data.get("max_list_size")
     if max_size is not None:
@@ -3715,14 +3732,28 @@ async def _list_try_add_to_line(
         except Exception:
             pass
     declined: Set[int] = set(int(x) for x in (data.get("declined") or set()))  # type: ignore[arg-type]
-    if int(uid) in declined:
-        declined.discard(int(uid))
+    if uid in declined:
+        declined.discard(uid)
         data["declined"] = declined
-    line.append(int(uid))
-    data["line"] = line
+
+    activity = str(data.get("activity") or "")
+    try:
+        await load_queues()
+    except Exception:
+        pass
+
+    next_index = int(data.get("next_index", 0) or 0)
+    pulled = line[:next_index]
+    waiting = list(line[next_index:])
+    waiting.append(uid)
+    data["line"] = _list_rebuild_waiting_with_priority(pulled, waiting, activity)
+
+    on_queue = uid in {int(u) for u in (QUEUES.get(activity, []) or [])}
     if guild:
         await _update_list_control_message(guild, session_id)
-    return True, "You're in line! We'll DM you when it's your turn."
+    if on_queue:
+        return True, "You're in line with **queue priority**! We'll DM you when it's your turn."
+    return True, "You're in line! Queue members are ahead of react joiners — we'll DM you when it's your turn."
 
 async def _list_add_join_reaction(message: Optional[discord.Message]) -> None:
     if not message:
@@ -3806,6 +3837,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         desc = (
             f"**/list** session for **{activity}** — running it back-to-back.\n"
             f"React {LIST_JOIN_EMOJI} on this post (or tap **Yes** in DMs) to join the line.\n"
+            f"**Queue members get priority** over {LIST_JOIN_EMOJI} joiners.\n"
             f"Each group: **host** + **{group_size}** player(s) + {sherpa_note} (fireteam **{cap}**)."
         )
     embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
@@ -3836,9 +3868,15 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
     embed.add_field(name="Waiting", value=str(len(waiting)), inline=True)
 
     if waiting:
-        lines = [f"{next_index + i + 1}. <@{uid}>" for i, uid in enumerate(waiting[:20])]
+        q_order = {int(u): i for i, u in enumerate(QUEUES.get(activity, []) or [])}
+        lines = []
+        for i, uid in enumerate(waiting[:20]):
+            pos = next_index + i + 1
+            tag = " 🎫" if int(uid) in q_order else ""
+            lines.append(f"{pos}. <@{uid}>{tag}")
         extra = f"\n…and {len(waiting) - 20} more" if len(waiting) > 20 else ""
-        embed.add_field(name="Up Next", value="\n".join(lines) + extra, inline=False)
+        note = "\n🎫 = on activity queue (priority)"
+        embed.add_field(name="Up Next", value="\n".join(lines) + extra + note, inline=False)
     elif status != "done":
         embed.add_field(name="Up Next", value="_No one left in line._", inline=False)
 
