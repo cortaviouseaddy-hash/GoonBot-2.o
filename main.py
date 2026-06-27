@@ -12,6 +12,7 @@ import os
 import asyncio
 import json
 import re
+import uuid
 from datetime import datetime, timedelta
 import datetime as datetime_module
 from typing import Dict, List, Optional, Set, Tuple
@@ -136,6 +137,11 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 # ---------------------------
 
 SCHEDULES: Dict[int, Dict[str, object]] = {}
+# Active /list marathon sessions keyed by stable session id
+LIST_SESSIONS: Dict[str, Dict[str, object]] = {}
+LIST_RUNS_BY_CHANNEL: Dict[int, str] = {}
+LIST_RUNS_MSG_TO_SESSION: Dict[int, str] = {}
+LIST_REPOST_DEBOUNCE: Dict[int, float] = {}
 QUEUES: Dict[str, List[int]] = {}
 CHECKED: Dict[str, Set[int]] = {}
 # activity -> users who requested catty/weapon run while queued
@@ -404,6 +410,7 @@ async def _send_to_channel_id(
     embed: Optional[discord.Embed] = None,
     file: Optional[discord.File] = None,
     allowed_mentions: Optional[discord.AllowedMentions] = None,
+    view: Optional[discord.ui.View] = None,
 ):
     try:
         if not channel_id:
@@ -411,11 +418,16 @@ async def _send_to_channel_id(
         ch = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
         if not ch:
             return None
+        kwargs: Dict[str, object] = {}
+        if allowed_mentions is not None:
+            kwargs["allowed_mentions"] = allowed_mentions
+        if view is not None:
+            kwargs["view"] = view
         if file and embed:
-            return await ch.send(content=content, embed=embed, file=file, allowed_mentions=allowed_mentions)
+            return await ch.send(content=content, embed=embed, file=file, **kwargs)  # type: ignore[arg-type]
         if embed:
-            return await ch.send(content=content, embed=embed, allowed_mentions=allowed_mentions)
-        return await ch.send(content=content, allowed_mentions=allowed_mentions)
+            return await ch.send(content=content, embed=embed, **kwargs)  # type: ignore[arg-type]
+        return await ch.send(content=content, **kwargs)  # type: ignore[arg-type]
     except Exception as e:
         try: print("_send_to_channel_id error:", channel_id, e)
         except Exception: pass
@@ -2362,6 +2374,18 @@ async def on_ready():
         bot._sched_task = bot.loop.create_task(_scheduler_loop())  # type: ignore[attr-defined]
     if not getattr(bot, "_autosave_task", None):
         bot._autosave_task = bot.loop.create_task(_autosave_loop())  # type: ignore[attr-defined]
+    if not getattr(bot, "_list_views_registered", False):
+        try:
+            for session_id, data in list(LIST_SESSIONS.items()):
+                if str(data.get("status")) == "done":
+                    continue
+                _register_list_views(str(session_id), list(data.get("line") or []))  # type: ignore[arg-type]
+            bot._list_views_registered = True  # type: ignore[attr-defined]
+        except Exception as e:
+            try:
+                print("List view registration failed:", e)
+            except Exception:
+                pass
     print(f"Ready as {bot.user}")
 
 # ---------------------------
@@ -2444,6 +2468,10 @@ async def on_message(message: discord.Message):
         channel_id = getattr(message.channel, "id", None)
         if not channel_id:
             return
+
+        if EVENT_SIGNUP_CHANNEL_ID and int(channel_id) == int(EVENT_SIGNUP_CHANNEL_ID):
+            await _maybe_repost_list_control(int(channel_id))
+
         if int(channel_id) not in _help_channel_ids():
             return
 
@@ -3627,6 +3655,405 @@ def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
     return unique_ids
 
 # ---------------------------
+# List Run (/list marathon) helpers & views
+# ---------------------------
+
+def _list_run_sherpa_slots_needed(data: Dict[str, object], player_count: int) -> int:
+    cap = int(data.get("capacity", 0) or 0)
+    return max(0, cap - int(player_count))
+
+def _guild_sherpa_member_ids(guild: Optional[discord.Guild]) -> List[int]:
+    if not guild:
+        return []
+    out: List[int] = []
+    seen: Set[int] = set()
+    for member in guild.members:
+        try:
+            if _is_sherpa(member) or _is_sherpa_assistant(member):
+                if member.id not in seen:
+                    out.append(int(member.id))
+                    seen.add(int(member.id))
+        except Exception:
+            continue
+    return out
+
+def _pick_sherpas_for_batch(guild: Optional[discord.Guild], data: Dict[str, object], count: int) -> List[int]:
+    if count <= 0:
+        return []
+    pool: List[int] = list(data.get("sherpa_pool") or [])  # type: ignore[arg-type]
+    idx = int(data.get("sherpa_index", 0) or 0)
+    picked: List[int] = []
+    seen: Set[int] = set()
+    # Prefer registered sherpa pool (round-robin)
+    attempts = 0
+    while len(picked) < count and pool and attempts < len(pool) * 2:
+        uid = int(pool[idx % len(pool)])
+        idx += 1
+        attempts += 1
+        if uid in seen:
+            continue
+        seen.add(uid)
+        picked.append(uid)
+    # Fill any remaining slots from guild Sherpa roles
+    if len(picked) < count and guild:
+        for uid in _guild_sherpa_member_ids(guild):
+            if uid in seen:
+                continue
+            seen.add(uid)
+            picked.append(uid)
+            if len(picked) >= count:
+                break
+    data["sherpa_index"] = idx
+    return picked
+
+async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, object]) -> Tuple[discord.Embed, Optional[discord.File]]:
+    activity = str(data.get("activity") or "Activity")
+    when = str(data.get("when_text") or "TBD")
+    group_size = int(data.get("group_size", 1) or 1)
+    cap = int(data.get("capacity", 0) or 0)
+    batch_no = int(data.get("batch_number", 0) or 0)
+    status = str(data.get("status") or "active")
+    line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+    next_index = int(data.get("next_index", 0) or 0)
+    waiting = line[next_index:]
+    completed_batches: List[List[int]] = list(data.get("completed_batches") or [])  # type: ignore[arg-type]
+    promoter_id = data.get("promoter_id")
+
+    title = f"📋 List Run — {activity}"
+    if status == "done":
+        desc = "This list run is **finished**. Thanks everyone!"
+    else:
+        desc = (
+            f"We're running **{activity}** back-to-back today.\n"
+            f"Players go in groups of **{group_size}**; remaining fireteam slots are filled with **Sherpas**."
+        )
+    embed = discord.Embed(title=title, description=desc, color=_activity_color(activity))
+    embed.add_field(name="When", value=when, inline=False)
+    if data.get("difficulty"):
+        embed.add_field(name="Difficulty", value=str(data.get("difficulty")), inline=True)
+    embed.add_field(name="Group Size", value=str(group_size), inline=True)
+    embed.add_field(name="Fireteam Size", value=str(cap), inline=True)
+    if promoter_id:
+        embed.add_field(name="Hosted by", value=f"<@{int(promoter_id)}>", inline=True)
+    embed.add_field(name="Batches Run", value=str(batch_no), inline=True)
+    embed.add_field(name="In Line", value=str(len(line)), inline=True)
+    embed.add_field(name="Waiting", value=str(len(waiting)), inline=True)
+
+    if waiting:
+        lines = [f"{next_index + i + 1}. <@{uid}>" for i, uid in enumerate(waiting[:20])]
+        extra = f"\n…and {len(waiting) - 20} more" if len(waiting) > 20 else ""
+        embed.add_field(name="Up Next", value="\n".join(lines) + extra, inline=False)
+    elif status != "done":
+        embed.add_field(name="Up Next", value="_No one left in line._", inline=False)
+
+    if completed_batches:
+        last = completed_batches[-1]
+        embed.add_field(
+            name="Last Group",
+            value=", ".join(f"<@{uid}>" for uid in last) or "—",
+            inline=False,
+        )
+
+    if status == "active":
+        embed.set_footer(text="Use Next to pull the next group • Done ends this list run")
+
+    try:
+        img_url = data.get("image_url")
+        if img_url and not str(img_url).startswith("attachment://"):
+            embed.set_image(url=str(img_url))
+            return embed, None
+    except Exception:
+        pass
+    return _apply_activity_image(embed, activity)
+
+def _list_session_data(session_id: str) -> Optional[Dict[str, object]]:
+    return LIST_SESSIONS.get(str(session_id))
+
+def _list_control_message_id(data: Dict[str, object]) -> Optional[int]:
+    try:
+        mid = data.get("control_message_id")
+        return int(mid) if mid else None
+    except Exception:
+        return None
+
+def _register_list_views(session_id: str, line_user_ids: Optional[List[int]] = None) -> None:
+    sid = str(session_id)
+    try:
+        bot.add_view(ListControlView(session_id=sid))
+    except Exception:
+        pass
+    if line_user_ids:
+        for uid in line_user_ids:
+            try:
+                bot.add_view(ListConfirmView(session_id=sid, uid=int(uid)))
+            except Exception:
+                pass
+
+async def _update_list_control_message(guild: Optional[discord.Guild], session_id: str) -> None:
+    data = _list_session_data(session_id)
+    if not data or not guild:
+        return
+    mid = _list_control_message_id(data)
+    channel_id = int(data.get("channel_id") or 0)
+    if not mid or not channel_id:
+        return
+    channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
+    if not channel:
+        return
+    try:
+        msg = await channel.fetch_message(int(mid))
+    except Exception:
+        return
+    embed, _ = await _render_list_embed(guild, data)
+    view = None if str(data.get("status")) == "done" else ListControlView(session_id=str(session_id))
+    try:
+        await msg.edit(embed=embed, view=view)
+    except Exception:
+        pass
+
+async def _repost_list_to_bottom(guild: Optional[discord.Guild], session_id: str) -> Optional[int]:
+    data = _list_session_data(session_id)
+    if not data or not guild or str(data.get("status")) == "done":
+        return None
+    channel_id = int(data.get("channel_id") or 0)
+    old_mid = _list_control_message_id(data)
+    if not channel_id:
+        return None
+    channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
+    if not channel:
+        return None
+    embed, f = await _render_list_embed(guild, data)
+    view = ListControlView(session_id=str(session_id))
+    if old_mid:
+        try:
+            old_msg = await channel.fetch_message(int(old_mid))
+            try:
+                await old_msg.delete()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        LIST_RUNS_MSG_TO_SESSION.pop(int(old_mid), None)
+    try:
+        if f:
+            new_msg = await channel.send(embed=embed, file=f, view=view)
+        else:
+            new_msg = await channel.send(embed=embed, view=view)
+    except Exception:
+        return None
+    new_mid = int(new_msg.id)
+    data["control_message_id"] = new_mid
+    LIST_RUNS_MSG_TO_SESSION[new_mid] = str(session_id)
+    _register_list_views(str(session_id))
+    try:
+        if new_msg.embeds and new_msg.embeds[0].image and new_msg.embeds[0].image.url:
+            url = str(new_msg.embeds[0].image.url)
+            if not url.startswith("attachment://"):
+                data["image_url"] = url
+                embed_cdn, _ = await _render_list_embed(guild, data)
+                await new_msg.edit(embed=embed_cdn, view=view, attachments=[])
+    except Exception:
+        pass
+    return new_mid
+
+async def _maybe_repost_list_control(channel_id: int) -> None:
+    session_id = LIST_RUNS_BY_CHANNEL.get(int(channel_id))
+    if not session_id:
+        return
+    data = _list_session_data(session_id)
+    if not data or str(data.get("status")) == "done":
+        return
+    now = float(datetime.utcnow().timestamp())
+    last = float(LIST_REPOST_DEBOUNCE.get(int(channel_id), 0) or 0)
+    if (now - last) < 3.0:
+        return
+    LIST_REPOST_DEBOUNCE[int(channel_id)] = now
+    guild_id = data.get("guild_id")
+    guild = bot.get_guild(int(guild_id)) if guild_id else None  # type: ignore[arg-type]
+    if guild:
+        await _repost_list_to_bottom(guild, str(session_id))
+
+class ListConfirmView(discord.ui.View):
+    def __init__(self, session_id: str, uid: int):
+        super().__init__(timeout=None)
+        self.session_id = str(session_id)
+        self.uid = int(uid)
+        yes_btn = discord.ui.Button(
+            label="Yes",
+            style=discord.ButtonStyle.success,
+            custom_id=f"list_confirm_yes:{self.session_id}:{self.uid}",
+        )
+        yes_btn.callback = self._yes_callback  # type: ignore[method-assign]
+        self.add_item(yes_btn)
+        no_btn = discord.ui.Button(
+            label="Can't make it",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"list_confirm_no:{self.session_id}:{self.uid}",
+        )
+        no_btn.callback = self._no_callback  # type: ignore[method-assign]
+        self.add_item(no_btn)
+
+    async def _yes_callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This DM button isn't for you.", ephemeral=True)
+            return
+        data = _list_session_data(self.session_id)
+        if not data or str(data.get("status")) == "done":
+            await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
+            return
+        line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+        declined: Set[int] = set(int(x) for x in (data.get("declined") or set()))  # type: ignore[arg-type]
+        if self.uid in line:
+            await interaction.response.send_message("You're already in line!", ephemeral=True)
+            return
+        if self.uid in declined:
+            declined.discard(self.uid)
+            data["declined"] = declined
+        line.append(self.uid)
+        data["line"] = line
+        await interaction.response.send_message("You're in line! We'll DM you when it's your turn.", ephemeral=True)
+        guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore[arg-type]
+        if guild:
+            await _update_list_control_message(guild, self.session_id)
+
+    async def _no_callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("This DM button isn't for you.", ephemeral=True)
+            return
+        data = _list_session_data(self.session_id)
+        if not data:
+            await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
+            return
+        line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+        declined: Set[int] = set(int(x) for x in (data.get("declined") or set()))  # type: ignore[arg-type]
+        if self.uid in line:
+            line = [x for x in line if int(x) != self.uid]
+            data["line"] = line
+            nxt = int(data.get("next_index", 0) or 0)
+            if nxt > len(line):
+                data["next_index"] = len(line)
+        declined.add(self.uid)
+        data["declined"] = declined
+        await interaction.response.send_message("No worries — skipped for this list run.", ephemeral=True)
+        guild = interaction.client.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore[arg-type]
+        if guild:
+            await _update_list_control_message(guild, self.session_id)
+
+class ListControlView(discord.ui.View):
+    def __init__(self, session_id: str):
+        super().__init__(timeout=None)
+        self.session_id = str(session_id)
+        next_btn = discord.ui.Button(
+            label="Next",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"list_next:{self.session_id}",
+        )
+        next_btn.callback = self._next_callback  # type: ignore[method-assign]
+        self.add_item(next_btn)
+        done_btn = discord.ui.Button(
+            label="Done",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"list_done:{self.session_id}",
+        )
+        done_btn.callback = self._done_callback  # type: ignore[method-assign]
+        self.add_item(done_btn)
+
+    async def _next_callback(self, interaction: discord.Interaction) -> None:
+        data = _list_session_data(self.session_id)
+        if not data or str(data.get("status")) == "done":
+            await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
+            return
+        if not _is_promoter_or_founder(interaction, data):
+            await interaction.response.send_message("Only the host or a founder can advance the list.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        line: List[int] = list(data.get("line") or [])  # type: ignore[arg-type]
+        next_index = int(data.get("next_index", 0) or 0)
+        group_size = max(1, int(data.get("group_size", 1) or 1))
+        waiting = line[next_index:]
+        if not waiting:
+            await interaction.followup.send("No one left in line.", ephemeral=True)
+            return
+        batch_players = waiting[:group_size]
+        new_index = next_index + len(batch_players)
+        data["next_index"] = new_index
+        sherpa_count = _list_run_sherpa_slots_needed(data, len(batch_players))
+        sherpas = _pick_sherpas_for_batch(guild, data, sherpa_count)
+        activity = str(data.get("activity") or "Activity")
+        batch_no = int(data.get("batch_number", 0) or 0) + 1
+        data["batch_number"] = batch_no
+        completed_batches: List[List[int]] = list(data.get("completed_batches") or [])  # type: ignore[arg-type]
+        completed_batches.append(list(batch_players))
+        data["completed_batches"] = completed_batches
+
+        sherpa_text = ", ".join(f"<@{uid}>" for uid in sherpas) if sherpas else "_None needed_"
+        player_text = ", ".join(f"<@{uid}>" for uid in batch_players)
+        channel_id = int(data.get("channel_id") or interaction.channel_id)
+        turn_msg = (
+            f"**Group {batch_no} — your turn for {activity}!**\n"
+            f"Players: {player_text}\n"
+            f"Sherpas: {sherpa_text}"
+        )
+        await _send_to_channel_id(
+            channel_id,
+            content=turn_msg,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+        when_text = str(data.get("when_text") or "")
+        for uid in batch_players:
+            try:
+                member = guild.get_member(int(uid)) if guild else None
+                if not member:
+                    continue
+                dm = await member.create_dm()
+                await dm.send(
+                    content=(
+                        f"It's your turn for **{activity}**"
+                        + (f" at **{when_text}**" if when_text else "")
+                        + f" (Group {batch_no}).\nHead to the event channel!"
+                    )
+                )
+            except Exception:
+                pass
+
+        try:
+            act = str(data.get("activity") or "")
+            if act:
+                await _mark_queue_participants_checked(act, batch_players)
+        except Exception:
+            pass
+
+        await _update_list_control_message(guild, self.session_id)
+        await _repost_list_to_bottom(guild, self.session_id)
+        await interaction.followup.send(
+            f"Pulled group {batch_no}: {len(batch_players)} player(s)"
+            + (f" + {len(sherpas)} Sherpa(s)" if sherpas else "")
+            + ".",
+            ephemeral=True,
+        )
+
+    async def _done_callback(self, interaction: discord.Interaction) -> None:
+        data = _list_session_data(self.session_id)
+        if not data:
+            await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
+            return
+        if not _is_promoter_or_founder(interaction, data):
+            await interaction.response.send_message("Only the host or a founder can end the list.", ephemeral=True)
+            return
+        data["status"] = "done"
+        channel_id = int(data.get("channel_id") or 0)
+        if channel_id:
+            LIST_RUNS_BY_CHANNEL.pop(channel_id, None)
+        guild = interaction.guild
+        embed, _ = await _render_list_embed(guild, data)
+        try:
+            await interaction.response.edit_message(embed=embed, view=None)
+        except Exception:
+            await interaction.response.send_message("List run ended.", ephemeral=True)
+
+# ---------------------------
 # DM Confirm Views
 # ---------------------------
 
@@ -4608,6 +5035,244 @@ async def schedule_cmd(
                 pass
 
 # ---------------------------
+# /list — marathon list run (batch queue with Next/Done controls)
+# ---------------------------
+
+@bot.tree.command(
+    name="list",
+    description="(Founder) Start a back-to-back list run: DM queue, line up players, pull groups with Next/Done",
+)
+@founder_only()
+@app_commands.describe(
+    activity="Activity name",
+    datetime_str="Date and time (MM-DD HH:MM, 24h)",
+    timezone="Timezone (dropdown)",
+    group_size="Players per group (e.g. 3 pulls 3 at a time)",
+    difficulty="Difficulty (raids/dungeons only)",
+    sherpas="User(s) to pre-slot as Sherpa helpers (optional)",
+)
+@app_commands.autocomplete(activity=_activity_autocomplete)
+@app_commands.choices(
+    timezone=[
+        app_commands.Choice(name="US Eastern", value="America/New_York"),
+        app_commands.Choice(name="US Central", value="America/Chicago"),
+        app_commands.Choice(name="US Mountain", value="America/Denver"),
+        app_commands.Choice(name="US Pacific", value="America/Los_Angeles"),
+        app_commands.Choice(name="UTC", value="UTC"),
+        app_commands.Choice(name="Europe/London", value="Europe/London"),
+        app_commands.Choice(name="Europe/Paris", value="Europe/Paris"),
+        app_commands.Choice(name="Asia/Tokyo", value="Asia/Tokyo"),
+    ],
+    difficulty=[
+        app_commands.Choice(name="Normal", value="Normal"),
+        app_commands.Choice(name="Master", value="Master"),
+    ],
+)
+async def list_cmd(
+    interaction: discord.Interaction,
+    activity: str,
+    datetime_str: str,
+    timezone: str = "America/New_York",
+    group_size: int = 3,
+    difficulty: Optional[str] = None,
+    sherpas: Optional[str] = None,
+):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    try:
+        act, sug = _resolve_activity(activity)
+        if not act:
+            hint = (" Try: " + ", ".join(sug)) if sug else ""
+            await interaction.followup.send(f"Unknown activity.{hint}", ephemeral=True)
+            return
+
+        is_raid_dungeon = _is_raid_or_dungeon(act)
+        selected_difficulty = difficulty if is_raid_dungeon else None
+        channel_id = int(EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id)
+        cap = _cap_for_activity(act)
+        batch_players = max(1, min(int(group_size or 1), cap))
+
+        try:
+            await load_queues()
+        except Exception:
+            pass
+
+        queue_members = [int(uid) for uid in (QUEUES.get(act, []) or [])]
+        if not queue_members:
+            await interaction.followup.send(
+                f"No one is on the queue for **{act}**. Use /join first.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            date_part, time_part = datetime_str.strip().split()
+            year = datetime.now().year
+            date_full = f"{year}-{date_part}"
+        except Exception:
+            await interaction.followup.send("Invalid datetime format. Use MM-DD HH:MM.", ephemeral=True)
+            return
+
+        start_ts = _parse_date_time_to_epoch(date_full, time_part, tz_name=timezone)
+        if not start_ts:
+            await interaction.followup.send(
+                "Could not parse the date/time. Use MM-DD HH:MM (24h).",
+                ephemeral=True,
+            )
+            return
+        when_text = f"<t:{start_ts}:F> ({timezone})"
+
+        guild = interaction.guild
+        sherpa_ids = _parse_user_ids(sherpas or "", guild) if sherpas else []
+        sherpa_pool: List[int] = []
+        seen_sherpas: Set[int] = set()
+        for sid in sherpa_ids:
+            if sid not in seen_sherpas:
+                sherpa_pool.append(int(sid))
+                seen_sherpas.add(int(sid))
+
+        existing_session = LIST_RUNS_BY_CHANNEL.get(channel_id)
+        if existing_session:
+            old = _list_session_data(existing_session)
+            if old and str(old.get("status")) != "done":
+                old["status"] = "done"
+                old_mid = _list_control_message_id(old)
+                if guild and old_mid:
+                    try:
+                        ch = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
+                        if ch:
+                            msg = await ch.fetch_message(int(old_mid))
+                            emb, _ = await _render_list_embed(guild, old)
+                            await msg.edit(embed=emb, view=None)
+                    except Exception:
+                        pass
+
+        session_id = uuid.uuid4().hex[:12]
+        promoter_id = interaction.user.id
+        data: Dict[str, object] = {
+            "session_id": session_id,
+            "guild_id": guild.id if guild else None,
+            "activity": act,
+            "when_text": when_text,
+            "start_ts": start_ts,
+            "timezone": timezone,
+            "difficulty": selected_difficulty,
+            "capacity": cap,
+            "group_size": batch_players,
+            "channel_id": channel_id,
+            "promoter_id": promoter_id,
+            "line": [],
+            "declined": set(),
+            "next_index": 0,
+            "completed_batches": [],
+            "sherpa_pool": sherpa_pool,
+            "sherpa_index": 0,
+            "status": "active",
+            "batch_number": 0,
+            "sherpa_alert_message_id": None,
+            "sherpa_alert_channel_id": None,
+        }
+        LIST_SESSIONS[session_id] = data
+        LIST_RUNS_BY_CHANNEL[channel_id] = session_id
+
+        embed, f = await _render_list_embed(guild, data)
+        view = ListControlView(session_id=session_id)
+        if f:
+            ctrl_msg = await _send_to_channel_id(channel_id, embed=embed, file=f, view=view)
+        else:
+            ctrl_msg = await _send_to_channel_id(channel_id, embed=embed, view=view)
+        if not ctrl_msg:
+            LIST_SESSIONS.pop(session_id, None)
+            LIST_RUNS_BY_CHANNEL.pop(channel_id, None)
+            await interaction.followup.send(
+                "Failed to post list control embed — set EVENT_SIGNUP_CHANNEL_ID or run in a channel.",
+                ephemeral=True,
+            )
+            return
+
+        mid = int(ctrl_msg.id)
+        data["control_message_id"] = mid
+        LIST_RUNS_MSG_TO_SESSION[mid] = session_id
+        _register_list_views(session_id)
+
+        try:
+            if ctrl_msg.embeds and ctrl_msg.embeds[0].image and ctrl_msg.embeds[0].image.url:
+                url = str(ctrl_msg.embeds[0].image.url)
+                if not url.startswith("attachment://"):
+                    data["image_url"] = url
+                    embed_cdn, _ = await _render_list_embed(guild, data)
+                    await ctrl_msg.edit(embed=embed_cdn, view=view, attachments=[])
+        except Exception:
+            pass
+
+        sherpa_slots = _list_run_sherpa_slots_needed(data, batch_players)
+        if RAID_SIGN_UP_CHANNEL_ID and sherpa_slots > 0:
+            try:
+                sherpa_embed = discord.Embed(
+                    title=f"🧭 Sherpa Signup — List Run: {act}",
+                    description=(
+                        f"We're running **{act}** back-to-back at {when_text}.\n"
+                        f"React ✅ to join the Sherpa rotation (fills remaining fireteam slots)."
+                    ),
+                    color=_activity_color(act),
+                )
+                sherpa_embed.add_field(name="When", value=when_text, inline=True)
+                sherpa_embed.add_field(name="List Control", value=f"[Jump to list]({ctrl_msg.jump_url})", inline=False)
+                alert = await _send_to_channel_id(int(RAID_SIGN_UP_CHANNEL_ID), embed=sherpa_embed)
+                if alert:
+                    data["sherpa_alert_message_id"] = str(alert.id)
+                    data["sherpa_alert_channel_id"] = str(alert.channel.id)
+                    try:
+                        await alert.add_reaction("✅")
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    print("List sherpa signup post failed:", e)
+                except Exception:
+                    pass
+
+        sent = 0
+        for uid in queue_members:
+            try:
+                member = guild.get_member(uid) if guild else None
+                if not member:
+                    continue
+                dm = await member.create_dm()
+                await dm.send(
+                    content=(
+                        f"We're running **{act}** over and over today at **{when_text}** "
+                        f"in {guild.name if guild else 'the server'}.\n"
+                        "Tap **Yes** to get in line — we'll pull groups when it's your turn."
+                    ),
+                    view=ListConfirmView(session_id=session_id, uid=int(uid)),
+                )
+                _register_list_views(session_id, [int(uid)])
+                sent += 1
+            except Exception as e:
+                print("List DM failed:", e)
+
+        status_lines = [
+            f"Started list run for **{act}**" + (f" ({selected_difficulty})" if selected_difficulty else "") + ".",
+            f"DMed **{sent}** queued player(s).",
+            f"Control embed posted in <#{channel_id}> (stays at the bottom until **Done**).",
+            f"Group size: **{batch_players}** | Fireteam: **{cap}** | Sherpas per group: **{sherpa_slots}**.",
+        ]
+        if difficulty and not is_raid_dungeon:
+            status_lines.append("Difficulty ignored: only used for raids and dungeons.")
+        await interaction.followup.send("\n".join(status_lines), ephemeral=True)
+
+    except Exception as e:
+        print("/list command error:", e)
+        try:
+            await interaction.followup.send("An error occurred while starting the list run. Check the bot logs.", ephemeral=True)
+        except Exception:
+            pass
+
+# ---------------------------
 # /event — Player-Created Signup (with Sherpa Requests)
 # ---------------------------
 
@@ -4778,6 +5443,43 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
     # Normalize emoji to string once
     emoji_str = str(payload.emoji)
+
+    # List-run Sherpa signup (✅ on sherpa alert for /list marathon)
+    for session_id, data in list(LIST_SESSIONS.items()):
+        if str(data.get("status")) == "done":
+            continue
+        alert_id = int(data.get("sherpa_alert_message_id")) if data.get("sherpa_alert_message_id") else None
+        alert_ch = int(data.get("sherpa_alert_channel_id")) if data.get("sherpa_alert_channel_id") else None
+        if not alert_id or payload.message_id != alert_id:
+            continue
+        if alert_ch is not None and payload.channel_id != alert_ch:
+            continue
+        if emoji_str != "✅":
+            continue
+        guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member or not (_is_sherpa(member) or _is_sherpa_assistant(member)):
+            return
+        pool: List[int] = list(data.get("sherpa_pool") or [])  # type: ignore[arg-type]
+        if member.id not in pool:
+            pool.append(int(member.id))
+            data["sherpa_pool"] = pool
+        try:
+            dm = await member.create_dm()
+            activity = str(data.get("activity") or "Activity")
+            when_text = str(data.get("when_text") or "")
+            await dm.send(
+                content=(
+                    f"You're signed up as a Sherpa for the **{activity}** list run"
+                    + (f" at **{when_text}**" if when_text else "")
+                    + ". You'll be rotated in to fill fireteam slots."
+                )
+            )
+        except Exception:
+            pass
+        return
 
     # Sherpa alert claim (✅ or 🔁 on the sherpa signup message in RAID_SIGN_UP_CHANNEL)
     for mid, data in list(SCHEDULES.items()):
