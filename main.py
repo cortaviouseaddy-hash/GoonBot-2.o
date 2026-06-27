@@ -2173,12 +2173,10 @@ def founder_only():
         raise app_commands.CheckFailure("You are not authorized to use this command.")
     return app_commands.check(predicate)
 
-def _is_list_host_or_founder(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
-    """Permission check for /list controls only (not shared with /schedule)."""
+def _is_list_host_only(interaction: discord.Interaction, data: Optional[Dict[str, object]] = None) -> bool:
+    """Only the user who ran /list can use Next/Done on that session."""
     try:
         uid = int(interaction.user.id)
-        if FOUNDER_USER_ID and uid == int(FOUNDER_USER_ID):
-            return True
         if data and data.get("type") == "list_run" and data.get("host_id") and int(data["host_id"]) == uid:  # type: ignore[arg-type]
             return True
     except Exception:
@@ -3889,7 +3887,7 @@ async def _render_list_embed(guild: Optional[discord.Guild], data: Dict[str, obj
         )
 
     if status == "active":
-        embed.set_footer(text=f"React {LIST_JOIN_EMOJI} to join • Next pulls the next group • Done ends this list")
+        embed.set_footer(text=f"React {LIST_JOIN_EMOJI} to join • Only the host can use Next/Done")
 
     try:
         img_url = data.get("image_url")
@@ -4087,8 +4085,8 @@ class ListControlView(discord.ui.View):
         if not data or str(data.get("status")) == "done":
             await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
             return
-        if not _is_list_host_or_founder(interaction, data):
-            await interaction.response.send_message("Only the list host or a founder can advance the list.", ephemeral=True)
+        if not _is_list_host_only(interaction, data):
+            await interaction.response.send_message("Only the person who started this /list can press **Next**.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
@@ -4174,8 +4172,8 @@ class ListControlView(discord.ui.View):
         if not data:
             await interaction.response.send_message("This list run is no longer active.", ephemeral=True)
             return
-        if not _is_list_host_or_founder(interaction, data):
-            await interaction.response.send_message("Only the list host or a founder can end the list.", ephemeral=True)
+        if not _is_list_host_only(interaction, data):
+            await interaction.response.send_message("Only the person who started this /list can press **Done**.", ephemeral=True)
             return
         data["status"] = "done"
         channel_id = int(data.get("channel_id") or 0)
