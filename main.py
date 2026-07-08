@@ -4963,6 +4963,9 @@ async def _scheduler_loop():
                         moved = _autofill_from_backups(data)
                         guild = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
                         await _dm_promoted_users(guild, moved, data)
+                        if guild:
+                            # Reflect any promotions on the event embed immediately
+                            await _update_schedule_message(guild, int(mid))
                     except Exception:
                         pass
                     # Add ✅, 📝, ❌ to main event post
@@ -4982,6 +4985,9 @@ async def _scheduler_loop():
                             moved = _autofill_from_backups(data)
                             guild2 = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
                             await _dm_promoted_users(guild2, moved, data)
+                            if guild2:
+                                # Update embed to show latest roster after any promotions
+                                await _update_schedule_message(guild2, int(mid))
                         except Exception:
                             pass
                         event_link = None
@@ -5008,6 +5014,22 @@ async def _scheduler_loop():
                     if not data.get(key) and now >= start_ts - delta:
                         await _send_reminders(data, label)
                         data[key] = True
+
+                # While signups are open, continuously pull from backups into any open player slots
+                # until the event starts. This ensures that users who react with 📝 (backup)
+                # during the open window are promoted automatically when space exists.
+                try:
+                    if str(data.get("type")) != "sherpa_only" and data.get("signups_open") and now < start_ts:
+                        participants: List[int] = data.get("players", [])  # type: ignore
+                        if len(participants) < player_slots:
+                            moved = _autofill_from_backups(data)
+                            if moved:
+                                guild3 = bot.get_guild(int(data.get("guild_id"))) if data.get("guild_id") else None  # type: ignore
+                                await _dm_promoted_users(guild3, moved, data)
+                                if guild3:
+                                    await _update_schedule_message(guild3, int(mid))
+                except Exception:
+                    pass
 
         except Exception as e:
             print("scheduler error:", e)
