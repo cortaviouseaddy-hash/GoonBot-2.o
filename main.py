@@ -2391,11 +2391,26 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
         team_count = len(players_set) + len(sherpas_set)
         if promoter_id is not None and promoter_id not in players_set and promoter_id not in sherpas_set:
             team_count += 1
-        embed.add_field(name="Capacity", value=f"{team_count}/{cap}", inline=True)
+        reserved = int(data.get("reserved_sherpas", 0) or 0)
+        player_slots = max(0, cap - reserved)
+        embed.add_field(
+            name="Capacity",
+            value=f"{team_count}/{cap} — {player_slots} player slot(s), {reserved} Sherpa slot(s)",
+            inline=False,
+        )
 
     if not is_user_event:
-        if sherpas:
-            embed.add_field(name="Sherpas", value=", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10]), inline=False)
+        reserved = int(data.get("reserved_sherpas", 0) or 0)
+        if reserved or sherpas:
+            if sherpas:
+                sherpa_names = ", ".join(f"<@{int(x)}>" for x in list(sherpas)[:10])
+            else:
+                sherpa_names = "_Open — claim on the Sherpa signup post_"
+            embed.add_field(
+                name=f"Sherpas ({len(sherpas)}/{reserved})",
+                value=sherpa_names,
+                inline=False,
+            )
         if s_backups:
             embed.add_field(name=f"Sherpa Backups ({len(s_backups)})", value="\n".join(f"<@{int(x)}>" for x in list(s_backups)[:10]), inline=False)
 
@@ -2404,9 +2419,21 @@ async def _render_event_embed(guild: Optional[discord.Guild], activity: str, dat
             lines = [f"{i+1}. <@{uid}>" for i, uid in enumerate(players)]
             embed.add_field(name=f"Participants ({len(players)}/{cap})", value="\n".join(lines), inline=False)
         else:
-            # Show only the number of listed Players here to avoid confusion.
-            # Overall occupancy (Players + Sherpas + Host-if-not-listed) is shown in the Capacity field above.
-            embed.add_field(name=f"Players ({len(players)})", value="\n".join(f"<@{p}>" for p in players), inline=False)
+            reserved = int(data.get("reserved_sherpas", 0) or 0)
+            player_slots = max(0, cap - reserved)
+            embed.add_field(
+                name=f"Players ({len(players)}/{player_slots})",
+                value="\n".join(f"<@{p}>" for p in players),
+                inline=False,
+            )
+    elif not is_user_event:
+        reserved = int(data.get("reserved_sherpas", 0) or 0)
+        player_slots = max(0, cap - reserved)
+        embed.add_field(
+            name=f"Players (0/{player_slots})",
+            value="_Open — queue DMs / react when signups open_",
+            inline=False,
+        )
     if backups:
         if is_user_event:
             embed.add_field(name=f"Backup ({len(backups)})", value="\n".join(f"– <@{b}>" for b in backups), inline=False)
@@ -3733,6 +3760,26 @@ async def ping_cmd(interaction: discord.Interaction):
 # Parser
 # ---------------------------
 
+def _coerce_slot_count(text: Optional[str], cap: int) -> Optional[int]:
+    """If `text` is a 1–2 digit number, treat it as a fireteam slot count.
+
+    Discord snowflakes are 15+ digits, so values like "4" in the `sherpas`
+    option are a slot count, not a user ID. Typing 4 there used to leave the
+    default 2 Sherpa / 4 player split in place (looked backwards).
+    """
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not re.fullmatch(r"[0-9]{1,2}", s):
+        return None
+    try:
+        n = int(s)
+    except Exception:
+        return None
+    cap_n = max(0, int(cap or 0))
+    return max(0, min(n, cap_n if cap_n else n))
+
+
 def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
     """Parse a free-form list of users into user IDs.
 
@@ -3822,7 +3869,8 @@ def _parse_user_ids(text: str, guild: Optional[discord.Guild]) -> List[int]:
         # Skip if already parsed via mention/ID
         if re.fullmatch(r"<@!?[0-9]{5,25}>", tok):
             continue
-        if tok.isdigit():
+        # Bare snowflakes only (15+ digits). Short numbers are slot counts, not users.
+        if tok.isdigit() and len(tok) >= 15:
             try:
                 uid = int(tok)
                 if uid not in resolved_ids:
@@ -4651,6 +4699,9 @@ class ConfirmView(discord.ui.View):
         data = SCHEDULES.get(self.mid)
         if not data:
             await interaction.response.send_message("Event no longer exists.", ephemeral=True); return
+        if _user_in_any_event_list(data, self.uid) == "sherpas":
+            await interaction.response.send_message("You're already locked in as a Sherpa for this run.", ephemeral=True)
+            return
         participants: List[int] = data.get("players", [])  # type: ignore
         backups: List[int] = data.get("backups", [])  # type: ignore
         cap = int(data.get("capacity", 0)); reserved = int(data.get("reserved_sherpas", 0))
@@ -5204,9 +5255,9 @@ async def on_message_delete(message: discord.Message):
     datetime_str="Date and time (MM-DD HH:MM, 24h)",
     timezone="Timezone (dropdown)",
     difficulty="Difficulty (raids/dungeons only)",
-    reserved_sherpas="Number of Sherpa slots to reserve (default 2)",
-    sherpas="User(s) to pre-slot as Sherpa (optional)",
-    participants="User(s) to pre-slot as Participant (optional)",
+    reserved_sherpas="Sherpa slot count. Raid of 6 with 4 sherpas leaves 2 players. Default 2.",
+    sherpas="Mention Sherpas to pre-slot. A number like 4 means 4 Sherpa slots, not 4 players.",
+    participants="Mention players to pre-slot (optional)",
 )
 @app_commands.autocomplete(activity=_activity_autocomplete)
 @app_commands.choices(
@@ -5253,7 +5304,7 @@ async def schedule_cmd(
         channel_id = (EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id)
 
         cap = _cap_for_activity(act)
-        reserved = max(0, min(int(reserved_sherpas or 0), cap))
+        reserved = max(0, min(int(reserved_sherpas if reserved_sherpas is not None else 2), cap))
 
         try:
             await load_queues()
@@ -5285,16 +5336,39 @@ async def schedule_cmd(
         when_text = f"<t:{start_ts}:F> ({timezone})"
 
         guild = interaction.guild
-        sherpa_ids = set(_parse_user_ids(sherpas or "", guild)) if sherpas else set()
+        # `sherpas` is a string option, so people type "4" meaning 4 Sherpa slots.
+        # That used to be parsed as user id 4 and player slots stayed at cap-2 = 4.
+        count_from_sherpas = _coerce_slot_count(sherpas, cap)
+        if count_from_sherpas is not None:
+            reserved = count_from_sherpas
+            sherpa_ids: Set[int] = set()
+        else:
+            sherpa_ids = set(_parse_user_ids(sherpas or "", guild)) if sherpas else set()
         participant_ids = _parse_user_ids(participants or "", guild) if participants else []
 
-        # Pre-slotted sherpas count toward reserved slots.
-        # We announce only if there are open Sherpa slots remaining.
-        open_sherpa_slots = max(0, int(reserved) - len(set(int(x) for x in sherpa_ids)))
-
         promoter_id = interaction.user.id
-        if promoter_id not in participant_ids:
+        promoter_member = None
+        try:
+            if isinstance(interaction.user, discord.Member):
+                promoter_member = interaction.user
+            elif guild:
+                promoter_member = guild.get_member(promoter_id)
+        except Exception:
+            promoter_member = None
+        # Sherpa hosts belong in Sherpa slots, not the player list.
+        if (
+            promoter_member
+            and reserved > 0
+            and (_is_sherpa(promoter_member) or _is_sherpa_assistant(promoter_member))
+        ):
+            sherpa_ids.add(int(promoter_id))
+        elif promoter_id not in participant_ids:
             participant_ids.insert(0, promoter_id)
+
+        # Pre-slotted sherpas must actually consume reserved slots (and shrink player slots).
+        reserved = max(int(reserved), len(set(int(x) for x in sherpa_ids)))
+        reserved = max(0, min(int(reserved), cap))
+        open_sherpa_slots = max(0, int(reserved) - len(set(int(x) for x in sherpa_ids)))
 
         # Build players/backups from non-sherpa participants only
         # Sherpas are tracked separately in data["sherpas"] and do not appear in Players
@@ -5551,9 +5625,10 @@ async def schedule_cmd(
         # ---- DMs to unchecked queued users who are not already players (ConfirmView) ----
         sent = 0
         pre_slotted_players = {int(uid) for uid in (data.get("players", []) or [])}
+        pre_slotted_sherpas = {int(uid) for uid in (data.get("sherpas") or [])}
         sent_candidate_ids: Set[int] = set()
         for uid in candidates:
-            if int(uid) in pre_slotted_players:
+            if int(uid) in pre_slotted_players or int(uid) in pre_slotted_sherpas:
                 continue
             try:
                 m = guild.get_member(uid) if guild else None
@@ -5592,6 +5667,7 @@ async def schedule_cmd(
         # Build a concise status summary for the promoter
         status_lines = [
             f"Scheduled **{act}**" + (f" ({selected_difficulty})" if selected_difficulty else "") + ".",
+            f"Fireteam: **{max(0, cap - reserved)}** player slot(s), **{reserved}** Sherpa slot(s) (capacity {cap}).",
             f"DMed {sent} queued player(s), notified {p_sent} pre-slotted participant(s).",
             f"Sherpa signup posted: {'Yes' if posted_sherpa_signup else 'No'}" + (f" (fallback in <#{sherpa_signup_fallback}>)" if sherpa_signup_fallback else ""),
             (
@@ -5634,7 +5710,7 @@ async def schedule_cmd(
     num_sherpas="Sherpas per group (leave empty to auto-fill remaining fireteam slots)",
     max_list_size="Max people allowed in the line (leave empty for unlimited)",
     difficulty="Difficulty (raids/dungeons only)",
-    sherpas="User(s) to pre-slot as Sherpa helpers (optional)",
+    sherpas="Mention Sherpas, or a number like 4 for 4 Sherpa slots per group",
 )
 @app_commands.autocomplete(activity=_activity_autocomplete)
 @app_commands.choices(
@@ -5681,6 +5757,12 @@ async def list_cmd(
         channel_id = int(EVENT_SIGNUP_CHANNEL_ID or interaction.channel_id)
         cap = _cap_for_activity(act)
         host_slots = 1
+        # Same pitfall as /schedule: typing "4" in `sherpas` means 4 Sherpa slots.
+        count_from_sherpas = _coerce_slot_count(sherpas, cap)
+        if count_from_sherpas is not None:
+            if num_sherpas is None:
+                num_sherpas = count_from_sherpas
+            sherpas = None
         sherpa_slots_fixed: Optional[int] = None
         if num_sherpas is not None:
             sherpa_slots_fixed = max(0, min(int(num_sherpas), max(0, cap - host_slots - 1)))
