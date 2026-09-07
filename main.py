@@ -339,14 +339,109 @@ def sherpa_host_only():
         raise app_commands.CheckFailure("Only Sherpas can use this command." + (" Assistants are not allowed." if not ALLOW_ASSISTANTS_TO_HOST else ""))
     return app_commands.check(predicate)
 
-async def _activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+DISCORD_AUTOCOMPLETE_LIMIT = 25
+_ACTIVITY_CATEGORY_KEYS = ("raids", "dungeons", "exotic_activities")
+_ACTIVITY_CATEGORY_KEYWORDS = {
+    "raid": "raids",
+    "raids": "raids",
+    "dungeon": "dungeons",
+    "dungeons": "dungeons",
+    "exotic": "exotic_activities",
+    "exotics": "exotic_activities",
+    "mission": "exotic_activities",
+    "missions": "exotic_activities",
+}
+
+
+def _preset_activities_in_order() -> List[str]:
+    """Raids, then dungeons, then exotic missions, matching activities.json."""
+    ordered: List[str] = []
+    seen = set()
+    for key in _ACTIVITY_CATEGORY_KEYS:
+        for act in (PRESETS.get(key) or []):
+            if isinstance(act, str) and act and act not in seen:
+                ordered.append(act)
+                seen.add(act)
+    for act in ALL_ACTIVITIES:
+        if act not in seen:
+            ordered.append(act)
+            seen.add(act)
+    return ordered
+
+
+def _activity_preset_rank(act: str) -> Tuple[int, int]:
+    for cat_i, key in enumerate(_ACTIVITY_CATEGORY_KEYS):
+        items = [a for a in (PRESETS.get(key) or []) if isinstance(a, str)]
+        try:
+            return cat_i, items.index(act)
+        except ValueError:
+            continue
+    return 99, 0
+
+
+def _category_for_activity(act: Optional[str]) -> Optional[str]:
+    if not act:
+        return None
+    for key in _ACTIVITY_CATEGORY_KEYS:
+        if act in (PRESETS.get(key) or []):
+            return key
+    return None
+
+
+def _category_label(category: Optional[str]) -> str:
+    return {
+        "raids": "Raids",
+        "dungeons": "Dungeons",
+        "exotic_activities": "Exotic Missions",
+    }.get(category or "", "Activities")
+
+
+def _category_from_namespace(interaction: discord.Interaction) -> Optional[str]:
+    try:
+        raw = getattr(interaction.namespace, "category", None)
+    except Exception:
+        raw = None
+    if raw in _ACTIVITY_CATEGORY_KEYS:
+        return str(raw)
+    return None
+
+
+def _activities_for_category(category: Optional[str]) -> List[str]:
+    if category in _ACTIVITY_CATEGORY_KEYS:
+        return [a for a in (PRESETS.get(category) or []) if isinstance(a, str) and a]
+    return _preset_activities_in_order()
+
+
+def _build_activity_choices(
+    interaction: discord.Interaction,
+    current: str,
+    *,
+    prefer_queued: bool = False,
+) -> List[app_commands.Choice[str]]:
+    """Build the 25 Discord autocomplete rows.
+
+    Discord only shows 25 choices. We keep raids then dungeons first so every
+    raid and dungeon is visible without typing, and treat "raid"/"dungeon" as
+    category keywords. `/check` can also filter by the category option.
+    """
     cur_raw = (current or "").strip()
     cur = cur_raw.lower()
     cur_norm = _normalize_activity_text(cur_raw)
+    category = _category_from_namespace(interaction)
+    if not category and cur_norm in _ACTIVITY_CATEGORY_KEYWORDS:
+        category = _ACTIVITY_CATEGORY_KEYWORDS[cur_norm]
+        cur = ""
+        cur_norm = ""
+
+    pool = _activities_for_category(category)
+    if prefer_queued:
+        for act in list(QUEUES.keys()):
+            if act and act not in pool:
+                pool.append(act)
 
     def _match_score(act: str) -> int:
         if not cur:
-            return 0
+            return 1
         act_low = act.lower()
         act_norm = _normalize_activity_text(act)
         if act_low.startswith(cur) or act_norm.startswith(cur_norm):
@@ -358,20 +453,115 @@ async def _activity_autocomplete(interaction: discord.Interaction, current: str)
                 return 4
         return 0
 
+    def _queued_boost(act: str) -> int:
+        if not prefer_queued:
+            return 0
+        return 1 if (QUEUES.get(act) or []) else 0
+
     ranked: List[Tuple[int, str]] = []
-    for act in ALL_ACTIVITIES:
+    for act in pool:
         score = _match_score(act)
         if not cur or score > 0:
             ranked.append((score, act))
 
     if cur:
-        ranked.sort(key=lambda item: (-item[0], item[1].lower()))
+        ranked.sort(
+            key=lambda item: (
+                -item[0],
+                -_queued_boost(item[1]),
+                _activity_preset_rank(item[1]),
+                item[1].lower(),
+            )
+        )
     else:
-        ranked.sort(key=lambda item: item[1].lower())
+        # Never let queued exotics push raids/dungeons off the 25-choice menu.
+        ranked.sort(
+            key=lambda item: (
+                _activity_preset_rank(item[1])[0],
+                0 if (_activity_preset_rank(item[1])[0] == 2 and _queued_boost(item[1])) else 1,
+                _activity_preset_rank(item[1])[1],
+            )
+        )
 
     out: List[app_commands.Choice[str]] = []
-    for _, act in ranked[:25]:
-        out.append(app_commands.Choice(name=act, value=act))
+    for _, act in ranked[:DISCORD_AUTOCOMPLETE_LIMIT]:
+        out.append(app_commands.Choice(name=act[:100], value=act[:100]))
+    return out
+
+
+async def _activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return _build_activity_choices(interaction, current, prefer_queued=False)
+
+
+async def _check_activity_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return _build_activity_choices(interaction, current, prefer_queued=True)
+
+
+def _member_check_label(guild: Optional[discord.Guild], uid: int, *, checked: bool, activity: Optional[str] = None) -> str:
+    name = str(uid)
+    if guild:
+        mem = guild.get_member(int(uid))
+        if mem:
+            name = mem.display_name or mem.name or name
+    mark = "✅ " if checked else ""
+    if activity:
+        short = _normalize_activity_text(activity) or activity
+        label = f"{mark}{name} — {short}"
+    else:
+        label = f"{mark}{name}"
+    return label[:100]
+
+
+async def _queue_user_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """List people currently in the chosen activity queue (or any queue)."""
+    cur = (current or "").strip().lower()
+    guild = interaction.guild
+    activity_raw = None
+    try:
+        activity_raw = getattr(interaction.namespace, "activity", None)
+    except Exception:
+        activity_raw = None
+    act: Optional[str] = None
+    if activity_raw:
+        act, _ = _resolve_activity(str(activity_raw))
+
+    out: List[app_commands.Choice[str]] = []
+    seen: Set[str] = set()
+
+    def _add(uid: int, activity_name: str) -> None:
+        if len(out) >= DISCORD_AUTOCOMPLETE_LIMIT:
+            return
+        value = str(int(uid))
+        if value in seen:
+            return
+        checked = int(uid) in (CHECKED.get(activity_name, set()) or set())
+        label = _member_check_label(
+            guild,
+            int(uid),
+            checked=checked,
+            activity=None if act else activity_name,
+        )
+        if cur and cur not in label.lower() and cur not in value:
+            return
+        seen.add(value)
+        out.append(app_commands.Choice(name=label, value=value))
+
+    if act:
+        for uid in (QUEUES.get(act) or []):
+            try:
+                _add(int(uid), act)
+            except Exception:
+                continue
+        return out
+
+    for activity_name, q in QUEUES.items():
+        for uid in (q or []):
+            try:
+                _add(int(uid), str(activity_name))
+            except Exception:
+                continue
+            if len(out) >= DISCORD_AUTOCOMPLETE_LIMIT:
+                return out
     return out
 
 def _activity_color(activity: str) -> int:
@@ -3677,10 +3867,272 @@ async def restorequeue_preview_cmd(
         await interaction.followup.send(f"Queue restore preview failed: {e.__class__.__name__}", ephemeral=True)
 
 
-@bot.tree.command(name="check", description="Add a green check next to a user in a queue")
-@app_commands.describe(activity="Activity name", user="User mention or ID to mark")
-@app_commands.autocomplete(activity=_activity_autocomplete)
-async def check_cmd(interaction: discord.Interaction, activity: str, user: str):
+def _check_people_embed(guild: Optional[discord.Guild], activity: str) -> discord.Embed:
+    q = list(QUEUES.get(activity) or [])
+    checked = CHECKED.get(activity, set()) or set()
+    embed = discord.Embed(title=f"Checks — {activity}", color=_activity_color(activity))
+    if not q:
+        embed.description = "Nobody is in this queue yet."
+        return embed
+    lines = []
+    for uid in q:
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        mark = "✅" if uid_int in checked else "⬜"
+        lines.append(f"{mark} <@{uid_int}>")
+    embed.description = "\n".join(lines) if lines else "Nobody is in this queue yet."
+    embed.set_footer(text="Pick a name below to add or remove their ✅.")
+    return embed
+
+
+def _check_category_embed() -> discord.Embed:
+    return discord.Embed(
+        title="Check someone in a queue",
+        description=(
+            "Pick **Raids** or **Dungeons** to see **every** activity, then tap a name to add a ✅.\n\n"
+            "Exotic missions are on their own button so nothing gets cut off."
+        ),
+        color=0xE6B500,
+    )
+
+
+def _check_activity_list_embed(category: str) -> discord.Embed:
+    color = 0xE6B500
+    if category == "dungeons":
+        color = 0x8A2BE2
+    elif category == "exotic_activities":
+        color = 0x00CED1
+    acts = _activities_for_category(category)
+    return discord.Embed(
+        title=_category_label(category),
+        description=(
+            f"All **{len(acts)}** are listed below. Pick one to put checks next to people's names."
+            if acts
+            else "No activities found in that list."
+        ),
+        color=color,
+    )
+
+
+async def _edit_check_activity_picker(interaction: discord.Interaction, category: str, owner_id: int) -> None:
+    embed = _check_activity_list_embed(category)
+    view = CheckActivityView(category, owner_id)
+    if interaction.response.is_done():
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def _edit_check_people_picker(
+    interaction: discord.Interaction,
+    activity: str,
+    owner_id: int,
+    category: Optional[str],
+) -> None:
+    embed = _check_people_embed(interaction.guild, activity)
+    view = CheckPeopleView(activity, owner_id, category, interaction.guild)
+    if interaction.response.is_done():
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class CheckCategoryView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This check list isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Raids", style=discord.ButtonStyle.primary)
+    async def btn_raids(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await _edit_check_activity_picker(interaction, "raids", self.owner_id)
+
+    @discord.ui.button(label="Dungeons", style=discord.ButtonStyle.primary)
+    async def btn_dungeons(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await _edit_check_activity_picker(interaction, "dungeons", self.owner_id)
+
+    @discord.ui.button(label="Exotic Missions", style=discord.ButtonStyle.secondary)
+    async def btn_exotics(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await _edit_check_activity_picker(interaction, "exotic_activities", self.owner_id)
+
+
+class CheckActivitySelect(discord.ui.Select):
+    def __init__(self, category: str, owner_id: int):
+        acts = _activities_for_category(category)
+        options: List[discord.SelectOption] = []
+        for act in acts[:DISCORD_AUTOCOMPLETE_LIMIT]:
+            n = len(QUEUES.get(act) or [])
+            desc = f"{n} in queue" if n else "Empty"
+            options.append(discord.SelectOption(label=act[:100], value=act[:100], description=desc[:100]))
+        super().__init__(
+            placeholder=f"All {_category_label(category).lower()} — pick one",
+            min_values=1,
+            max_values=1,
+            options=options or [discord.SelectOption(label="None listed", value="none")],
+            disabled=not bool(acts),
+        )
+        self.category = category
+        self.owner_id = int(owner_id)
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        act = self.values[0]
+        if act == "none":
+            await interaction.response.send_message("No activities in that list.", ephemeral=True)
+            return
+        resolved, _ = _resolve_activity(act)
+        await _edit_check_people_picker(interaction, resolved or act, self.owner_id, self.category)
+
+
+class CheckActivityView(discord.ui.View):
+    def __init__(self, category: str, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = int(owner_id)
+        self.category = category
+        self.add_item(CheckActivitySelect(category, owner_id))
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+
+        async def _back(interaction: discord.Interaction) -> None:
+            await interaction.response.edit_message(embed=_check_category_embed(), view=CheckCategoryView(self.owner_id))
+
+        back.callback = _back  # type: ignore[method-assign]
+        self.add_item(back)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This check list isn't for you.", ephemeral=True)
+            return False
+        return True
+
+
+class CheckPeopleSelect(discord.ui.Select):
+    def __init__(
+        self,
+        activity: str,
+        owner_id: int,
+        category: Optional[str],
+        guild: Optional[discord.Guild],
+    ):
+        q = list(QUEUES.get(activity) or [])
+        checked = CHECKED.get(activity, set()) or set()
+        options: List[discord.SelectOption] = []
+        seen_labels: Set[str] = set()
+        for uid in q[:DISCORD_AUTOCOMPLETE_LIMIT]:
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
+            name = str(uid_int)
+            if guild:
+                mem = guild.get_member(uid_int)
+                if mem:
+                    name = mem.display_name or mem.name or name
+            mark = "✅" if uid_int in checked else "⬜"
+            label = f"{mark} {name}"
+            if label in seen_labels:
+                label = f"{label} ({uid_int})"
+            seen_labels.add(label)
+            options.append(discord.SelectOption(label=label[:100], value=str(uid_int)))
+        super().__init__(
+            placeholder="Pick a name to toggle their ✅" if options else "Queue is empty",
+            min_values=1,
+            max_values=1,
+            options=options or [discord.SelectOption(label="Queue is empty", value="empty")],
+            disabled=not bool(options),
+        )
+        self.activity = activity
+        self.owner_id = int(owner_id)
+        self.category = category
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if self.values[0] == "empty":
+            await interaction.response.defer()
+            return
+        try:
+            uid = int(self.values[0])
+        except Exception:
+            await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+            return
+        try:
+            await load_queues()
+            await load_checked()
+        except Exception:
+            pass
+        q = [int(x) for x in (QUEUES.get(self.activity) or [])]
+        if uid not in q:
+            await interaction.response.send_message("User is not in that queue.", ephemeral=True)
+            return
+        checked = _ensure_checked(self.activity)
+        if uid in checked:
+            checked.discard(uid)
+        else:
+            checked.add(uid)
+        # Answer Discord first so the checklist doesn't time out while the board posts.
+        await _edit_check_people_picker(interaction, self.activity, self.owner_id, self.category)
+        await persist_checked()
+        await _post_activity_board(self.activity)
+
+
+class CheckPeopleView(discord.ui.View):
+    def __init__(
+        self,
+        activity: str,
+        owner_id: int,
+        category: Optional[str],
+        guild: Optional[discord.Guild],
+    ):
+        super().__init__(timeout=300)
+        self.owner_id = int(owner_id)
+        self.activity = activity
+        self.category = category or _category_for_activity(activity)
+        self.add_item(CheckPeopleSelect(activity, owner_id, self.category, guild))
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+
+        async def _back(interaction: discord.Interaction) -> None:
+            if self.category:
+                await _edit_check_activity_picker(interaction, self.category, self.owner_id)
+            else:
+                await interaction.response.edit_message(
+                    embed=_check_category_embed(),
+                    view=CheckCategoryView(self.owner_id),
+                )
+
+        back.callback = _back  # type: ignore[method-assign]
+        self.add_item(back)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This check list isn't for you.", ephemeral=True)
+            return False
+        return True
+
+
+@bot.tree.command(name="check", description="Put a green check next to people in a raid, dungeon, or exotic queue")
+@app_commands.describe(
+    category="Pick Raids or Dungeons to see every activity (nothing gets cut off)",
+    activity="Activity to mark. Leave blank to pick from the full raid/dungeon list.",
+    user="Person in that queue. Leave blank to pick names from a checklist.",
+)
+@app_commands.choices(
+    category=[
+        app_commands.Choice(name="Raids", value="raids"),
+        app_commands.Choice(name="Dungeons", value="dungeons"),
+        app_commands.Choice(name="Exotic Missions", value="exotic_activities"),
+    ]
+)
+@app_commands.autocomplete(activity=_check_activity_autocomplete, user=_queue_user_autocomplete)
+async def check_cmd(
+    interaction: discord.Interaction,
+    category: Optional[str] = None,
+    activity: Optional[str] = None,
+    user: Optional[str] = None,
+):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
@@ -3691,30 +4143,91 @@ async def check_cmd(interaction: discord.Interaction, activity: str, user: str):
         await load_checked()
     except Exception:
         pass
-    act, sug = _resolve_activity(activity)
-    if not act:
-        hint = (" Try: " + ", ".join(sug)) if sug else ""
-        await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
+
+    act: Optional[str] = None
+    if activity:
+        act, sug = _resolve_activity(activity)
+        if not act:
+            hint = (" Try: " + ", ".join(sug)) if sug else ""
+            await interaction.response.send_message(f"Unknown activity.{hint}", ephemeral=True)
+            return
+
+    uid: Optional[int] = None
+    if user:
+        ids = _parse_user_ids(user, guild)
+        if not ids:
+            await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+            return
+        uid = ids[0]
+        if not act:
+            matches = [a for a, lst in QUEUES.items() if uid in (lst or [])]
+            if len(matches) == 1:
+                act = matches[0]
+            elif not matches:
+                await interaction.response.send_message("User is not in a queue.", ephemeral=True)
+                return
+            else:
+                names = ", ".join(matches[:8])
+                await interaction.response.send_message(
+                    f"They're in more than one queue. Pick an activity first ({names}).",
+                    ephemeral=True,
+                )
+                return
+
+    if act and uid is not None:
+        q = QUEUES.get(act, [])
+        if uid not in q:
+            await interaction.response.send_message("User is not in that queue.", ephemeral=True)
+            return
+        _ensure_checked(act).add(uid)
+        await persist_checked()
+        await interaction.response.send_message("Marked with green check.", ephemeral=True)
+        await _post_activity_board(act)
         return
-    ids = _parse_user_ids(user, guild)
-    if not ids:
-        await interaction.response.send_message("Couldn't resolve that user.", ephemeral=True)
+
+    if act:
+        await interaction.response.send_message(
+            embed=_check_people_embed(guild, act),
+            view=CheckPeopleView(act, interaction.user.id, category or _category_for_activity(act), guild),
+            ephemeral=True,
+        )
         return
-    uid = ids[0]
-    q = QUEUES.get(act, [])
-    if uid not in q:
-        await interaction.response.send_message("User is not in that queue.", ephemeral=True)
+
+    if category in _ACTIVITY_CATEGORY_KEYS:
+        await interaction.response.send_message(
+            embed=_check_activity_list_embed(category),
+            view=CheckActivityView(category, interaction.user.id),
+            ephemeral=True,
+        )
         return
-    _ensure_checked(act).add(uid)
-    await persist_checked()
-    await interaction.response.send_message("Marked with green check.", ephemeral=True)
-    await _post_activity_board(act)
+
+    await interaction.response.send_message(
+        embed=_check_category_embed(),
+        view=CheckCategoryView(interaction.user.id),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="uncheck", description="Remove the green check next to a user in a queue")
-@app_commands.describe(activity="Activity name", user="User mention or ID to unmark")
-@app_commands.autocomplete(activity=_activity_autocomplete)
-async def uncheck_cmd(interaction: discord.Interaction, activity: str, user: str):
+@app_commands.describe(
+    category="Pick Raids or Dungeons to see every activity",
+    activity="Activity name",
+    user="User mention or ID to unmark",
+)
+@app_commands.choices(
+    category=[
+        app_commands.Choice(name="Raids", value="raids"),
+        app_commands.Choice(name="Dungeons", value="dungeons"),
+        app_commands.Choice(name="Exotic Missions", value="exotic_activities"),
+    ]
+)
+@app_commands.autocomplete(activity=_check_activity_autocomplete, user=_queue_user_autocomplete)
+async def uncheck_cmd(
+    interaction: discord.Interaction,
+    activity: str,
+    user: str,
+    category: Optional[str] = None,
+):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("Use this in a server.", ephemeral=True)
