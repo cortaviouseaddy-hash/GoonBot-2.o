@@ -23,6 +23,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from env_safety import get_token, load_dotenv_file
+from tikfinity_live import start_tikfinity_monitor
+
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
@@ -31,6 +34,8 @@ except Exception:
 # ---------------------------
 # Config & Environment
 # ---------------------------
+
+load_dotenv_file()
 
 def _env_int(*names) -> Optional[int]:
     for n in names:
@@ -60,6 +65,7 @@ SHERPA_ROLE_ID                = _env_int("SHERPA_ROLE_ID")
 EVENT_SIGNUP_CHANNEL_ID       = _env_int("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID", "EVENT_SIGNUP_CHANNEL_ID")  # Main event embed
 EVENT_HOST_AUTOJOIN           = _env_bool("EVENT_HOST_AUTOJOIN", True)
 BUILD_OF_THE_WEEK_CHANNEL_ID  = _env_int("BUILD_OF_THE_WEEK_CHANNEL_ID")  # Build submissions channel
+DISCORD_LIVE_CHANNEL_ID       = _env_int("DISCORD_LIVE_CHANNEL_ID")  # TikTok LIVE announce channel
 
 # Optional local overrides via channel_ids.json (non-secret, deploy-time config)
 def _load_channel_overrides() -> None:
@@ -74,7 +80,7 @@ def _load_channel_overrides() -> None:
                 return int(str(v).strip())
             except Exception:
                 return None
-        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID, BUILD_OF_THE_WEEK_CHANNEL_ID
+        global GENERAL_SHERPA_CHANNEL_ID, RAID_SIGN_UP_CHANNEL_ID, GENERAL_CHANNEL_ID, LFG_CHAT_CHANNEL_ID, RAID_QUEUE_CHANNEL_ID, EVENT_SIGNUP_CHANNEL_ID, WELCOME_CHANNEL_ID, BUILD_OF_THE_WEEK_CHANNEL_ID, DISCORD_LIVE_CHANNEL_ID
         gs = _to_int(data.get("GENERAL_SHERPA_CHANNEL_ID"))
         rs = _to_int(data.get("RAID_SIGN_UP_CHANNEL_ID"))
         gc = _to_int(data.get("GENERAL_CHANNEL_ID"))
@@ -83,6 +89,7 @@ def _load_channel_overrides() -> None:
         ev = _to_int(data.get("EVENT_SIGNUP_CHANNEL_ID")) or _to_int(data.get("RAID_DUNGEON_EVENT_SIGNUP_CHANNEL_ID"))
         wc = _to_int(data.get("WELCOME_CHANNEL_ID"))
         bw = _to_int(data.get("BUILD_OF_THE_WEEK_CHANNEL_ID"))
+        live = _to_int(data.get("DISCORD_LIVE_CHANNEL_ID"))
         if gs and not GENERAL_SHERPA_CHANNEL_ID:
             GENERAL_SHERPA_CHANNEL_ID = gs
         if rs and not RAID_SIGN_UP_CHANNEL_ID:
@@ -99,10 +106,14 @@ def _load_channel_overrides() -> None:
             WELCOME_CHANNEL_ID = wc
         if bw and not BUILD_OF_THE_WEEK_CHANNEL_ID:
             BUILD_OF_THE_WEEK_CHANNEL_ID = bw
+        if live and not DISCORD_LIVE_CHANNEL_ID:
+            DISCORD_LIVE_CHANNEL_ID = live
     except Exception:
         pass
 
 _load_channel_overrides()
+if not DISCORD_LIVE_CHANNEL_ID:
+    DISCORD_LIVE_CHANNEL_ID = GENERAL_CHANNEL_ID
 
 # ---------------------------
 # Data directory (durable storage)
@@ -164,7 +175,6 @@ HELP_REMINDER_FOOTER = "Don't forget to message @GFerryGoon."
 # External Helpers (project)
 # ---------------------------
 from presets_loader import load_presets
-from env_safety import get_token
 
 try:
     PRESETS = load_presets() or {}
@@ -605,6 +615,7 @@ async def _send_to_channel_id(
     file: Optional[discord.File] = None,
     allowed_mentions: Optional[discord.AllowedMentions] = None,
     view: Optional[discord.ui.View] = None,
+    suppress_embeds: bool = False,
 ):
     try:
         if not channel_id:
@@ -617,6 +628,8 @@ async def _send_to_channel_id(
             kwargs["allowed_mentions"] = allowed_mentions
         if view is not None:
             kwargs["view"] = view
+        if suppress_embeds:
+            kwargs["suppress_embeds"] = True
         if file and embed:
             return await ch.send(content=content, embed=embed, file=file, **kwargs)  # type: ignore[arg-type]
         if embed:
@@ -2754,6 +2767,20 @@ async def on_ready():
         except Exception as e:
             try:
                 print("List view registration failed:", e)
+            except Exception:
+                pass
+    if not getattr(bot, "_tikfinity_task", None):
+        try:
+            bot._tikfinity_task = start_tikfinity_monitor(  # type: ignore[attr-defined]
+                bot,
+                general_channel_id=GENERAL_CHANNEL_ID,
+                live_channel_id=DISCORD_LIVE_CHANNEL_ID,
+                data_dir=DATA_DIR,
+                send_func=_send_to_channel_id,
+            )
+        except Exception as e:
+            try:
+                print("TikFinity LIVE monitor failed to start:", e)
             except Exception:
                 pass
     print(f"Ready as {bot.user}")
