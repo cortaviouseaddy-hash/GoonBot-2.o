@@ -9,12 +9,14 @@ from unittest.mock import patch
 from aiohttp import web
 
 from tikfinity_live import (
+    CONNECTION_EVENTS,
     DEFAULT_TIKTOK_URL,
     DEFAULT_TWITCH_URL,
     INTERACTION_EVENTS,
     LiveLinksView,
     TikFinityLiveMonitor,
     build_live_announcement_text,
+    dump_payload,
     extract_event_name,
     extract_room_id,
     load_tikfinity_config,
@@ -64,21 +66,31 @@ class LiveDetectionTests(unittest.TestCase):
             "🟣 Twitch:\nhttps://www.twitch.tv/gferrygoon",
         )
 
-    def test_connected_announces_once(self) -> None:
-        raw = json.dumps({"event": "connected", "data": {"roomId": "room-1"}})
-        self.assertEqual(self.monitor.evaluate_raw_message(raw), ["announce"])
-        self.assertEqual(self.monitor.evaluate_raw_message(raw), ["ignore"])
+    def test_connected_never_announces(self) -> None:
+        for name in ("connected", "websocketConnected", "disconnected", "ready"):
+            monitor = TikFinityLiveMonitor(live_start_events=[name, "streamStart"], log=self.logs.append)
+            raw = json.dumps({"event": name, "data": {"roomId": "room-1"}})
+            self.assertEqual(monitor.evaluate_raw_message(raw), ["ignore"], name)
+            self.assertFalse(monitor.session_announced, name)
 
-    def test_stream_start_alias(self) -> None:
+    def test_socket_status_payload_is_logged(self) -> None:
+        raw = json.dumps({"event": "connected", "data": {"roomId": "room-1"}})
+        self.monitor.evaluate_raw_message(raw)
+        self.assertTrue(any("event: connected" in line and "not a LIVE" in line for line in self.logs))
+        self.assertTrue(any("payload=" in line and "room-1" in line for line in self.logs))
+
+    def test_stream_start_does_not_announce_until_configured(self) -> None:
         raw = json.dumps({"event": "streamStart", "data": {"roomId": "abc"}})
-        self.assertEqual(self.monitor.evaluate_raw_message(raw), ["announce"])
+        self.assertEqual(self.monitor.evaluate_raw_message(raw), ["ignore"])
+        self.assertFalse(self.monitor.session_announced)
 
     def test_interactions_never_announce(self) -> None:
         self.monitor.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "r"}}))
         for name in ("like", "chat", "comment", "gift", "follow", "share", "subscribe", "member", "roomUser"):
-            actions = self.monitor.evaluate_raw_message(json.dumps({"event": name, "data": {}}))
+            actions = self.monitor.evaluate_raw_message(json.dumps({"event": name, "data": {"hello": True}}))
             self.assertEqual(actions, ["ignore"], name)
             self.assertTrue(any(f"event: {name}" in line for line in self.logs), name)
+            self.assertTrue(any(f"event: {name}" in line and "payload=" in line for line in self.logs), name)
 
     def test_first_interaction_does_not_announce(self) -> None:
         for name in ("like", "gift", "comment", "follow"):
@@ -87,33 +99,54 @@ class LiveDetectionTests(unittest.TestCase):
             self.assertEqual(actions, ["ignore"], name)
             self.assertFalse(monitor.session_announced)
 
+    def test_configured_start_event_announces_once(self) -> None:
+        monitor = TikFinityLiveMonitor(live_start_events=["streamStart"], log=lambda _m: None)
+        raw = json.dumps({"event": "streamStart", "data": {"roomId": "abc"}})
+        self.assertEqual(monitor.evaluate_raw_message(raw), ["announce"])
+        self.assertEqual(monitor.evaluate_raw_message(raw), ["ignore"])
+
     def test_new_room_is_a_new_session(self) -> None:
-        self.monitor.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "a"}}))
-        actions = self.monitor.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "b"}}))
+        monitor = TikFinityLiveMonitor(live_start_events=["streamStart"], log=lambda _m: None)
+        monitor.evaluate_raw_message(json.dumps({"event": "streamStart", "data": {"roomId": "a"}}))
+        actions = monitor.evaluate_raw_message(json.dumps({"event": "streamStart", "data": {"roomId": "b"}}))
         self.assertEqual(actions, ["announce"])
 
     def test_stream_end_allows_next_live(self) -> None:
-        self.monitor.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "a"}}))
-        self.assertEqual(self.monitor.evaluate_raw_message(json.dumps({"event": "streamEnd"})), ["end"])
-        actions = self.monitor.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "a"}}))
+        monitor = TikFinityLiveMonitor(live_start_events=["streamStart"], log=lambda _m: None)
+        monitor.evaluate_raw_message(json.dumps({"event": "streamStart", "data": {"roomId": "a"}}))
+        self.assertEqual(monitor.evaluate_raw_message(json.dumps({"event": "streamEnd"})), ["end"])
+        actions = monitor.evaluate_raw_message(json.dumps({"event": "streamStart", "data": {"roomId": "a"}}))
         self.assertEqual(actions, ["announce"])
 
-    def test_event_names_are_logged(self) -> None:
-        self.monitor.evaluate_raw_message(json.dumps({"event": "gift"}))
+    def test_event_names_and_payloads_are_logged(self) -> None:
+        payload = {"event": "gift", "data": {"giftName": "Rose"}}
+        self.monitor.evaluate_raw_message(json.dumps(payload))
         self.assertTrue(any("event: gift" in line for line in self.logs))
+        self.assertTrue(any("Rose" in line and "payload=" in line for line in self.logs))
+        self.assertIn("Rose", dump_payload(payload))
 
     def test_custom_start_event(self) -> None:
         monitor = TikFinityLiveMonitor(live_start_events=["myLivePing"], log=lambda _m: None)
         actions = monitor.evaluate_raw_message(json.dumps({"event": "myLivePing", "data": {"roomId": "z"}}))
         self.assertEqual(actions, ["announce"])
 
+    def test_connected_cannot_be_forced_as_start_event(self) -> None:
+        monitor = TikFinityLiveMonitor(live_start_events=["connected"], log=lambda _m: None)
+        actions = monitor.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "z"}}))
+        self.assertEqual(actions, ["ignore"])
+        self.assertFalse(monitor.session_announced)
+
     def test_state_survives_reload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            first = TikFinityLiveMonitor(data_dir=tmp, log=lambda _m: None)
-            first.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "keep"}}))
-            second = TikFinityLiveMonitor(data_dir=tmp, log=lambda _m: None)
-            actions = second.evaluate_raw_message(json.dumps({"event": "connected", "data": {"roomId": "keep"}}))
+            first = TikFinityLiveMonitor(data_dir=tmp, live_start_events=["streamStart"], log=lambda _m: None)
+            first.evaluate_raw_message(json.dumps({"event": "streamStart", "data": {"roomId": "keep"}}))
+            second = TikFinityLiveMonitor(data_dir=tmp, live_start_events=["streamStart"], log=lambda _m: None)
+            actions = second.evaluate_raw_message(json.dumps({"event": "streamStart", "data": {"roomId": "keep"}}))
             self.assertEqual(actions, ["ignore"])
+
+    def test_connection_event_constants(self) -> None:
+        for name in ("connected", "disconnected", "websocketconnected"):
+            self.assertIn(name, CONNECTION_EVENTS)
 
     def test_interaction_constants_cover_common_noise(self) -> None:
         for name in ("gift", "like", "chat", "comment", "follow"):
@@ -144,7 +177,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class WebSocketReconnectTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reconnect_does_not_reannounce_same_room(self) -> None:
+    async def test_socket_connect_and_connected_event_do_not_announce(self) -> None:
         announced: List[int] = []
         logs: List[str] = []
         release_second = asyncio.Event()
@@ -185,14 +218,15 @@ class WebSocketReconnectTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(monitor.run_forever())
         try:
             for _ in range(80):
-                if connections["count"] >= 2 and announced:
+                if connections["count"] >= 2:
                     break
                 await asyncio.sleep(0.05)
             self.assertGreaterEqual(connections["count"], 2)
-            self.assertEqual(sum(announced), 1)
-            self.assertTrue(any("event: gift" in line for line in logs))
+            self.assertEqual(sum(announced), 0)
+            self.assertTrue(any("this is NOT a TikTok LIVE" in line for line in logs))
+            self.assertTrue(any("event: gift" in line and "payload=" in line for line in logs))
             self.assertTrue(any("event: like" in line for line in logs))
-            self.assertTrue(any("event: connected" in line for line in logs))
+            self.assertTrue(any("event: connected" in line and "not a LIVE" in line for line in logs))
         finally:
             release_second.set()
             monitor.stop()

@@ -17,25 +17,29 @@ DEFAULT_TIKTOK_URL = "https://www.tiktok.com/@GFerryGoon"
 DEFAULT_TWITCH_URL = "https://www.twitch.tv/gferrygoon"
 STATE_FILENAME = "tikfinity_live_state.json"
 
-# TikFinity forwards TikTok-Live-Connector control events when a LIVE begins.
-DEFAULT_LIVE_START_EVENTS = frozenset(
+# Handshake / socket status only. These prove the bot reached TikFinity,
+# not that a TikTok LIVE session started. Never announce from these.
+CONNECTION_EVENTS = frozenset(
     {
         "connected",
+        "disconnected",
         "websocketconnected",
-        "streamstart",
-        "stream_start",
-        "streamstarted",
-        "livestreamstart",
-        "livestream_start",
-        "livestart",
-        "live_start",
-        "roomstart",
-        "room_start",
-        "webcaststart",
-        "webcast_start",
-        "livestream",
+        "websocket_connected",
+        "websocketdisconnected",
+        "websocket_disconnected",
+        "ready",
+        "welcome",
+        "handshake",
+        "hello",
+        "ping",
+        "pong",
+        "error",
     }
 )
+
+# Empty on purpose until a real LIVE-start event is identified from logs.
+# Set TIKFINITY_LIVE_START_EVENTS after a test stream (do not include "connected").
+DEFAULT_LIVE_START_EVENTS = frozenset()
 
 DEFAULT_LIVE_END_EVENTS = frozenset(
     {
@@ -110,11 +114,11 @@ def _csv_events(raw: Optional[str]) -> Set[str]:
 def extract_event_name(payload: Any) -> Optional[str]:
     """Best-effort event name from TikFinity / TikTok-Live-Connector JSON shapes."""
     if isinstance(payload, str):
-        n = _norm_event(payload)
+        n = payload.strip()
         return n or None
     if not isinstance(payload, dict):
         return None
-    for key in ("event", "eventName", "event_name", "type", "name"):
+    for key in ("event", "eventName", "event_name", "eventType", "event_type", "type", "name", "status"):
         val = payload.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
@@ -128,6 +132,16 @@ def extract_event_name(payload: Any) -> Optional[str]:
         if nested:
             return nested
     return None
+
+
+def dump_payload(payload: Any, *, limit: int = 2000) -> str:
+    try:
+        text = json.dumps(payload, default=str, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        text = str(payload)
+    if len(text) > limit:
+        return text[:limit] + "...(truncated)"
+    return text
 
 
 def extract_room_id(payload: Any) -> Optional[str]:
@@ -231,7 +245,8 @@ class TikFinityLiveMonitor:
         self.ws_url = (ws_url or DEFAULT_WS_URL).strip() or DEFAULT_WS_URL
         extra_start = {_norm_event(n) for n in (live_start_events or []) if _norm_event(n)}
         extra_end = {_norm_event(n) for n in (live_end_events or []) if _norm_event(n)}
-        self.live_start_events = set(DEFAULT_LIVE_START_EVENTS) | extra_start
+        # Connection/handshake names can never be used as LIVE-start, even via env.
+        self.live_start_events = (set(DEFAULT_LIVE_START_EVENTS) | extra_start) - CONNECTION_EVENTS
         self.live_end_events = set(DEFAULT_LIVE_END_EVENTS) | extra_end
         self.data_dir = data_dir
         self.on_announce = on_announce
@@ -291,11 +306,20 @@ class TikFinityLiveMonitor:
         self.session_announced = False
         self._save_state()
 
+    def is_connection_status(self, event_name: Optional[str]) -> bool:
+        return _norm_event(event_name) in CONNECTION_EVENTS
+
     def is_live_start(self, event_name: Optional[str]) -> bool:
-        return _norm_event(event_name) in self.live_start_events
+        n = _norm_event(event_name)
+        if not n or n in CONNECTION_EVENTS:
+            return False
+        return n in self.live_start_events
 
     def is_live_end(self, event_name: Optional[str]) -> bool:
-        return _norm_event(event_name) in self.live_end_events
+        n = _norm_event(event_name)
+        if not n or n in CONNECTION_EVENTS:
+            return False
+        return n in self.live_end_events
 
     def is_interaction(self, event_name: Optional[str]) -> bool:
         return _norm_event(event_name) in INTERACTION_EVENTS
@@ -308,13 +332,18 @@ class TikFinityLiveMonitor:
         """
         event_name = extract_event_name(payload)
         room_id = extract_room_id(payload)
-        if not event_name:
-            self._log("[tikfinity] event: <unnamed>")
-            return "unknown"
+        dumped = dump_payload(payload)
+        display = event_name or "<unnamed>"
 
-        kind = "event"
+        kind = "logged"
         action = "ignore"
-        if self.is_live_end(event_name):
+        if not event_name:
+            kind = "unnamed"
+            action = "unknown"
+        elif self.is_connection_status(event_name):
+            kind = "TikFinity/socket status — not a LIVE"
+            action = "ignore"
+        elif self.is_live_end(event_name):
             kind = "live end"
             action = "end"
         elif self.is_live_start(event_name):
@@ -330,11 +359,11 @@ class TikFinityLiveMonitor:
             else:
                 action = "announce"
         elif self.is_interaction(event_name):
-            kind = "ignored interaction"
+            kind = "LIVE data (logged, no Discord ping)"
             action = "ignore"
 
         extra = f" roomId={room_id}" if room_id else ""
-        self._log(f"[tikfinity] event: {event_name} ({kind}){extra}")
+        self._log(f"[tikfinity] event: {display} ({kind}){extra} payload={dumped}")
 
         if action == "end":
             self._reset_session()
@@ -347,11 +376,18 @@ class TikFinityLiveMonitor:
             self._save_state()
             return "announce"
 
-        return "ignore" if event_name else "unknown"
+        return action if action in ("ignore", "unknown") else "ignore"
 
     def evaluate_raw_message(self, raw: str) -> List[str]:
+        items = parse_tikfinity_messages(raw)
+        if not items:
+            preview = (raw or "").strip()
+            if preview:
+                self._log(f"[tikfinity] event: <raw> payload={preview[:2000]}")
+                return ["unknown"]
+            return []
         actions: List[str] = []
-        for item in parse_tikfinity_messages(raw):
+        for item in items:
             if isinstance(item, str):
                 item = {"event": item}
             actions.append(self.evaluate_payload(item))
@@ -378,7 +414,10 @@ class TikFinityLiveMonitor:
                         autoclose=True,
                         autoping=True,
                     ) as ws:
-                        self._log("[tikfinity] connected to TikFinity Event API")
+                        self._log(
+                            "[tikfinity] socket connected to TikFinity Event API — "
+                            "this is NOT a TikTok LIVE and will not ping Discord"
+                        )
                         delay = self.reconnect_initial
                         failures = 0
                         async for msg in ws:
@@ -424,7 +463,7 @@ def load_tikfinity_config(
     channel_id = _env_int("DISCORD_LIVE_CHANNEL_ID") or live_channel_id or general_channel_id
     tiktok_url = (os.getenv("TIKTOK_LIVE_URL") or DEFAULT_TIKTOK_URL).strip() or DEFAULT_TIKTOK_URL
     twitch_url = (os.getenv("TWITCH_LIVE_URL") or DEFAULT_TWITCH_URL).strip() or DEFAULT_TWITCH_URL
-    extra_start = _csv_events(os.getenv("TIKFINITY_LIVE_START_EVENTS"))
+    extra_start = _csv_events(os.getenv("TIKFINITY_LIVE_START_EVENTS")) - CONNECTION_EVENTS
     extra_end = _csv_events(os.getenv("TIKFINITY_LIVE_END_EVENTS"))
     return {
         "ws_url": ws_url,
@@ -500,9 +539,15 @@ def start_tikfinity_monitor(
         on_announce=_on_announce,
     )
     bot._tikfinity_monitor = monitor  # type: ignore[attr-defined]
+    start_names = ",".join(sorted(monitor.live_start_events)) or "(none yet — logging only)"
     print(
         f"[tikfinity] LIVE monitor enabled → {cfg['ws_url']} "
-        f"(announce channel={cfg['channel_id']})",
+        f"(announce channel={cfg['channel_id']}; live-start events={start_names})",
+        flush=True,
+    )
+    print(
+        "[tikfinity] connecting to TikFinity will not send @everyone. "
+        "Every incoming event is logged so a real LIVE-start event can be identified.",
         flush=True,
     )
     return bot.loop.create_task(monitor.run_forever(), name="tikfinity-live-monitor")
