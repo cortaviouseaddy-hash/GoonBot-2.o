@@ -37,3 +37,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Bot runtime state
+data/tikfinity_live_state.json
+data/tikfinity_live_state.json.tmp
